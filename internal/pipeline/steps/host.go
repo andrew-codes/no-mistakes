@@ -66,15 +66,12 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			// this provider can safely consume fork_url for PR creation.
 			return nil, "fork PR routing for Bitbucket is not implemented"
 		}
-		client, err := bitbucket.NewClientFromEnv(sctx.Env)
-		if err != nil {
-			return nil, err.Error()
-		}
 		repo, err := resolveBitbucketRepoRef(sctx.Repo.UpstreamURL, sctx.Run.PRURL)
 		if err != nil {
 			return nil, err.Error()
 		}
-		return bitbucket.NewHost(client, repo), ""
+		client := bitbucket.NewClient(cmdFactory)
+		return bitbucket.NewHost(client, repo, func() bool { return stepCLIAvailable(sctx, provider) }), ""
 	case scm.ProviderAzureDevOps:
 		if sctx.Repo.ForkURL != "" {
 			// Fork PR routing for Azure DevOps is intentionally not half-wired,

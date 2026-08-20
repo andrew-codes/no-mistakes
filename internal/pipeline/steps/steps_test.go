@@ -1,6 +1,7 @@
 package steps
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +43,8 @@ func handleFakeCLI(mode string) {
 	switch mode {
 	case "gh":
 		fakeGHHandler(args)
+	case "twg":
+		fakeTwgHandler(args)
 	case "glab":
 		fakeGlabHandler(args)
 	case "record-success":
@@ -140,6 +143,34 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	os.Exit(1)
+}
+
+// fakeTwgHandler replies to a fake `twg` invocation from a canned response
+// map (see fakeTwg in helpers_test.go), matched by exact argv.
+func fakeTwgHandler(args []string) {
+	respFile := os.Getenv("FAKE_TWG_RESPONSES")
+	if respFile == "" {
+		fmt.Fprintln(os.Stderr, "FAKE_TWG_RESPONSES not set")
+		os.Exit(1)
+	}
+	data, err := os.ReadFile(respFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	var responses map[string]fakeTwgResponse
+	if err := json.Unmarshal(data, &responses); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	key := twgArgsKey(args...)
+	resp, ok := responses[key]
+	if !ok {
+		fmt.Fprintf(os.Stderr, "no fake twg response registered for args: %v\n", args)
+		os.Exit(1)
+	}
+	fmt.Print(resp.Stdout)
+	os.Exit(resp.ExitCode)
 }
 
 func fakeGitStatusErrorHandler(args []string) {

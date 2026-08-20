@@ -189,16 +189,15 @@ Creates or updates a pull request.
 **Skipped when:**
 - The branch is the default branch
 - The upstream host is not GitHub, GitLab, Bitbucket Cloud (`bitbucket.org`), or Azure DevOps (`dev.azure.com` / `*.visualstudio.com`)
-- The provider CLI (`gh` or `glab`) is not installed for GitHub or GitLab
-- The provider CLI is not authenticated for GitHub or GitLab
-- Bitbucket Cloud credentials are missing (`NO_MISTAKES_BITBUCKET_EMAIL` or `NO_MISTAKES_BITBUCKET_API_TOKEN`)
+- The provider CLI (`gh`, `glab`, or `twg`) is not installed for GitHub, GitLab, or Bitbucket Cloud
+- The provider CLI is not authenticated for GitHub, GitLab, or Bitbucket Cloud
 - The `az` CLI with the `azure-devops` extension is not installed or not authenticated for Azure DevOps
 - A legacy or manually edited GitLab, Bitbucket, or Azure DevOps repo record has `fork_url` set, because fork MR/PR routing is currently GitHub-only
 
 **Behavior:**
 - Checks for an existing PR on the branch
 - If one exists, updates it. If not, creates a new one.
-- Uses the provider CLI for GitHub/GitLab, the `az` CLI for Azure DevOps, and the Bitbucket API for Bitbucket Cloud
+- Uses the provider CLI for GitHub/GitLab, the `az` CLI for Azure DevOps, and the `twg` CLI for Bitbucket Cloud
 - For GitHub fork routing, keeps `gh --repo` pointed at the parent repository from `origin`, checks existing PRs with the bare branch name, filters matching PRs by head owner, and creates PRs with `--head <fork-owner>:<branch>`
 - PR title: agent-generated from the final branch delta with user intent when available, in conventional commit format (`type(scope): description` or `type: description`); user-facing product impact should use `feat` or `fix` so release automation can pick it up; when a scope is used, it should be the primary affected real module/package from the changed paths and kept broad rather than file-level. If drafting fails, the fallback uses the neutral title `chore: update pull request` rather than inferring scope from earlier commits.
 - The PR stage exclusively owns the complete branch-scope description. It drafts `## What Changed` from the actual final diff after local mutating stages finish, and its fallback lists the final changed paths and statuses.
@@ -220,7 +219,7 @@ Monitors PR health after creation and auto-fixes CI failures. Mergeability polli
 
 - GitHub requires `gh` CLI, installed and authenticated.
 - GitLab requires `glab` CLI, installed and authenticated.
-- Bitbucket Cloud requires `NO_MISTAKES_BITBUCKET_EMAIL` and `NO_MISTAKES_BITBUCKET_API_TOKEN`.
+- Bitbucket Cloud requires the `twg` CLI, installed and authenticated.
 - Azure DevOps requires the `az` CLI with the `azure-devops` extension, authenticated with a PAT.
 
 **Behavior:**

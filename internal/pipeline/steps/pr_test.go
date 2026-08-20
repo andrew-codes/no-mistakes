@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,11 +98,21 @@ func TestPRStep_UpdatesExistingPR(t *testing.T) {
 func TestPRStep_BitbucketUpdatesExistingPR(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	api := newFakeBitbucketPRAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42")
+
+	doctorKey, doctorResp := twgDoctorOK()
+	env, logFile := fakeTwg(t, map[string]fakeTwgResponse{
+		doctorKey: doctorResp,
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+			Stdout: twgEnvelope(`[{"id":42,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/42"}}}]`),
+		},
+		twgArgsKey("bitbucket", "pull-requests", "update", "--pull-request", "42", "--title", "<value>", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
+			Stdout: twgEnvelope(`{"id":42,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/42"}}}`),
+		},
+	})
 
 	ag := &mockAgent{name: "test"}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.Env = fakeBitbucketEnv(api.server.URL)
+	sctx.Env = env
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 
 	step := &PRStep{}
@@ -115,20 +123,14 @@ func TestPRStep_BitbucketUpdatesExistingPR(t *testing.T) {
 	if outcome.NeedsApproval {
 		t.Fatal("bitbucket PR step should never need approval")
 	}
-	if api.listCalls != 1 {
-		t.Fatalf("list calls = %d, want 1", api.listCalls)
+	if got := countLogLines(t, logFile, "pull-requests query"); got != 1 {
+		t.Fatalf("query calls = %d, want 1", got)
 	}
-	if api.updateCalls != 1 {
-		t.Fatalf("update calls = %d, want 1", api.updateCalls)
+	if got := countLogLines(t, logFile, "pull-requests update"); got != 1 {
+		t.Fatalf("update calls = %d, want 1", got)
 	}
-	if api.createCalls != 0 {
-		t.Fatalf("create calls = %d, want 0", api.createCalls)
-	}
-	if api.lastAuthHeader == "" {
-		t.Fatal("expected Authorization header for Bitbucket API")
-	}
-	if !strings.Contains(api.lastUpdateBody, "title") || !strings.Contains(api.lastUpdateBody, "description") {
-		t.Fatalf("expected Bitbucket PR update payload to include title and description, got %q", api.lastUpdateBody)
+	if got := countLogLines(t, logFile, "pull-requests create"); got != 0 {
+		t.Fatalf("create calls = %d, want 0", got)
 	}
 
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
@@ -143,40 +145,25 @@ func TestPRStep_BitbucketUpdatesExistingPR(t *testing.T) {
 func TestPRStep_BitbucketUpdatesExistingPRWithoutHTMLLink(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	api := newFakeBitbucketPRAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42")
-	api.existingPRURL = "https://bitbucket.org/test/repo/pull-requests/42"
-	api.createdPRURL = ""
+
+	const existingPRURL = "https://bitbucket.org/test/repo/pull-requests/42"
+	doctorKey, doctorResp := twgDoctorOK()
+	env, _ := fakeTwg(t, map[string]fakeTwgResponse{
+		doctorKey: doctorResp,
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+			Stdout: twgEnvelope(`[{"id":42,"state":"OPEN","links":{"html":{"href":"` + existingPRURL + `"}}}]`),
+		},
+		twgArgsKey("bitbucket", "pull-requests", "update", "--pull-request", "42", "--title", "<value>", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
+			// twg's raw update response omits the html link on some Bitbucket
+			// responses; the PR step must fall back to the known existing URL.
+			Stdout: twgEnvelope(`{"id":42}`),
+		},
+	})
 
 	ag := &mockAgent{name: "test"}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.Env = fakeBitbucketEnv(api.server.URL)
+	sctx.Env = env
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
-	api.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		api.lastAuthHeader = r.Header.Get("Authorization")
-
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/2.0/repositories/test/repo/pullrequests":
-			api.listCalls++
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"values":[{"id":%d,"links":{"html":{"href":%q}}}]}`,
-				api.existingPRID,
-				api.existingPRURL,
-			)
-		case r.Method == http.MethodPut && r.URL.Path == fmt.Sprintf("/2.0/repositories/test/repo/pullrequests/%d", api.existingPRID):
-			api.updateCalls++
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Fatalf("read update body: %v", err)
-			}
-			api.lastUpdateBody = string(body)
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"id":%d}`,
-				api.existingPRID,
-			)
-		default:
-			t.Fatalf("unexpected Bitbucket PR API request: %s %s", r.Method, r.URL.String())
-		}
-	})
 
 	step := &PRStep{}
 	outcome, err := step.Execute(sctx)
@@ -186,25 +173,16 @@ func TestPRStep_BitbucketUpdatesExistingPRWithoutHTMLLink(t *testing.T) {
 	if outcome.NeedsApproval {
 		t.Fatal("bitbucket PR step should never need approval")
 	}
-	if api.listCalls != 1 {
-		t.Fatalf("list calls = %d, want 1", api.listCalls)
-	}
-	if api.updateCalls != 1 {
-		t.Fatalf("update calls = %d, want 1", api.updateCalls)
-	}
-	if api.createCalls != 0 {
-		t.Fatalf("create calls = %d, want 0", api.createCalls)
-	}
-	if outcome.PRURL != api.existingPRURL {
-		t.Fatalf("outcome PR URL = %q, want %q", outcome.PRURL, api.existingPRURL)
+	if outcome.PRURL != existingPRURL {
+		t.Fatalf("outcome PR URL = %q, want %q", outcome.PRURL, existingPRURL)
 	}
 
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.PRURL == nil || *run.PRURL != api.existingPRURL {
-		t.Fatalf("PR URL = %v, want %q", run.PRURL, api.existingPRURL)
+	if run.PRURL == nil || *run.PRURL != existingPRURL {
+		t.Fatalf("PR URL = %v, want %q", run.PRURL, existingPRURL)
 	}
 }
 
@@ -360,12 +338,23 @@ func TestPRStep_GitHubForkCreatesParentPRWithForkHead(t *testing.T) {
 func TestPRStep_BitbucketCreatesNewPR(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	api := newFakeBitbucketPRAPI(t, 0, "")
+
+	const createdPRURL = "https://bitbucket.org/test/repo/pull-requests/99"
+	doctorKey, doctorResp := twgDoctorOK()
+	env, logFile := fakeTwg(t, map[string]fakeTwgResponse{
+		doctorKey: doctorResp,
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+			Stdout: twgEnvelope(`[]`),
+		},
+		twgArgsKey("bitbucket", "pull-requests", "create", "--title", "<value>", "--source", "feature", "--dest", "main", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
+			Stdout: twgEnvelope(`{"id":99,"state":"OPEN","links":{"html":{"href":"` + createdPRURL + `"}}}`),
+		},
+	})
 
 	findings := `{"findings":[],"summary":"clean","risk_level":"medium","risk_rationale":"touches critical error handling"}`
 	ag := &mockAgent{name: "test"}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.Env = fakeBitbucketEnv(api.server.URL)
+	sctx.Env = env
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 	reviewStep, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
 	if err != nil {
@@ -386,38 +375,44 @@ func TestPRStep_BitbucketCreatesNewPR(t *testing.T) {
 	if outcome.NeedsApproval {
 		t.Fatal("bitbucket PR step should never need approval")
 	}
-	if api.listCalls != 1 {
-		t.Fatalf("list calls = %d, want 1", api.listCalls)
+	if got := countLogLines(t, logFile, "pull-requests query"); got != 1 {
+		t.Fatalf("query calls = %d, want 1", got)
 	}
-	if api.createCalls != 1 {
-		t.Fatalf("create calls = %d, want 1", api.createCalls)
+	if got := countLogLines(t, logFile, "pull-requests create"); got != 1 {
+		t.Fatalf("create calls = %d, want 1", got)
 	}
-	if api.updateCalls != 0 {
-		t.Fatalf("update calls = %d, want 0", api.updateCalls)
-	}
-	if !strings.Contains(api.lastCreateBody, `"source"`) || !strings.Contains(api.lastCreateBody, `"destination"`) {
-		t.Fatalf("expected Bitbucket PR create payload to include source and destination, got %q", api.lastCreateBody)
+	if got := countLogLines(t, logFile, "pull-requests update"); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
 	}
 
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.PRURL == nil || *run.PRURL != api.createdPRURL {
-		t.Fatalf("PR URL = %v, want %q", run.PRURL, api.createdPRURL)
+	if run.PRURL == nil || *run.PRURL != createdPRURL {
+		t.Fatalf("PR URL = %v, want %q", run.PRURL, createdPRURL)
 	}
 }
 
 func TestPRStep_BitbucketCreatesNewPRWithoutHTMLLink(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	api := newFakeBitbucketPRAPI(t, 0, "")
-	api.createdPRURL = ""
+
+	doctorKey, doctorResp := twgDoctorOK()
+	env, _ := fakeTwg(t, map[string]fakeTwgResponse{
+		doctorKey: doctorResp,
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+			Stdout: twgEnvelope(`[]`),
+		},
+		twgArgsKey("bitbucket", "pull-requests", "create", "--title", "<value>", "--source", "feature", "--dest", "main", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
+			Stdout: twgEnvelope(`{"id":99}`),
+		},
+	})
 
 	findings := `{"findings":[],"summary":"clean","risk_level":"medium","risk_rationale":"touches critical error handling"}`
 	ag := &mockAgent{name: "test"}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
-	sctx.Env = fakeBitbucketEnv(api.server.URL)
+	sctx.Env = env
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 	reviewStep, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
 	if err != nil {
@@ -429,28 +424,6 @@ func TestPRStep_BitbucketCreatesNewPRWithoutHTMLLink(t *testing.T) {
 	if err := sctx.DB.SetStepFindings(reviewStep.ID, findings); err != nil {
 		t.Fatal(err)
 	}
-	api.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		api.lastAuthHeader = r.Header.Get("Authorization")
-
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/2.0/repositories/test/repo/pullrequests":
-			api.listCalls++
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"values":[]}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/2.0/repositories/test/repo/pullrequests":
-			api.createCalls++
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Fatalf("read create body: %v", err)
-			}
-			api.lastCreateBody = string(body)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			fmt.Fprint(w, `{"id":99}`)
-		default:
-			t.Fatalf("unexpected Bitbucket PR API request: %s %s", r.Method, r.URL.String())
-		}
-	})
 
 	step := &PRStep{}
 	outcome, err := step.Execute(sctx)
@@ -473,13 +446,17 @@ func TestPRStep_BitbucketCreatesNewPRWithoutHTMLLink(t *testing.T) {
 	}
 }
 
-func TestPRStep_BitbucketMissingEnvSkipsBeforeBuildingContent(t *testing.T) {
+func TestPRStep_BitbucketSkipsBeforeBuildingContentWhenCLIUnavailable(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 
 	ag := &mockAgent{name: "test"}
 	sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
+	// An empty, twg-free PATH override makes stepCLIAvailable(ProviderBitbucket)
+	// report false, so buildHost's Available() check must skip before ever
+	// invoking the agent to build PR content.
+	sctx.Env = []string{"PATH=" + t.TempDir()}
 
 	step := &PRStep{}
 	outcome, err := step.Execute(sctx)
@@ -496,10 +473,19 @@ func TestPRStep_BitbucketMissingEnvSkipsBeforeBuildingContent(t *testing.T) {
 
 func TestPRStep_BitbucketUsesProcessEnvWhenStepEnvIsNil(t *testing.T) {
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	api := newFakeBitbucketPRAPI(t, 0, "")
-	t.Setenv("NO_MISTAKES_BITBUCKET_EMAIL", "test@example.com")
-	t.Setenv("NO_MISTAKES_BITBUCKET_API_TOKEN", "test-token")
-	t.Setenv("NO_MISTAKES_BITBUCKET_API_BASE_URL", api.server.URL)
+
+	const createdPRURL = "https://bitbucket.org/test/repo/pull-requests/99"
+	doctorKey, doctorResp := twgDoctorOK()
+	env, logFile := fakeTwg(t, map[string]fakeTwgResponse{
+		doctorKey: doctorResp,
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+			Stdout: twgEnvelope(`[]`),
+		},
+		twgArgsKey("bitbucket", "pull-requests", "create", "--title", "<value>", "--source", "feature", "--dest", "main", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
+			Stdout: twgEnvelope(`{"id":99,"state":"OPEN","links":{"html":{"href":"` + createdPRURL + `"}}}`),
+		},
+	})
+	setProcessEnvFromFakeCLIEnv(t, env)
 
 	ag := &mockAgent{
 		name: "test",
@@ -519,11 +505,11 @@ func TestPRStep_BitbucketUsesProcessEnvWhenStepEnvIsNil(t *testing.T) {
 	if outcome.NeedsApproval {
 		t.Fatal("bitbucket PR step should never need approval")
 	}
-	if outcome.PRURL != api.createdPRURL {
-		t.Fatalf("PR URL = %q, want %q", outcome.PRURL, api.createdPRURL)
+	if outcome.PRURL != createdPRURL {
+		t.Fatalf("PR URL = %q, want %q", outcome.PRURL, createdPRURL)
 	}
-	if api.createCalls != 1 {
-		t.Fatalf("expected Bitbucket PR create API to be called once, got %d", api.createCalls)
+	if got := countLogLines(t, logFile, "pull-requests create"); got != 1 {
+		t.Fatalf("expected Bitbucket PR create to be called once, got %d", got)
 	}
 }
 

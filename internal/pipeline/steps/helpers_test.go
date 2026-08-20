@@ -2,10 +2,8 @@ package steps
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -231,151 +229,106 @@ func fakeGH(t *testing.T, prViewURL string) (env []string, logFile string) {
 	return env, logFile
 }
 
-type fakeBitbucketPRAPI struct {
-	server         *httptest.Server
-	listCalls      int
-	createCalls    int
-	updateCalls    int
-	lastAuthHeader string
-	lastCreateBody string
-	lastUpdateBody string
-	existingPRID   int
-	existingPRURL  string
-	createdPRURL   string
+// fakeTwgResponse describes what the fake twg binary should emit for one
+// matched invocation, keyed by its exact argv (see fakeTwg).
+type fakeTwgResponse struct {
+	Stdout   string
+	ExitCode int
 }
 
-func newFakeBitbucketPRAPI(t *testing.T, existingPRID int, existingPRURL string) *fakeBitbucketPRAPI {
-	t.Helper()
+// twgEnvelope wraps data in twg's standard `--output json` response shape:
+// {"apiVersion":"v2","command":"...","data":<payload>}.
+func twgEnvelope(data string) string {
+	return `{"apiVersion":"v2","command":"test","data":` + data + `}`
+}
 
-	api := &fakeBitbucketPRAPI{
-		existingPRID:  existingPRID,
-		existingPRURL: existingPRURL,
-		createdPRURL:  "https://bitbucket.org/test/repo/pull-requests/99",
-	}
+// twgMaskedFlags are flags whose value is agent-generated (PR title/body) and
+// therefore unpredictable at response-table build time; twgArgsKey replaces
+// their value with a placeholder so a canned response matches regardless of
+// the exact generated content. The real content still reaches the fake twg
+// binary's invocation log unmasked, so log-content assertions stay meaningful.
+var twgMaskedFlags = map[string]bool{"--title": true, "--description": true}
 
-	api.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		api.lastAuthHeader = r.Header.Get("Authorization")
-
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/2.0/repositories/test/repo/pullrequests":
-			api.listCalls++
-			w.Header().Set("Content-Type", "application/json")
-			if api.existingPRID == 0 {
-				fmt.Fprint(w, `{"values":[]}`)
-				return
-			}
-			fmt.Fprintf(w, `{"values":[{"id":%d,"links":{"html":{"href":%q}}}]}`,
-				api.existingPRID,
-				api.existingPRURL,
-			)
-		case r.Method == http.MethodPost && r.URL.Path == "/2.0/repositories/test/repo/pullrequests":
-			api.createCalls++
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Fatalf("read create body: %v", err)
-			}
-			api.lastCreateBody = string(body)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusCreated)
-			fmt.Fprintf(w, `{"id":99,"links":{"html":{"href":%q}}}`,
-				api.createdPRURL,
-			)
-		case r.Method == http.MethodPut && r.URL.Path == fmt.Sprintf("/2.0/repositories/test/repo/pullrequests/%d", api.existingPRID):
-			api.updateCalls++
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Fatalf("read update body: %v", err)
-			}
-			api.lastUpdateBody = string(body)
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"id":%d,"links":{"html":{"href":%q}}}`,
-				api.existingPRID,
-				api.existingPRURL,
-			)
-		default:
-			t.Fatalf("unexpected Bitbucket PR API request: %s %s", r.Method, r.URL.String())
+// twgArgsKey joins argv the same way the fake twg dispatcher (steps_test.go
+// fakeTwgHandler) computes its lookup key, masking agent-generated flag
+// values so a canned response can match regardless of exact PR content.
+func twgArgsKey(args ...string) string {
+	masked := make([]string, len(args))
+	copy(masked, args)
+	for i := 0; i < len(masked)-1; i++ {
+		if twgMaskedFlags[masked[i]] {
+			masked[i+1] = "<value>"
 		}
-	}))
-	t.Cleanup(api.server.Close)
-
-	return api
-}
-
-func fakeBitbucketEnv(apiBaseURL string) []string {
-	return []string{
-		"NO_MISTAKES_BITBUCKET_EMAIL=test@example.com",
-		"NO_MISTAKES_BITBUCKET_API_TOKEN=test-token",
-		"NO_MISTAKES_BITBUCKET_API_BASE_URL=" + apiBaseURL,
 	}
+	return strings.Join(masked, "\x1f")
 }
 
-type fakeBitbucketCIAPI struct {
-	server         *httptest.Server
-	prState        string
-	statusesJSON   string
-	pipelinesJSON  string
-	stepsJSON      string
-	stepLog        string
-	stepsByPath    map[string]string
-	stepLogsByPath map[string]string
-	prSourceSHA    string
-	prStateCalls   int
-	statusesCalls  int
-	pipelinesCalls int
-	stepsCalls     int
-	stepLogCalls   int
-	lastAuthHeader string
-	lastStatusesQ  string
-	lastPipelineQ  string
+// twgDoctorOK is the response every twg-backed Bitbucket step needs for its
+// Available() precondition check.
+func twgDoctorOK() (string, fakeTwgResponse) {
+	return twgArgsKey("doctor", "--output", "json"), fakeTwgResponse{Stdout: twgEnvelope(`{"bitbucket":{"ok":true}}`)}
 }
 
-func newFakeBitbucketCIAPI(t *testing.T, prState, statusesJSON string) *fakeBitbucketCIAPI {
+// fakeTwg creates a mock twg binary in a temp dir and returns env entries for
+// StepContext.Env plus the invocation log file path. responses maps a
+// twgArgsKey-joined argv to the canned reply for that exact invocation.
+func fakeTwg(t *testing.T, responses map[string]fakeTwgResponse) (env []string, logFile string) {
 	t.Helper()
+	binDir := fakeCLIBinDir(t)
+	logFile = filepath.Join(t.TempDir(), "twg.log")
+	linkTestBinary(t, binDir, "twg")
 
-	api := &fakeBitbucketCIAPI{
-		prState:      prState,
-		statusesJSON: statusesJSON,
+	respFile := filepath.Join(t.TempDir(), "twg-responses.json")
+	data, err := json.Marshal(responses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(respFile, data, 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	api.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		api.lastAuthHeader = r.Header.Get("Authorization")
+	env = fakeCLIEnv(binDir, map[string]string{
+		"FAKE_CLI_MODE":      "twg",
+		"FAKE_CLI_LOG":       logFile,
+		"FAKE_TWG_RESPONSES": respFile,
+	})
+	return env, logFile
+}
 
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/2.0/repositories/test/repo/pullrequests/42":
-			api.prStateCalls++
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"id":42,"state":%q,"source":{"commit":{"hash":%q}}}`, api.prState, api.prSourceSHA)
-		case r.Method == http.MethodGet && r.URL.Path == "/2.0/repositories/test/repo/pullrequests/42/statuses":
-			api.statusesCalls++
-			api.lastStatusesQ = r.URL.Query().Get("q")
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, api.statusesJSON)
-		case r.Method == http.MethodGet && r.URL.Path == "/2.0/repositories/test/repo/pipelines" && api.pipelinesJSON != "":
-			api.pipelinesCalls++
-			api.lastPipelineQ = r.URL.Query().Get("target.commit.hash")
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, api.pipelinesJSON)
-		case r.Method == http.MethodGet && api.stepsByPath[r.URL.Path] != "":
-			api.stepsCalls++
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, api.stepsByPath[r.URL.Path])
-		case r.Method == http.MethodGet && api.stepLogsByPath[r.URL.Path] != "":
-			api.stepLogCalls++
-			fmt.Fprint(w, api.stepLogsByPath[r.URL.Path])
-		case r.Method == http.MethodGet && r.URL.Path == "/2.0/repositories/test/repo/pipelines/{pipeline-1}/steps" && api.stepsJSON != "":
-			api.stepsCalls++
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, api.stepsJSON)
-		case r.Method == http.MethodGet && r.URL.Path == "/2.0/repositories/test/repo/pipelines/{pipeline-1}/steps/{step-1}/log" && api.stepLog != "":
-			api.stepLogCalls++
-			fmt.Fprint(w, api.stepLog)
-		default:
-			t.Fatalf("unexpected Bitbucket CI API request: %s %s", r.Method, r.URL.String())
+// setProcessEnvFromFakeCLIEnv publishes every entry from a fakeCLIEnv-built
+// env slice (see fakeGH/fakeTwg) onto the real test process's environment via
+// t.Setenv, so a step running with sctx.Env == nil - which makes stepCmd fall
+// back to ambient PATH/env resolution instead of the StepContext-scoped
+// override - still finds and correctly drives the fake CLI binary.
+func setProcessEnvFromFakeCLIEnv(t *testing.T, env []string) {
+	t.Helper()
+	// fakeCLIEnv already builds PATH as "<binDir><sep><original PATH>", so each
+	// entry (including PATH) can be published as-is.
+	for _, kv := range env {
+		key, value, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
 		}
-	}))
-	t.Cleanup(api.server.Close)
+		t.Setenv(key, value)
+	}
+}
 
-	return api
+func countLogLines(t *testing.T, logFile, substr string) int {
+	t.Helper()
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	count := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, substr) {
+			count++
+		}
+	}
+	return count
 }
 
 func fakeGlab(t *testing.T, mrViewJSON string) (env []string, logFile string) {

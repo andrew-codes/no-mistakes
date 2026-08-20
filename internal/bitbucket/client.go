@@ -1,24 +1,19 @@
+// Package bitbucket implements scm.Host for Bitbucket Cloud by shelling out
+// to the twg CLI (`twg bitbucket ...` / its `twg bb ...` alias), mirroring
+// the CLI-adapter pattern used by internal/scm/github, internal/scm/gitlab,
+// and internal/scm/azuredevops. twg owns Bitbucket credentials and its own
+// auth/login lifecycle end to end; this package never handles a Bitbucket
+// App Password, email, or API token itself.
 package bitbucket
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
-	"os"
+	"os/exec"
+	"strconv"
 	"strings"
-	"time"
-)
-
-const (
-	defaultAPIBaseURL = "https://api.bitbucket.org"
-	envEmail          = "NO_MISTAKES_BITBUCKET_EMAIL"
-	envToken          = "NO_MISTAKES_BITBUCKET_API_TOKEN"
-	envAPIBaseURL     = "NO_MISTAKES_BITBUCKET_API_BASE_URL"
-	maxStepLogBytes   = 32 * 1024
 )
 
 type RepoRef struct {
@@ -41,48 +36,19 @@ type CommitStatus struct {
 	URL         string `json:"url"`
 }
 
-type Pipeline struct {
-	UUID string `json:"uuid"`
-}
+// CmdFactory builds an exec.Cmd in the caller's workdir with the caller's env,
+// matching the pattern used by internal/scm/github, internal/scm/gitlab, and
+// internal/scm/azuredevops.
+type CmdFactory func(ctx context.Context, name string, args ...string) *exec.Cmd
 
-type PipelineStep struct {
-	UUID  string `json:"uuid"`
-	State struct {
-		Name   string `json:"name"`
-		Result struct {
-			Name string `json:"name"`
-		} `json:"result"`
-	} `json:"state"`
-}
-
+// Client talks to Bitbucket Cloud through the twg CLI.
 type Client struct {
-	baseURL    string
-	email      string
-	token      string
-	httpClient *http.Client
+	cmd CmdFactory
 }
 
-func NewClientFromEnv(env []string) (*Client, error) {
-	email := lookupEnv(env, envEmail)
-	if strings.TrimSpace(email) == "" {
-		return nil, fmt.Errorf("missing %s", envEmail)
-	}
-	token := lookupEnv(env, envToken)
-	if strings.TrimSpace(token) == "" {
-		return nil, fmt.Errorf("missing %s", envToken)
-	}
-	baseURL := lookupEnv(env, envAPIBaseURL)
-	if strings.TrimSpace(baseURL) == "" {
-		baseURL = defaultAPIBaseURL
-	}
-	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		email:   email,
-		token:   token,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-	}, nil
+// NewClient builds a Client that shells out to twg via cmd.
+func NewClient(cmd CmdFactory) *Client {
+	return &Client{cmd: cmd}
 }
 
 func ParseRepoRef(raw string) (RepoRef, error) {
@@ -113,203 +79,56 @@ func parseRepoPath(path string) (RepoRef, error) {
 	return RepoRef{Workspace: parts[0], RepoSlug: parts[1]}, nil
 }
 
-func (c *Client) FindOpenPRBySourceBranch(ctx context.Context, repo RepoRef, branch, destBranch string) (*PullRequest, error) {
-	query := url.Values{}
-	clauses := []string{
-		fmt.Sprintf(`source.branch.name=%q`, branch),
-		fmt.Sprintf(`source.repository.full_name=%q`, repo.Workspace+"/"+repo.RepoSlug),
-	}
-	if strings.TrimSpace(destBranch) != "" {
-		clauses = append(clauses, fmt.Sprintf(`destination.branch.name=%q`, destBranch))
-	}
-	clauses = append(clauses, fmt.Sprintf(`state=%q`, "OPEN"))
-	query.Set("q", strings.Join(clauses, " AND "))
-
-	var response struct {
-		Values []bitbucketPullRequest `json:"values"`
-	}
-	if err := c.doJSON(ctx, http.MethodGet, repoPRPath(repo), query, nil, &response); err != nil {
-		return nil, err
-	}
-	if len(response.Values) == 0 {
-		return nil, nil
-	}
-	return response.Values[0].toPullRequest(), nil
+// repoArgs returns the --workspace/--repo flags shared by every twg
+// bitbucket invocation for repo.
+func repoArgs(repo RepoRef) []string {
+	return []string{"--workspace", repo.Workspace, "--repo", repo.RepoSlug}
 }
 
-func (c *Client) CreatePR(ctx context.Context, repo RepoRef, sourceBranch, destBranch, title, body string) (*PullRequest, error) {
-	requestBody := map[string]any{
-		"title":       title,
-		"description": body,
-		"source": map[string]any{
-			"branch": map[string]string{"name": sourceBranch},
-		},
-		"destination": map[string]any{
-			"branch": map[string]string{"name": destBranch},
-		},
-	}
-	var response bitbucketPullRequest
-	if err := c.doJSON(ctx, http.MethodPost, repoPRPath(repo), nil, requestBody, &response); err != nil {
-		return nil, err
-	}
-	return response.toPullRequest(), nil
+// twgEnvelope is the standard `--output json` wrapper twg emits on every
+// command: {"apiVersion":"v2","command":"...","data":<payload>}.
+type twgEnvelope struct {
+	Data json.RawMessage `json:"data"`
 }
 
-func (c *Client) UpdatePR(ctx context.Context, repo RepoRef, prID int, title, body string) (*PullRequest, error) {
-	requestBody := map[string]any{
-		"title":       title,
-		"description": body,
-	}
-	var response bitbucketPullRequest
-	if err := c.doJSON(ctx, http.MethodPut, fmt.Sprintf("%s/%d", repoPRPath(repo), prID), nil, requestBody, &response); err != nil {
-		return nil, err
-	}
-	return response.toPullRequest(), nil
-}
-
-func (c *Client) GetPR(ctx context.Context, repo RepoRef, prID int) (*PullRequest, error) {
-	var response bitbucketPullRequest
-	if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/%d", repoPRPath(repo), prID), nil, nil, &response); err != nil {
-		return nil, err
-	}
-	return response.toPullRequest(), nil
-}
-
-func (c *Client) ListPRStatuses(ctx context.Context, repo RepoRef, prID int) ([]CommitStatus, error) {
-	query := url.Values{}
-	query.Set("sort", "-created_on")
-
-	next := fmt.Sprintf("%s/%d/statuses?%s", repoPRPath(repo), prID, query.Encode())
-	statuses := make([]CommitStatus, 0)
-	for next != "" {
-		var response struct {
-			Values []CommitStatus `json:"values"`
-			Next   string         `json:"next"`
-		}
-		if err := c.doJSONPathOrURL(ctx, http.MethodGet, next, nil, &response); err != nil {
-			return nil, err
-		}
-		statuses = append(statuses, response.Values...)
-		if response.Next != "" {
-			validatedNext, err := c.validatePaginationURL(response.Next)
-			if err != nil {
-				return nil, err
-			}
-			next = validatedNext
-			continue
-		}
-		next = response.Next
-	}
-	return statuses, nil
-}
-
-func (c *Client) ListPipelinesByCommit(ctx context.Context, repo RepoRef, commitSHA string) ([]Pipeline, error) {
-	query := url.Values{}
-	query.Set("target.commit.hash", commitSHA)
-	query.Set("sort", "-created_on")
-
-	next := fmt.Sprintf("%s/2.0/repositories/%s/%s/pipelines?%s", c.baseURL, repo.Workspace, repo.RepoSlug, query.Encode())
-	pipelines := make([]Pipeline, 0)
-	for next != "" {
-		var response struct {
-			Values []Pipeline `json:"values"`
-			Next   string     `json:"next"`
-		}
-		if err := c.doJSONPathOrURL(ctx, http.MethodGet, next, nil, &response); err != nil {
-			return nil, err
-		}
-		pipelines = append(pipelines, response.Values...)
-		if response.Next == "" {
-			next = ""
-			continue
-		}
-		validatedNext, err := c.validatePaginationURL(response.Next)
-		if err != nil {
-			return nil, err
-		}
-		next = validatedNext
-	}
-	return pipelines, nil
-}
-
-func (c *Client) ListPipelineSteps(ctx context.Context, repo RepoRef, pipelineUUID string) ([]PipelineStep, error) {
-	next := fmt.Sprintf("%s/2.0/repositories/%s/%s/pipelines/%s/steps", c.baseURL, repo.Workspace, repo.RepoSlug, pipelineUUID)
-	steps := make([]PipelineStep, 0)
-	for next != "" {
-		var response struct {
-			Values []PipelineStep `json:"values"`
-			Next   string         `json:"next"`
-		}
-		if err := c.doJSONPathOrURL(ctx, http.MethodGet, next, nil, &response); err != nil {
-			return nil, err
-		}
-		steps = append(steps, response.Values...)
-		if response.Next == "" {
-			next = ""
-			continue
-		}
-		validatedNext, err := c.validatePaginationURL(response.Next)
-		if err != nil {
-			return nil, err
-		}
-		next = validatedNext
-	}
-	return steps, nil
-}
-
-func (c *Client) GetStepLog(ctx context.Context, repo RepoRef, pipelineUUID, stepUUID string) (string, error) {
-	path := fmt.Sprintf("/2.0/repositories/%s/%s/pipelines/%s/steps/%s/log", repo.Workspace, repo.RepoSlug, pipelineUUID, stepUUID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+// run executes `twg <args...> --output json` and returns the unwrapped
+// "data" payload. twg's `-o/--output json` flag (undocumented alias
+// `--output-summary`/`--agent-fields` are opt-in only and left unset here) is
+// documented to emit "pure machine-readable JSON on stdout", so stdout is
+// parsed directly with no banner-skipping needed.
+func (c *Client) run(ctx context.Context, args ...string) (json.RawMessage, error) {
+	args = append(append([]string{}, args...), "--output", "json")
+	cmd := c.cmd(ctx, "twg", args...)
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("build Bitbucket request: %w", err)
+		return nil, fmt.Errorf("twg %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 	}
-	req.SetBasicAuth(c.email, c.token)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("Bitbucket GET %s: %w", path, err)
+	var envelope twgEnvelope
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		return nil, fmt.Errorf("twg %s: decode response: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Bitbucket GET %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-	data, err := readTail(resp.Body, maxStepLogBytes)
-	if err != nil {
-		return "", fmt.Errorf("read Bitbucket step log: %w", err)
-	}
-	return strings.TrimSpace(string(data)), nil
+	return envelope.Data, nil
 }
 
-func readTail(r io.Reader, maxBytes int) ([]byte, error) {
-	if maxBytes <= 0 {
-		return nil, nil
+// decodeList extracts the item array from a twg list payload, which is
+// either a bare JSON array or an object carrying it under "values" (the
+// Bitbucket Cloud REST pagination envelope) or "items".
+func decodeList(data json.RawMessage) ([]json.RawMessage, error) {
+	var asArray []json.RawMessage
+	if err := json.Unmarshal(data, &asArray); err == nil {
+		return asArray, nil
 	}
-	buf := make([]byte, 0, maxBytes)
-	tmp := make([]byte, 4096)
-	for {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			chunk := tmp[:n]
-			if len(chunk) >= maxBytes {
-				buf = append(buf[:0], chunk[len(chunk)-maxBytes:]...)
-			} else {
-				overflow := len(buf) + len(chunk) - maxBytes
-				if overflow > 0 {
-					buf = append(buf[overflow:], chunk...)
-				} else {
-					buf = append(buf, chunk...)
-				}
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
+	var asObject struct {
+		Values []json.RawMessage `json:"values"`
+		Items  []json.RawMessage `json:"items"`
 	}
-	return append([]byte(nil), buf...), nil
+	if err := json.Unmarshal(data, &asObject); err != nil {
+		return nil, fmt.Errorf("decode twg list payload: %w", err)
+	}
+	if len(asObject.Values) > 0 {
+		return asObject.Values, nil
+	}
+	return asObject.Items, nil
 }
 
 type bitbucketPullRequest struct {
@@ -319,6 +138,9 @@ type bitbucketPullRequest struct {
 		Commit struct {
 			Hash string `json:"hash"`
 		} `json:"commit"`
+		Branch struct {
+			Name string `json:"name"`
+		} `json:"branch"`
 	} `json:"source"`
 	Links struct {
 		HTML struct {
@@ -336,89 +158,130 @@ func (pr bitbucketPullRequest) toPullRequest() *PullRequest {
 	}
 }
 
-func (c *Client) validatePaginationURL(rawURL string) (string, error) {
-	base, err := url.Parse(c.baseURL)
+// FindOpenPRBySourceBranch looks up the open PR from branch to destBranch, if any.
+func (c *Client) FindOpenPRBySourceBranch(ctx context.Context, repo RepoRef, branch, destBranch string) (*PullRequest, error) {
+	args := append([]string{"bitbucket", "pull-requests", "query", "--scope", "repo", "--source", branch, "--state", "OPEN"}, repoArgs(repo)...)
+	if strings.TrimSpace(destBranch) != "" {
+		args = append(args, "--dest", destBranch)
+	}
+	data, err := c.run(ctx, args...)
 	if err != nil {
-		return "", fmt.Errorf("parse Bitbucket base URL: %w", err)
+		return nil, err
 	}
-	nextURL, err := url.Parse(rawURL)
+	items, err := decodeList(data)
 	if err != nil {
-		return "", fmt.Errorf("parse Bitbucket pagination URL: %w", err)
+		return nil, err
 	}
-	if !nextURL.IsAbs() {
-		return rawURL, nil
+	if len(items) == 0 {
+		return nil, nil
 	}
-	if !strings.EqualFold(nextURL.Scheme, base.Scheme) || !strings.EqualFold(nextURL.Host, base.Host) {
-		return "", fmt.Errorf("reject cross-origin Bitbucket pagination URL %q", rawURL)
+	var pr bitbucketPullRequest
+	if err := json.Unmarshal(items[0], &pr); err != nil {
+		return nil, fmt.Errorf("decode Bitbucket pull request: %w", err)
 	}
-	return rawURL, nil
+	return pr.toPullRequest(), nil
 }
 
-func (c *Client) doJSON(ctx context.Context, method, path string, query url.Values, requestBody any, responseBody any) error {
-	endpoint := c.baseURL + path
-	if len(query) > 0 {
-		endpoint += "?" + query.Encode()
+// CreatePR creates a new pull request from sourceBranch to destBranch.
+func (c *Client) CreatePR(ctx context.Context, repo RepoRef, sourceBranch, destBranch, title, body string) (*PullRequest, error) {
+	args := append([]string{"bitbucket", "pull-requests", "create",
+		"--title", title,
+		"--source", sourceBranch,
+		"--dest", destBranch,
+		"--description", body,
+	}, repoArgs(repo)...)
+	data, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
 	}
-	return c.doJSONPathOrURL(ctx, method, endpoint, requestBody, responseBody)
+	var pr bitbucketPullRequest
+	if err := json.Unmarshal(data, &pr); err != nil {
+		return nil, fmt.Errorf("decode Bitbucket pull request: %w", err)
+	}
+	return pr.toPullRequest(), nil
 }
 
-func (c *Client) doJSONPathOrURL(ctx context.Context, method, pathOrURL string, requestBody any, responseBody any) error {
-	var bodyReader io.Reader = http.NoBody
-	if requestBody != nil {
-		payload, err := json.Marshal(requestBody)
-		if err != nil {
-			return fmt.Errorf("marshal Bitbucket request body: %w", err)
+// UpdatePR updates an existing pull request's title and description.
+func (c *Client) UpdatePR(ctx context.Context, repo RepoRef, prID int, title, body string) (*PullRequest, error) {
+	args := append([]string{"bitbucket", "pull-requests", "update",
+		"--pull-request", strconv.Itoa(prID),
+		"--title", title,
+		"--description", body,
+	}, repoArgs(repo)...)
+	data, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	var pr bitbucketPullRequest
+	if err := json.Unmarshal(data, &pr); err != nil {
+		return nil, fmt.Errorf("decode Bitbucket pull request: %w", err)
+	}
+	return pr.toPullRequest(), nil
+}
+
+// GetPR fetches a pull request's current state.
+func (c *Client) GetPR(ctx context.Context, repo RepoRef, prID int) (*PullRequest, error) {
+	args := append([]string{"bitbucket", "pull-requests", "get", strconv.Itoa(prID)}, repoArgs(repo)...)
+	data, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	var pr bitbucketPullRequest
+	if err := json.Unmarshal(data, &pr); err != nil {
+		return nil, fmt.Errorf("decode Bitbucket pull request: %w", err)
+	}
+	return pr.toPullRequest(), nil
+}
+
+// ListPRStatuses lists the build/CI statuses attached to a pull request.
+func (c *Client) ListPRStatuses(ctx context.Context, repo RepoRef, prID int) ([]CommitStatus, error) {
+	args := append([]string{"bitbucket", "pull-requests", "get", strconv.Itoa(prID), "--statuses"}, repoArgs(repo)...)
+	data, err := c.run(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Statuses []CommitStatus `json:"_statuses"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("decode Bitbucket pull request statuses: %w", err)
+	}
+	return payload.Statuses, nil
+}
+
+// GetFailedStepLog fetches the log of the first FAILED/ERROR/STOPPED step in
+// the given pipeline (identified by UUID, build number, or result URL).
+// Returns "" when the pipeline has no failed step or produced no log.
+func (c *Client) GetFailedStepLog(ctx context.Context, repo RepoRef, pipelineRef string) (string, error) {
+	args := append([]string{"bitbucket", "pipeline", "get",
+		"--pipeline", pipelineRef,
+		"--logs", "--failed-steps",
+	}, repoArgs(repo)...)
+	data, err := c.run(ctx, args...)
+	if err != nil {
+		return "", err
+	}
+	var payload struct {
+		Steps []struct {
+			State struct {
+				Result struct {
+					Name string `json:"name"`
+				} `json:"result"`
+			} `json:"state"`
+			Log string `json:"log"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", fmt.Errorf("decode Bitbucket pipeline: %w", err)
+	}
+	for _, step := range payload.Steps {
+		result := strings.ToUpper(strings.TrimSpace(step.State.Result.Name))
+		if result != "FAILED" && result != "ERROR" && result != "STOPPED" {
+			continue
 		}
-		bodyReader = bytes.NewReader(payload)
-	}
-
-	endpoint := pathOrURL
-	requestLabel := pathOrURL
-	if !strings.HasPrefix(pathOrURL, "http://") && !strings.HasPrefix(pathOrURL, "https://") {
-		endpoint = c.baseURL + pathOrURL
-	}
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
-	if err != nil {
-		return fmt.Errorf("build Bitbucket request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.SetBasicAuth(c.email, c.token)
-	if requestBody != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("Bitbucket %s %s: %w", method, requestLabel, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("Bitbucket %s %s: status %d: %s", method, requestLabel, resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-	if responseBody == nil {
-		return nil
-	}
-	if err := json.NewDecoder(resp.Body).Decode(responseBody); err != nil {
-		return fmt.Errorf("decode Bitbucket response: %w", err)
-	}
-	return nil
-}
-
-func repoPRPath(repo RepoRef) string {
-	return fmt.Sprintf("/2.0/repositories/%s/%s/pullrequests", repo.Workspace, repo.RepoSlug)
-}
-
-func lookupEnv(env []string, key string) string {
-	prefix := key + "="
-	for _, entry := range env {
-		if strings.HasPrefix(entry, prefix) {
-			return strings.TrimPrefix(entry, prefix)
+		if log := strings.TrimSpace(step.Log); log != "" {
+			return log, nil
 		}
 	}
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return ""
+	return "", nil
 }

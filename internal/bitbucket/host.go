@@ -2,6 +2,7 @@ package bitbucket
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,15 +12,19 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
 
-// Host implements scm.Host for Bitbucket using the REST API client.
+// Host implements scm.Host for Bitbucket using the twg-backed Client.
 type Host struct {
-	client *Client
-	repo   RepoRef
+	client       *Client
+	repo         RepoRef
+	cliAvailable func() bool
 }
 
-// NewHost builds a Host from an API client and a parsed repository reference.
-func NewHost(client *Client, repo RepoRef) *Host {
-	return &Host{client: client, repo: repo}
+// NewHost builds a Host from a twg-backed client and a parsed repository
+// reference. cliAvailable reports whether the twg binary is resolvable on
+// the caller's PATH (possibly overridden by env); when nil, availability is
+// determined solely by the doctor check in Available.
+func NewHost(client *Client, repo RepoRef, cliAvailable func() bool) *Host {
+	return &Host{client: client, repo: repo, cliAvailable: cliAvailable}
 }
 
 func (h *Host) Provider() scm.Provider { return scm.ProviderBitbucket }
@@ -30,9 +35,36 @@ func (h *Host) Capabilities() scm.Capabilities {
 	return scm.Capabilities{MergeableState: false, FailedCheckLogs: true}
 }
 
-func (h *Host) Available(_ context.Context) error {
+// doctorPayload mirrors the subset of `twg doctor --output json`'s data that
+// reports Bitbucket-specific auth resolution.
+type doctorPayload struct {
+	Bitbucket struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+	} `json:"bitbucket"`
+}
+
+func (h *Host) Available(ctx context.Context) error {
 	if h.client == nil {
 		return errors.New("bitbucket client is not configured")
+	}
+	if h.cliAvailable != nil && !h.cliAvailable() {
+		return errors.New("twg CLI is not installed")
+	}
+	data, err := h.client.run(ctx, "doctor")
+	if err != nil {
+		return fmt.Errorf("twg doctor: %w", err)
+	}
+	var doctor doctorPayload
+	if err := json.Unmarshal(data, &doctor); err != nil {
+		return fmt.Errorf("twg doctor: decode response: %w", err)
+	}
+	if !doctor.Bitbucket.OK {
+		msg := strings.TrimSpace(doctor.Bitbucket.Message)
+		if msg == "" {
+			msg = "twg is not authenticated with Bitbucket"
+		}
+		return errors.New(msg)
 	}
 	return nil
 }
@@ -107,49 +139,31 @@ func (h *Host) GetMergeableState(_ context.Context, _ *scm.PR) (scm.MergeableSta
 	return "", scm.ErrUnsupported
 }
 
-func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, headSHA string, failingNames []string) (string, error) {
-	if h.client == nil {
+// FetchFailedCheckLogs finds the pipeline behind a failing check by reading
+// the check's status URL (Bitbucket Pipelines build statuses always link to
+// their pipeline result: .../pipelines/results/<uuid>) and fetches its
+// failed step's log directly. twg has no "list pipelines by commit" primitive,
+// so this only covers checks whose status carries a result URL - the case
+// every real caller hits, since failingNames always comes from a prior
+// GetChecks pass over the same statuses.
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _ string, failingNames []string) (string, error) {
+	if h.client == nil || len(failingNames) == 0 {
 		return "", nil
 	}
 	id, err := strconv.Atoi(pr.Number)
 	if err != nil {
 		return "", err
 	}
-	commitSHA := strings.TrimSpace(headSHA)
-	var targets map[string]struct{}
-	if got, prErr := h.client.GetPR(ctx, h.repo, id); prErr == nil && got != nil && strings.TrimSpace(got.SourceCommitHash) != "" {
-		commitSHA = strings.TrimSpace(got.SourceCommitHash)
-	}
-	if statuses, statusErr := h.client.ListPRStatuses(ctx, h.repo, id); statusErr == nil {
-		targets = failedPipelineUUIDs(statuses, failingNames)
-	}
-	if strings.TrimSpace(commitSHA) == "" {
-		return "", nil
-	}
-	pipelines, err := h.client.ListPipelinesByCommit(ctx, h.repo, commitSHA)
+	statuses, err := h.client.ListPRStatuses(ctx, h.repo, id)
 	if err != nil {
 		return "", nil
 	}
-	for _, pipelineRun := range pipelines {
-		if len(targets) > 0 {
-			if _, ok := targets[normalizePipelineUUID(pipelineRun.UUID)]; !ok {
-				continue
-			}
-		}
-		steps, err := h.client.ListPipelineSteps(ctx, h.repo, pipelineRun.UUID)
-		if err != nil {
+	for _, uuid := range failedPipelineUUIDs(statuses, failingNames) {
+		logOutput, err := h.client.GetFailedStepLog(ctx, h.repo, uuid)
+		if err != nil || strings.TrimSpace(logOutput) == "" {
 			continue
 		}
-		for _, step := range steps {
-			if !strings.EqualFold(step.State.Result.Name, "FAILED") {
-				continue
-			}
-			logOutput, err := h.client.GetStepLog(ctx, h.repo, pipelineRun.UUID, step.UUID)
-			if err != nil || strings.TrimSpace(logOutput) == "" {
-				continue
-			}
-			return strings.TrimSpace(logOutput), nil
-		}
+		return strings.TrimSpace(logOutput), nil
 	}
 	return "", nil
 }
@@ -261,7 +275,9 @@ func pipelineUUIDFromStatusURL(raw string) string {
 	return ""
 }
 
-func failedPipelineUUIDs(statuses []CommitStatus, failingNames []string) map[string]struct{} {
+// failedPipelineUUIDs returns the pipeline UUIDs (in stable order) behind the
+// named failing statuses, derived from each status's result URL.
+func failedPipelineUUIDs(statuses []CommitStatus, failingNames []string) []string {
 	if len(failingNames) == 0 {
 		return nil
 	}
@@ -275,18 +291,21 @@ func failedPipelineUUIDs(statuses []CommitStatus, failingNames []string) map[str
 	if len(failing) == 0 {
 		return nil
 	}
-	targets := map[string]struct{}{}
+	seen := make(map[string]struct{})
+	var uuids []string
 	for _, status := range LatestStatuses(statuses) {
 		if _, ok := failing[statusName(status)]; !ok {
 			continue
 		}
 		uuid := pipelineUUIDFromStatusURL(status.URL)
-		if uuid != "" {
-			targets[uuid] = struct{}{}
+		if uuid == "" {
+			continue
 		}
+		if _, ok := seen[uuid]; ok {
+			continue
+		}
+		seen[uuid] = struct{}{}
+		uuids = append(uuids, uuid)
 	}
-	if len(targets) == 0 {
-		return nil
-	}
-	return targets
+	return uuids
 }

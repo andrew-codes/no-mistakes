@@ -246,7 +246,7 @@ func (p Provider) CLIName() string {
 	case ProviderGitLab:
 		return "glab"
 	case ProviderBitbucket:
-		return "bb"
+		return "twg"
 	case ProviderAzureDevOps:
 		return "az"
 	default:
@@ -261,7 +261,11 @@ func (p Provider) AuthCheckCommand() []string {
 	case ProviderGitLab:
 		return []string{"glab", "auth", "status"}
 	case ProviderBitbucket:
-		return []string{"bb", "profile", "which"}
+		// twg doctor always exits 0 (it's a diagnostic report, not a pass/fail
+		// probe); the Bitbucket Host implements its own Available() check that
+		// parses the doctor JSON's bitbucket.ok field instead of relying on
+		// this generic exit-code contract.
+		return []string{"twg", "doctor"}
 	case ProviderAzureDevOps:
 		return []string{"az", "account", "show"}
 	default:

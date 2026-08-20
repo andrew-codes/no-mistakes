@@ -34,6 +34,14 @@ Safest local verification sequence after non-trivial changes:
 - The backend is pinned against `glab v1.5x`, whose flag surface drifts between versions: the auth check must be host-scoped (`--hostname <host>`, falling back to unscoped only when the host is unknown), `glab mr list` no longer accepts `--state opened`, and the daemon's detached-HEAD worktree breaks `glab ci get`, so pipeline jobs are read via the branch-independent `glab api .../pipelines/<id>/jobs` REST endpoint.
 - The comments in `internal/scm/gitlab/gitlab.go` own the full rationale for each trap; extend them there when you hit new glab version drift.
 
+**Bitbucket Backend (`internal/bitbucket`) - twg-only, no fork routing**
+
+- Bitbucket Cloud access is entirely twg-CLI-backed (`twg bitbucket ...`), following the same `CmdFactory`/`stepCmd` shelling pattern as `internal/scm/github`, `internal/scm/gitlab`, and `internal/scm/azuredevops`. There is no HTTP client, no Bitbucket App Password/email/API-token credential, and no `NO_MISTAKES_BITBUCKET_*` env var anywhere in this codebase; `twg` owns Bitbucket auth and its own login lifecycle end to end. This is a permanent local fork divergence from upstream `kunchenguid/no-mistakes` - do not reintroduce the env-var-gated HTTP client.
+- `buildHost` (`internal/pipeline/steps/host.go`) constructs the Bitbucket `Host` unconditionally, same as the other providers; `Host.Available` runs `twg doctor --output json` and reads the `bitbucket.ok`/`bitbucket.message` fields for the auth precondition, since `twg doctor` always exits 0 regardless of auth state (it is a diagnostic report, not a pass/fail probe).
+- `twg` has no "list pipelines by commit hash" primitive, so `Host.FetchFailedCheckLogs` derives the pipeline UUID straight from each failing check's status URL (`.../pipelines/results/<uuid>`, always present on a real Bitbucket Pipelines build status) and fetches its failed step directly via `twg bitbucket pipeline get --pipeline <uuid> --logs --failed-steps`, rather than round-tripping through a commit-based pipeline search.
+- `twg`'s `--output json` wraps every response as `{"apiVersion","command","data":<payload>}`; `internal/bitbucket/client.go`'s `run` helper unwraps `data`, and list-shaped commands (`decodeList`) accept either a bare JSON array or a `{"values":[...]}` envelope, matching Bitbucket's own REST pagination shape.
+- Regressions: `internal/bitbucket/client_test.go`, `internal/bitbucket/host_test.go` (fake `twg` binary via `newFakeTwgClient`/`fake_twg_test.go`), `internal/pipeline/steps/pr_test.go` and `ci_bitbucket_test.go` Bitbucket cases (fake `twg` binary via `fakeTwg` in `helpers_test.go`, dispatched through `steps_test.go`'s `fakeTwgHandler`).
+
 **Documentation**
 
 - Keep `README.md` concise and high-level; the bar needs to be extremely high for what shows up there.

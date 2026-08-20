@@ -2,13 +2,13 @@ package bitbucket
 
 import (
 	"context"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"strconv"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestParseRepoRefRejectsLookalikeHosts(t *testing.T) {
@@ -54,39 +54,192 @@ func TestParseRepoRefRejectsLookalikeHosts(t *testing.T) {
 	}
 }
 
-func TestListPRStatusesFollowsPagination(t *testing.T) {
-	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
-	var pageCalls int
+// fakeTwgResponse describes what the fake twg binary should emit for one
+// matched invocation.
+type fakeTwgResponse struct {
+	Stdout   string `json:"stdout"`
+	ExitCode int    `json:"exitCode"`
+}
 
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/2.0/repositories/test/repo/pullrequests/42/statuses" {
-			t.Fatalf("path = %q, want %q", r.URL.Path, "/2.0/repositories/test/repo/pullrequests/42/statuses")
-		}
-		if got := r.URL.Query().Get("sort"); got != "-created_on" {
-			t.Fatalf("sort = %q, want -created_on", got)
-		}
-		pageCalls++
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Query().Get("page") {
-		case "", "1":
-			_, _ = w.Write([]byte(`{"values":[{"name":"build","state":"SUCCESSFUL"}],"next":"` + server.URL + `/2.0/repositories/test/repo/pullrequests/42/statuses?sort=-created_on&page=2"}`))
-		case "2":
-			_, _ = w.Write([]byte(`{"values":[{"name":"tests","state":"FAILED"}]}`))
-		default:
-			t.Fatalf("unexpected page query %q", r.URL.RawQuery)
-		}
-	}))
-	defer server.Close()
+// newFakeTwgClient builds a Client whose CmdFactory invokes this test binary
+// re-executed as a fake "twg" that replies from responses, keyed by the exact
+// argv (joined with a unit separator) the Client is expected to invoke.
+// logFile records one line per invocation (joined argv) for assertions.
+func newFakeTwgClient(t *testing.T, responses map[string]fakeTwgResponse) (*Client, string) {
+	t.Helper()
+	binDir := t.TempDir()
+	linkTestBinaryAs(t, binDir, "twg")
 
-	client := &Client{
-		baseURL: server.URL,
-		email:   "test@example.com",
-		token:   "token",
-		httpClient: &http.Client{
-			Timeout: time.Second,
-		},
+	respFile := filepath.Join(t.TempDir(), "responses.json")
+	data, err := json.Marshal(responses)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if err := os.WriteFile(respFile, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logFile := filepath.Join(t.TempDir(), "twg.log")
+
+	env := []string{
+		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"FAKE_TWG_MODE=1",
+		"FAKE_TWG_RESPONSES=" + respFile,
+		"FAKE_TWG_LOG=" + logFile,
+	}
+
+	cmdFactory := func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		// exec.CommandContext resolves name against the CALLING process's PATH
+		// immediately, before cmd.Env below ever takes effect for the child -
+		// so the binary must be resolved from binDir explicitly here, or this
+		// would silently invoke a real twg found on the test runner's PATH.
+		resolved := filepath.Join(binDir, name)
+		if runtime.GOOS == "windows" {
+			resolved += ".exe"
+		}
+		cmd := exec.CommandContext(ctx, resolved, args...)
+		cmd.Env = env
+		return cmd
+	}
+	return NewClient(cmdFactory), logFile
+}
+
+func linkTestBinaryAs(t *testing.T, binDir, name string) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	dst := filepath.Join(binDir, name)
+	if err := os.Link(exe, dst); err != nil {
+		data, readErr := os.ReadFile(exe)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if err := os.WriteFile(dst, data, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func readFakeTwgLog(t *testing.T, logFile string) []string {
+	t.Helper()
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "\n")
+}
+
+func envelope(t *testing.T, data string) string {
+	t.Helper()
+	return `{"apiVersion":"v2","command":"test","data":` + data + `}`
+}
+
+func TestClient_FindOpenPRBySourceBranch_QueriesOpenPRsByBranchAndDest(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fquery\x1f--scope\x1frepo\x1f--source\x1ffeature\x1f--state\x1fOPEN\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--dest\x1fmain\x1f--output\x1fjson"
+	client, logFile := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `[{"id":42,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/42"}}}]`)},
+	})
+
+	pr, err := client.FindOpenPRBySourceBranch(context.Background(), repo, "feature", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr == nil || pr.ID != 42 {
+		t.Fatalf("pr = %#v, want id 42", pr)
+	}
+	if pr.URL != "https://bitbucket.org/test/repo/pull-requests/42" {
+		t.Fatalf("pr.URL = %q", pr.URL)
+	}
+	if got := readFakeTwgLog(t, logFile); len(got) != 1 {
+		t.Fatalf("invocations = %v, want exactly 1", got)
+	}
+}
+
+func TestClient_FindOpenPRBySourceBranch_NoResultsReturnsNil(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fquery\x1f--scope\x1frepo\x1f--source\x1ffeature\x1f--state\x1fOPEN\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `[]`)},
+	})
+
+	pr, err := client.FindOpenPRBySourceBranch(context.Background(), repo, "feature", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr != nil {
+		t.Fatalf("pr = %#v, want nil", pr)
+	}
+}
+
+func TestClient_CreatePR(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fcreate\x1f--title\x1ffeat: thing\x1f--source\x1ffeature\x1f--dest\x1fmain\x1f--description\x1fbody text\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+	client, logFile := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `{"id":99,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/99"}}}`)},
+	})
+
+	pr, err := client.CreatePR(context.Background(), repo, "feature", "main", "feat: thing", "body text")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr == nil || pr.ID != 99 {
+		t.Fatalf("pr = %#v, want id 99", pr)
+	}
+	if got := readFakeTwgLog(t, logFile); len(got) != 1 {
+		t.Fatalf("invocations = %v, want exactly 1", got)
+	}
+}
+
+func TestClient_UpdatePR(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fupdate\x1f--pull-request\x1f42\x1f--title\x1fnew title\x1f--description\x1fnew body\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `{"id":42,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/42"}}}`)},
+	})
+
+	pr, err := client.UpdatePR(context.Background(), repo, 42, "new title", "new body")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr == nil || pr.ID != 42 {
+		t.Fatalf("pr = %#v, want id 42", pr)
+	}
+}
+
+func TestClient_GetPR(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fget\x1f42\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `{"id":42,"state":"MERGED","source":{"commit":{"hash":"abc123"}},"links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/42"}}}`)},
+	})
+
+	pr, err := client.GetPR(context.Background(), repo, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr == nil || pr.State != "MERGED" || pr.SourceCommitHash != "abc123" {
+		t.Fatalf("pr = %#v", pr)
+	}
+}
+
+func TestClient_ListPRStatuses(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fget\x1f42\x1f--statuses\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `{"id":42,"_statuses":[{"name":"build","state":"SUCCESSFUL"},{"name":"tests","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/{pipe-1}"}]}`)},
+	})
 
 	statuses, err := client.ListPRStatuses(context.Background(), repo, 42)
 	if err != nil {
@@ -98,203 +251,52 @@ func TestListPRStatusesFollowsPagination(t *testing.T) {
 	if statuses[0].Name != "build" || statuses[1].Name != "tests" {
 		t.Fatalf("statuses = %#v, want build then tests", statuses)
 	}
-	if pageCalls != 2 {
-		t.Fatalf("pageCalls = %d, want 2", pageCalls)
+}
+
+func TestClient_GetFailedStepLog(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpipeline\x1fget\x1f--pipeline\x1f{pipe-1}\x1f--logs\x1f--failed-steps\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `{"steps":[{"state":{"result":{"name":"FAILED"}},"log":"boom: test failed\n"}]}`)},
+	})
+
+	logOutput, err := client.GetFailedStepLog(context.Background(), repo, "{pipe-1}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logOutput != "boom: test failed" {
+		t.Fatalf("logOutput = %q", logOutput)
 	}
 }
 
-func TestListPRStatusesRejectsCrossOriginPagination(t *testing.T) {
+func TestClient_GetFailedStepLog_NoFailedStepReturnsEmpty(t *testing.T) {
 	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpipeline\x1fget\x1f--pipeline\x1f{pipe-1}\x1f--logs\x1f--failed-steps\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `{"steps":[]}`)},
+	})
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"values":[{"name":"build","state":"SUCCESSFUL"}],"next":"https://evil.example/2.0/repositories/test/repo/pullrequests/42/statuses?page=2"}`)
-	}))
-	defer server.Close()
-
-	client := &Client{
-		baseURL: server.URL,
-		email:   "test@example.com",
-		token:   "token",
-		httpClient: &http.Client{
-			Timeout: time.Second,
-		},
+	logOutput, err := client.GetFailedStepLog(context.Background(), repo, "{pipe-1}")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if logOutput != "" {
+		t.Fatalf("logOutput = %q, want empty", logOutput)
+	}
+}
 
-	_, err := client.ListPRStatuses(context.Background(), repo, 42)
+func TestClient_RunPropagatesCLIFailure(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fget\x1f42\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: "not authenticated with Bitbucket", ExitCode: 1},
+	})
+
+	_, err := client.GetPR(context.Background(), repo, 42)
 	if err == nil {
-		t.Fatal("expected cross-origin pagination to fail")
+		t.Fatal("expected error")
 	}
-	if !strings.Contains(err.Error(), "cross-origin") {
-		t.Fatalf("error = %q, want cross-origin validation failure", err)
-	}
-}
-
-func TestFindOpenPRBySourceAndDestinationBranchFiltersSourceRepo(t *testing.T) {
-	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
-	var gotQ string
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/2.0/repositories/test/repo/pullrequests" {
-			t.Fatalf("path = %q, want %q", r.URL.Path, "/2.0/repositories/test/repo/pullrequests")
-		}
-		gotQ = r.URL.Query().Get("q")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"values":[{"id":42,"links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/42"}}}]}`))
-	}))
-	defer server.Close()
-
-	client := &Client{
-		baseURL: server.URL,
-		email:   "test@example.com",
-		token:   "token",
-		httpClient: &http.Client{
-			Timeout: time.Second,
-		},
-	}
-
-	pr, err := client.FindOpenPRBySourceBranch(context.Background(), repo, "feature", "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pr == nil || pr.ID != 42 {
-		t.Fatalf("pr = %#v, want id 42", pr)
-	}
-	if gotQ != `source.branch.name="feature" AND source.repository.full_name="test/repo" AND destination.branch.name="main" AND state="OPEN"` {
-		t.Fatalf("q = %q, want source repo and destination branch filters", gotQ)
-	}
-}
-
-func TestListPipelinesByCommitFollowsPagination(t *testing.T) {
-	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
-	var pageCalls int
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/2.0/repositories/test/repo/pipelines" {
-			t.Fatalf("path = %q, want %q", r.URL.Path, "/2.0/repositories/test/repo/pipelines")
-		}
-		if got := r.URL.Query().Get("target.commit.hash"); got != "abc123" {
-			t.Fatalf("target.commit.hash = %q, want abc123", got)
-		}
-		if got := r.URL.Query().Get("sort"); got != "-created_on" {
-			t.Fatalf("sort = %q, want -created_on", got)
-		}
-		pageCalls++
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Query().Get("page") {
-		case "", "1":
-			_, _ = w.Write([]byte(`{"values":[{"uuid":"{first}"}],"next":"` + server.URL + `/2.0/repositories/test/repo/pipelines?target.commit.hash=abc123&sort=-created_on&page=2"}`))
-		case "2":
-			_, _ = w.Write([]byte(`{"values":[{"uuid":"{second}"}]}`))
-		default:
-			t.Fatalf("unexpected page query %q", r.URL.RawQuery)
-		}
-	}))
-	defer server.Close()
-
-	client := &Client{
-		baseURL: server.URL,
-		email:   "test@example.com",
-		token:   "token",
-		httpClient: &http.Client{
-			Timeout: time.Second,
-		},
-	}
-
-	pipelines, err := client.ListPipelinesByCommit(context.Background(), repo, "abc123")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pipelines) != 2 {
-		t.Fatalf("len(pipelines) = %d, want 2", len(pipelines))
-	}
-	if pipelines[0].UUID != "{first}" || pipelines[1].UUID != "{second}" {
-		t.Fatalf("pipelines = %#v, want first then second", pipelines)
-	}
-	if pageCalls != 2 {
-		t.Fatalf("pageCalls = %d, want 2", pageCalls)
-	}
-}
-
-func TestListPipelineStepsFollowsPagination(t *testing.T) {
-	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
-	var pageCalls int
-
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/2.0/repositories/test/repo/pipelines/{pipe}/steps" {
-			t.Fatalf("path = %q, want %q", r.URL.Path, "/2.0/repositories/test/repo/pipelines/{pipe}/steps")
-		}
-		pageCalls++
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Query().Get("page") {
-		case "", "1":
-			_, _ = w.Write([]byte(`{"values":[{"uuid":"{step-1}"}],"next":"` + server.URL + `/2.0/repositories/test/repo/pipelines/%7Bpipe%7D/steps?page=2"}`))
-		case "2":
-			_, _ = w.Write([]byte(`{"values":[{"uuid":"{step-2}","state":{"result":{"name":"FAILED"}}}]}`))
-		default:
-			t.Fatalf("unexpected page query %q", r.URL.RawQuery)
-		}
-	}))
-	defer server.Close()
-
-	client := &Client{
-		baseURL: server.URL,
-		email:   "test@example.com",
-		token:   "token",
-		httpClient: &http.Client{
-			Timeout: time.Second,
-		},
-	}
-
-	steps, err := client.ListPipelineSteps(context.Background(), repo, "{pipe}")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(steps) != 2 {
-		t.Fatalf("len(steps) = %d, want 2", len(steps))
-	}
-	if steps[0].UUID != "{step-1}" || steps[1].UUID != "{step-2}" {
-		t.Fatalf("steps = %#v, want step-1 then step-2", steps)
-	}
-	if pageCalls != 2 {
-		t.Fatalf("pageCalls = %d, want 2", pageCalls)
-	}
-}
-
-func TestGetStepLogCapsResponseToTail(t *testing.T) {
-	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
-	const maxLogBytes = 32 * 1024
-	prefix := strings.Repeat("a", 4096)
-	tail := strings.Repeat("z", maxLogBytes)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/2.0/repositories/test/repo/pipelines/{pipe}/steps/{step}/log" {
-			t.Fatalf("path = %q, want %q", r.URL.Path, "/2.0/repositories/test/repo/pipelines/{pipe}/steps/{step}/log")
-		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(prefix)+len(tail)))
-		_, _ = w.Write([]byte(prefix + tail))
-	}))
-	defer server.Close()
-
-	client := &Client{
-		baseURL: server.URL,
-		email:   "test@example.com",
-		token:   "token",
-		httpClient: &http.Client{
-			Timeout: time.Second,
-		},
-	}
-
-	logOutput, err := client.GetStepLog(context.Background(), repo, "{pipe}", "{step}")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(logOutput) != maxLogBytes {
-		t.Fatalf("len(logOutput) = %d, want %d", len(logOutput), maxLogBytes)
-	}
-	if logOutput != tail {
-		t.Fatalf("logOutput did not keep the expected tail")
+	if !strings.Contains(err.Error(), "not authenticated with Bitbucket") {
+		t.Fatalf("error = %v, want CLI failure message surfaced", err)
 	}
 }

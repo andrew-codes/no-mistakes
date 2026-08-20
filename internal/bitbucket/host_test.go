@@ -1,11 +1,89 @@
 package bitbucket
 
 import (
+	"context"
 	"slices"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
+
+func TestHost_Available_OKWhenDoctorReportsBitbucketOK(t *testing.T) {
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		"doctor\x1f--output\x1fjson": {Stdout: envelope(t, `{"bitbucket":{"ok":true}}`)},
+	})
+	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil)
+
+	if err := host.Available(context.Background()); err != nil {
+		t.Fatalf("Available() = %v, want nil", err)
+	}
+}
+
+func TestHost_Available_ErrorsWithDoctorMessageWhenBitbucketNotOK(t *testing.T) {
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		"doctor\x1f--output\x1fjson": {Stdout: envelope(t, `{"bitbucket":{"ok":false,"message":"No Bitbucket token resolved. Run twg setup bitbucket."}}`)},
+	})
+	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil)
+
+	err := host.Available(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if err.Error() != "No Bitbucket token resolved. Run twg setup bitbucket." {
+		t.Fatalf("error = %q, want doctor's bitbucket message surfaced", err)
+	}
+}
+
+func TestHost_Available_ErrorsWhenCLIUnavailable(t *testing.T) {
+	host := NewHost(nil, RepoRef{Workspace: "test", RepoSlug: "repo"}, func() bool { return false })
+	if err := host.Available(context.Background()); err == nil {
+		t.Fatal("expected error when client is nil")
+	}
+
+	client, _ := newFakeTwgClient(t, nil)
+	host = NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, func() bool { return false })
+	err := host.Available(context.Background())
+	if err == nil {
+		t.Fatal("expected error when twg CLI is unavailable")
+	}
+	if err.Error() != "twg CLI is not installed" {
+		t.Fatalf("error = %q, want CLI-not-installed message", err)
+	}
+}
+
+func TestHost_FetchFailedCheckLogs_UsesPipelineUUIDFromStatusURL(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		"bitbucket\x1fpull-requests\x1fget\x1f42\x1f--statuses\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson": {
+			Stdout: envelope(t, `{"_statuses":[{"name":"tests","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/{pipe-1}"}]}`),
+		},
+		"bitbucket\x1fpipeline\x1fget\x1f--pipeline\x1fpipe-1\x1f--logs\x1f--failed-steps\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson": {
+			Stdout: envelope(t, `{"steps":[{"state":{"result":{"name":"FAILED"}},"log":"boom\n"}]}`),
+		},
+	})
+	host := NewHost(client, repo, nil)
+
+	logOutput, err := host.FetchFailedCheckLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123", []string{"tests"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logOutput != "boom" {
+		t.Fatalf("logOutput = %q, want boom", logOutput)
+	}
+}
+
+func TestHost_FetchFailedCheckLogs_NoFailingNamesReturnsEmpty(t *testing.T) {
+	client, _ := newFakeTwgClient(t, nil)
+	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil)
+
+	logOutput, err := host.FetchFailedCheckLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logOutput != "" {
+		t.Fatalf("logOutput = %q, want empty", logOutput)
+	}
+}
 
 func TestNormalizePRState(t *testing.T) {
 	tests := []struct {
@@ -375,15 +453,12 @@ func TestFailedPipelineUUIDs(t *testing.T) {
 			if got == nil {
 				t.Fatalf("failedPipelineUUIDs = nil, want %v", tt.want)
 			}
-			keys := make([]string, 0, len(got))
-			for k := range got {
-				keys = append(keys, k)
-			}
+			keys := slices.Clone(got)
 			slices.Sort(keys)
 			want := slices.Clone(tt.want)
 			slices.Sort(want)
 			if !slices.Equal(keys, want) {
-				t.Fatalf("failedPipelineUUIDs keys = %v, want %v", keys, want)
+				t.Fatalf("failedPipelineUUIDs = %v, want %v", got, tt.want)
 			}
 		})
 	}

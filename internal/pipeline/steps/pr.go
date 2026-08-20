@@ -60,8 +60,12 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	if strings.HasPrefix(branch, "refs/heads/") {
 		branch = strings.TrimPrefix(branch, "refs/heads/")
 	}
-	if branch == sctx.Repo.DefaultBranch {
-		sctx.Log(fmt.Sprintf("skipping PR creation on default branch %s", branch))
+	baseBranch := sctx.Repo.DefaultBranch
+	if sctx.Config != nil && strings.TrimSpace(sctx.Config.PR.BaseBranch) != "" {
+		baseBranch = strings.TrimSpace(sctx.Config.PR.BaseBranch)
+	}
+	if branch == baseBranch {
+		sctx.Log(fmt.Sprintf("skipping PR creation on base branch %s", branch))
 		return &pipeline.StepOutcome{Skipped: true}, nil
 	}
 	provider := scm.DetectProviderContext(ctx, sctx.Repo.UpstreamURL)
@@ -76,14 +80,14 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	}
 
 	// Resolve the branch base so PR summaries cover the full branch delta.
-	baseSHA := resolveBranchBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, sctx.Repo.DefaultBranch)
-	content, err := s.buildPRContent(sctx, branch, baseSHA, scm.MaxPRBodyChars(provider))
+	baseSHA := resolveBranchBaseSHA(ctx, sctx.WorkDir, sctx.Run.BaseSHA, baseBranch)
+	content, err := s.buildPRContent(sctx, branch, baseBranch, baseSHA, provider, scm.MaxPRBodyChars(provider))
 	if err != nil {
 		return nil, err
 	}
 
 	sctx.Log(fmt.Sprintf("checking for existing pull request on branch %s...", branch))
-	existing, err := host.FindPR(ctx, branch, sctx.Repo.DefaultBranch)
+	existing, err := host.FindPR(ctx, branch, "")
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +108,7 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	}
 
 	sctx.Log("creating pull request...")
-	created, err := host.CreatePR(ctx, branch, sctx.Repo.DefaultBranch, scm.PRContent(content))
+	created, err := host.CreatePR(ctx, branch, baseBranch, scm.PRContent(content))
 	if err != nil {
 		return nil, err
 	}
@@ -131,14 +135,14 @@ func describePR(pr *scm.PR) string {
 	return ""
 }
 
-func (s *PRStep) buildPRContent(sctx *pipeline.StepContext, branch, baseSHA string, bodyLimit int) (prContent, error) {
+func (s *PRStep) buildPRContent(sctx *pipeline.StepContext, branch, baseBranch, baseSHA string, provider scm.Provider, bodyLimit int) (prContent, error) {
 	ctx := sctx.Ctx
 	diffStat, _ := git.Run(ctx, sctx.WorkDir, "diff", "--stat", baseSHA+".."+sctx.Run.HeadSHA)
 	finalDiff, err := git.Run(ctx, sctx.WorkDir, "diff", "--name-status", baseSHA+".."+sctx.Run.HeadSHA)
 	if err != nil {
 		return prContent{}, fmt.Errorf("read final branch diff: %w", err)
 	}
-	pipelineMD, riskLine, testingMD := s.buildPipelineSection(sctx)
+	pipelineMD, riskLine, testingMD := s.buildPipelineSection(sctx, provider)
 
 	prompt := fmt.Sprintf(`Draft a pull request title and summary for the full branch delta.
 
@@ -146,7 +150,7 @@ Context:
 - branch: %s
 - base commit: %s
 - target commit: %s
-- default branch: %s
+- PR base branch: %s
 
 Rules:
 - Cover the full branch delta, not just the latest commit.
@@ -162,7 +166,7 @@ Diff stat:
 %s
 
 Final diff paths and statuses:
-%s%s%s`, branch, baseSHA, sctx.Run.HeadSHA, sctx.Repo.DefaultBranch, conventional.ReleaseTypeRule, diffStat, finalDiff, userIntentPromptSection(sctx), executionContextPromptSection())
+%s%s%s`, branch, baseSHA, sctx.Run.HeadSHA, baseBranch, conventional.ReleaseTypeRule, diffStat, finalDiff, userIntentPromptSection(sctx), executionContextPromptSection())
 
 	prompt += prBodyBudgetPromptSection(bodyLimit)
 
@@ -207,7 +211,7 @@ Final diff paths and statuses:
 // produces the deterministic pipeline, risk, and testing sections. These are
 // scoped to this run's own steps and rounds, so they already describe only
 // the final terminal state each step reached in this run.
-func (s *PRStep) buildPipelineSection(sctx *pipeline.StepContext) (pipelineMD, riskLine, testingMD string) {
+func (s *PRStep) buildPipelineSection(sctx *pipeline.StepContext, provider scm.Provider) (pipelineMD, riskLine, testingMD string) {
 	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
 	if err != nil {
 		slog.Warn("failed to query step results for pipeline summary", "error", err)
@@ -224,8 +228,8 @@ func (s *PRStep) buildPipelineSection(sctx *pipeline.StepContext) (pipelineMD, r
 		rounds[sr.ID] = r
 	}
 
-	pipelineMD, riskLine = BuildPipelineSummary(steps, rounds)
-	testingMD = BuildTestingSummaryForPR(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir)
+	pipelineMD, riskLine = BuildPipelineSummaryFor(steps, rounds, sctx.Run.HeadSHA, provider)
+	testingMD = BuildTestingSummaryForPRWithProvider(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir, testEvidenceDir(sctx), publishRunEvidence(sctx), provider)
 	return pipelineMD, riskLine, testingMD
 }
 
@@ -280,38 +284,53 @@ func assemblePRBody(sctx *pipeline.StepContext, whatChanged, riskLine, testingMD
 			return core
 		}
 	}
-	return prependIntentSectionWithinLimit(sections, sctx, bodyLimit, false)
+	return assemblePRBodyCoreWithinLimit(sctx, whatChanged, riskLine, pipelineMD, bodyLimit)
 }
 
-func prependIntentSectionWithinLimit(body string, sctx *pipeline.StepContext, bodyLimit int, byteLimit bool) string {
-	if bodyLimit <= 0 {
-		return prependIntentSection(body, sctx)
+func assemblePRBodyCoreWithinLimit(sctx *pipeline.StepContext, whatChanged, riskLine, pipelineMD string, bodyLimit int) string {
+	prefix := prependIntentSection(appendGeneratedSections(whatChanged, riskLine, "", ""), sctx)
+	if pipelineMD == "" {
+		return scm.ClampPRBody(prefix, bodyLimit)
 	}
-	bodyLen := scm.PRBodyLen(body)
-	separatorLen := scm.PRBodyLen("\n\n")
-	if byteLimit {
-		bodyLen = len(body)
-		separatorLen = len("\n\n")
+
+	header, _ := splitPipelineSectionHeader(pipelineMD)
+	headerLen := scm.PRBodyLen(header)
+	if header == "" || headerLen > bodyLimit {
+		return scm.ClampPRBody(prefix+"\n\n"+pipelineMD, bodyLimit)
 	}
-	if bodyLen >= bodyLimit {
-		if byteLimit {
-			return truncateTextAtLineBoundary(body, bodyLimit, essentialPRBodyTruncationMarker())
-		}
-		return scm.ClampPRBody(body, bodyLimit)
+
+	separator := "\n\n"
+	prefixBudget := bodyLimit - headerLen - scm.PRBodyLen(separator)
+	if prefixBudget <= 0 {
+		return header
 	}
-	cleaned := cleanedUserIntent(sctx)
-	if cleaned == "" {
-		return body
+	prefix = scm.ClampPRBody(prefix, prefixBudget)
+	if scm.PRBodyLen(prefix) > prefixBudget {
+		prefix = ""
+		separator = ""
 	}
-	intent := "## Intent\n\n" + cleaned
-	intentBudget := bodyLimit - bodyLen - separatorLen
-	if intentBudget <= 0 {
-		return body
+	pipelineBudget := bodyLimit - scm.PRBodyLen(prefix) - scm.PRBodyLen(separator)
+	pipeline := clampPipelineSectionWithinLimit(pipelineMD, pipelineBudget)
+	return prefix + separator + pipeline
+}
+
+func clampPipelineSectionWithinLimit(pipelineMD string, bodyLimit int) string {
+	if scm.PRBodyLen(pipelineMD) <= bodyLimit {
+		return pipelineMD
 	}
-	if byteLimit {
-		return truncateTextAtLineBoundary(intent, intentBudget, essentialPRBodyTruncationMarker()) + "\n\n" + body
+	header, updates := splitPipelineSectionHeader(pipelineMD)
+	if header == "" || scm.PRBodyLen(header) > bodyLimit {
+		return scm.ClampPRBody(pipelineMD, bodyLimit)
 	}
-	return scm.ClampPRBody(intent, intentBudget) + "\n\n" + body
+	updateBudget := bodyLimit - scm.PRBodyLen(header)
+	if updateBudget <= 0 {
+		return header
+	}
+	updates = scm.ClampPRBody(updates, updateBudget)
+	if scm.PRBodyLen(updates) > updateBudget {
+		return header
+	}
+	return header + updates
 }
 
 func appendGeneratedSections(body, riskLine, testingMD, pipelineMD string) string {
@@ -333,7 +352,8 @@ func buildPRBody(body, riskLine, testingMD, pipelineMD string, sctx *pipeline.St
 		return intent + separator + sections
 	}
 	sectionsBudget := maxPullRequestBodyBytes - len(separator) - len(intent)
-	if sectionsBudget > 0 {
+	minimumSectionsBytes := len(pipelineSectionHeader(pipelineMD))
+	if sectionsBudget > 0 && (minimumSectionsBytes == 0 || sectionsBudget >= minimumSectionsBytes) {
 		sections = appendGeneratedSectionsToCleanBodyWithinLimit(body, riskLine, testingMD, pipelineMD, sectionsBudget)
 		return intent + separator + sections
 	}
@@ -387,19 +407,22 @@ func essentialPRBodyWithinLimit(body, generatedSections string) string {
 
 func essentialPRBodyWithinPipelineBudget(body, generatedSections, pipelineMD string, maxBytes int) string {
 	minPipeline := minimumPipelineRetainingLatestUpdate(pipelineMD)
-	if minPipeline == "" {
+	if minPipeline == "" || len(minPipeline) > maxBytes {
 		minPipeline = minimumPipelineOmissionSection(pipelineMD)
-		if minPipeline == "" {
-			return essentialPRBodyWithinBudget(body, generatedSections, maxBytes)
-		}
+	}
+	if minPipeline == "" || len(minPipeline) > maxBytes {
+		minPipeline = pipelineSectionHeader(pipelineMD)
+	}
+	if minPipeline == "" || len(minPipeline) > maxBytes {
+		return essentialPRBodyWithinBudget(body, generatedSections, maxBytes)
 	}
 
 	prefixBudget := maxBytes - len(minPipeline)
 	if body != "" || generatedSections != "" {
 		prefixBudget -= len("\n\n")
 	}
-	if prefixBudget <= 0 || len(generatedSections) > prefixBudget {
-		return essentialPRBodyWithinBudget(body, generatedSections, maxBytes)
+	if prefixBudget <= 0 {
+		return ""
 	}
 	return essentialPRBodyWithinBudget(body, generatedSections, prefixBudget)
 }
@@ -522,7 +545,15 @@ func pipelineOmissionSectionWithinLimit(header string, omitted, maxBytes int) st
 	if len(markerOnly) <= maxBytes {
 		return markerOnly
 	}
+	if len(header) <= maxBytes {
+		return header
+	}
 	return ""
+}
+
+func pipelineSectionHeader(pipelineMD string) string {
+	header, _ := splitPipelineSectionHeader(pipelineMD)
+	return header
 }
 
 func splitPipelineSectionHeader(pipelineMD string) (string, string) {
@@ -538,6 +569,18 @@ func splitPipelineSectionHeader(pipelineMD string) (string, string) {
 	}
 
 	headerEnd := len(heading) + introEnd + len("\n\n")
+	// The generated attestation is data, not an update detail. Keep it in the
+	// fixed header so PR-body truncation never drops the machine-readable
+	// snapshot while omitting older human-readable update rounds.
+	rest = pipelineMD[headerEnd:]
+	if strings.HasPrefix(rest, pipelineAttestationCommentPrefix) {
+		if end := strings.Index(rest, pipelineAttestationCommentClosingToken); end >= 0 {
+			headerEnd += end + len(pipelineAttestationCommentClosingToken)
+			if strings.HasPrefix(pipelineMD[headerEnd:], "\n\n") {
+				headerEnd += len("\n\n")
+			}
+		}
+	}
 	return pipelineMD[:headerEnd], pipelineMD[headerEnd:]
 }
 
@@ -558,12 +601,23 @@ func parsePipelineUpdateGroups(updates string) []pipelineUpdateGroup {
 				continue
 			}
 		}
+		if strings.HasPrefix(rest, "### ") {
+			end := nextPipelineFoldStart(rest[4:])
+			if end >= 0 {
+				end += 4
+			} else {
+				end = len(rest)
+			}
+			groups = append(groups, parsePipelineHeadingGroup(rest[:end]))
+			rest = rest[end:]
+			continue
+		}
 
-		nextDetails := strings.Index(rest, "\n<details>")
+		nextFold := nextPipelineFoldStart(rest)
 		raw := rest
-		if nextDetails >= 0 {
-			raw = rest[:nextDetails]
-			rest = rest[nextDetails+1:]
+		if nextFold >= 0 {
+			raw = rest[:nextFold]
+			rest = rest[nextFold:]
 		} else {
 			rest = ""
 		}
@@ -573,6 +627,36 @@ func parsePipelineUpdateGroups(updates string) []pipelineUpdateGroup {
 		}
 	}
 	return groups
+}
+
+func nextPipelineFoldStart(rest string) int {
+	detailsAt := strings.Index(rest, "\n<details>")
+	headingAt := strings.Index(rest, "\n### ")
+	switch {
+	case detailsAt < 0:
+		return headingAt
+	case headingAt < 0:
+		return detailsAt
+	case detailsAt < headingAt:
+		return detailsAt
+	default:
+		return headingAt
+	}
+}
+
+func parsePipelineHeadingGroup(raw string) pipelineUpdateGroup {
+	lineEnd := strings.Index(raw, "\n")
+	if lineEnd < 0 {
+		return pipelineUpdateGroup{header: raw}
+	}
+	contentStart := lineEnd + 1
+	if strings.HasPrefix(raw[contentStart:], "\n") {
+		contentStart++
+	}
+	return pipelineUpdateGroup{
+		header: raw[:contentStart],
+		units:  splitPipelineUpdateUnits(raw[contentStart:]),
+	}
 }
 
 func parsePipelineDetailsGroup(raw string) pipelineUpdateGroup {

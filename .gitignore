@@ -1,6 +1,7 @@
 # Build output
 bin/
 tmp/
+.tmp/
 
 # Go
 *.exe
@@ -34,3 +35,5 @@ demo_raw.gif
 
 # Local AI tooling state
 .serena/
+
+.no-mistakes/evidence/

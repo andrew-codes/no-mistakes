@@ -7,12 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -102,7 +104,7 @@ func TestPRStep_BitbucketUpdatesExistingPR(t *testing.T) {
 	doctorKey, doctorResp := twgDoctorOK()
 	env, logFile := fakeTwg(t, map[string]fakeTwgResponse{
 		doctorKey: doctorResp,
-		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--output", "json"): {
 			Stdout: twgEnvelope(`[{"id":42,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/42"}}}]`),
 		},
 		twgArgsKey("bitbucket", "pull-requests", "update", "--pull-request", "42", "--title", "<value>", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
@@ -150,7 +152,7 @@ func TestPRStep_BitbucketUpdatesExistingPRWithoutHTMLLink(t *testing.T) {
 	doctorKey, doctorResp := twgDoctorOK()
 	env, _ := fakeTwg(t, map[string]fakeTwgResponse{
 		doctorKey: doctorResp,
-		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--output", "json"): {
 			Stdout: twgEnvelope(`[{"id":42,"state":"OPEN","links":{"html":{"href":"` + existingPRURL + `"}}}]`),
 		},
 		twgArgsKey("bitbucket", "pull-requests", "update", "--pull-request", "42", "--title", "<value>", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
@@ -267,6 +269,9 @@ func TestPRStep_CreatesNewPR(t *testing.T) {
 	if !strings.Contains(ghLog, "pr create") {
 		t.Errorf("expected gh pr create to be called, got:\n%s", ghLog)
 	}
+	if !strings.Contains(ghLog, "pr create --head feature --base main") {
+		t.Fatalf("expected unset PR base to fall back to repository default branch, got:\n%s", ghLog)
+	}
 	if !strings.Contains(ghLog, "--title chore: update pull request --body") {
 		t.Fatalf("expected fallback PR title to make no scope claim, got:\n%s", ghLog)
 	}
@@ -290,6 +295,106 @@ func TestPRStep_CreatesNewPR(t *testing.T) {
 	}
 }
 
+func TestPRStep_UsesConfiguredBaseBranch(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	env, logFile := fakeGH(t, "")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Config.PR.BaseBranch = "develop"
+
+	if _, err := (&PRStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "pr list --head feature ") {
+		t.Fatalf("expected PR lookup by branch, got:\n%s", logData)
+	}
+	if strings.Contains(string(logData), "pr list --head feature --base") {
+		t.Fatalf("expected PR lookup not to filter by base branch (would miss an existing PR opened against a different base), got:\n%s", logData)
+	}
+	if !strings.Contains(string(logData), "pr create --head feature --base develop") {
+		t.Fatalf("expected configured base branch in PR creation, got:\n%s", logData)
+	}
+}
+
+// TestPRStep_ExistingPRAgainstDifferentBaseIsUpdatedNotDuplicated reproduces
+// the bug where a maintainer changes pr.base_branch after a PR already exists
+// against the old base. A base-filtered `gh pr list` would then miss that
+// still-open PR (GitHub filters server-side), so the step fell through to
+// `gh pr create` and opened a second, duplicate PR against the new base while
+// orphaning the original.
+func TestPRStep_ExistingPRAgainstDifferentBaseIsUpdatedNotDuplicated(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	env, logFile := fakeGHWithBase(t, "https://github.com/test/repo/pull/42", "develop")
+
+	ag := &mockAgent{name: "test"}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Config.PR.BaseBranch = "main"
+
+	if _, err := (&PRStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghLog := string(logData)
+	if strings.Contains(ghLog, "pr create") {
+		t.Fatalf("expected existing PR to be updated, not duplicated with a new pr create, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "pr edit") {
+		t.Fatalf("expected gh pr edit to update the existing PR, got:\n%s", ghLog)
+	}
+
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.PRURL == nil || *run.PRURL != "https://github.com/test/repo/pull/42" {
+		t.Errorf("PR URL = %v, want the existing PR to remain https://github.com/test/repo/pull/42", run.PRURL)
+	}
+}
+
+// TestPRStep_SkipsWhenBranchMatchesConfiguredBaseBranch reproduces the
+// 0530823 bug: with pr.base_branch configured to a branch other than the
+// repo's forge default, pushing directly to that configured base branch must
+// still skip PR creation instead of attempting a self-targeting PR. Before
+// that fix, the skip check compared only against sctx.Repo.DefaultBranch, so
+// a run on "develop" (configured base) would fall through to gh pr create.
+func TestPRStep_SkipsWhenBranchMatchesConfiguredBaseBranch(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	env, logFile := fakeGH(t, "")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Config.PR.BaseBranch = "develop"
+	sctx.Run.Branch = "refs/heads/develop"
+
+	outcome, err := (&PRStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Skipped {
+		t.Fatal("expected PR creation to be skipped when branch matches configured base branch")
+	}
+
+	if logData, err := os.ReadFile(logFile); err == nil {
+		t.Fatalf("expected no gh invocation when branch matches configured base branch, got log:\n%s", logData)
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
 func TestPRStep_GitHubForkCreatesParentPRWithForkHead(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
@@ -306,6 +411,7 @@ func TestPRStep_GitHubForkCreatesParentPRWithForkHead(t *testing.T) {
 	sctx.Env = env
 	sctx.Repo.UpstreamURL = "https://github.com/parent-owner/no-mistakes.git"
 	sctx.Repo.ForkURL = "https://github.com/fork-owner/no-mistakes.git"
+	sctx.Config.PR.BaseBranch = "develop"
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &PRStep{}
@@ -318,13 +424,13 @@ func TestPRStep_GitHubForkCreatesParentPRWithForkHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	ghLog := string(logData)
-	if !strings.Contains(ghLog, "pr list --head feature --base main --repo parent-owner/no-mistakes --state open --json number,url,headRefName,headRepositoryOwner") {
+	if !strings.Contains(ghLog, "pr list --head feature --repo parent-owner/no-mistakes --state open --json number,url,baseRefName,headRefName,headRepositoryOwner") {
 		t.Fatalf("expected PR lookup to use parent repo and bare head branch, got:\n%s", ghLog)
 	}
 	if strings.Contains(ghLog, "pr list --head fork-owner:feature") {
 		t.Fatalf("PR lookup used unsupported owner-qualified --head, got:\n%s", ghLog)
 	}
-	if !strings.Contains(ghLog, "pr create --head fork-owner:feature --base main --repo parent-owner/no-mistakes") {
+	if !strings.Contains(ghLog, "pr create --head fork-owner:feature --base develop --repo parent-owner/no-mistakes") {
 		t.Fatalf("expected PR create to target parent repo with fork owner head, got:\n%s", ghLog)
 	}
 	if strings.Contains(ghLog, "--repo fork-owner/no-mistakes") {
@@ -343,7 +449,7 @@ func TestPRStep_BitbucketCreatesNewPR(t *testing.T) {
 	doctorKey, doctorResp := twgDoctorOK()
 	env, logFile := fakeTwg(t, map[string]fakeTwgResponse{
 		doctorKey: doctorResp,
-		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--output", "json"): {
 			Stdout: twgEnvelope(`[]`),
 		},
 		twgArgsKey("bitbucket", "pull-requests", "create", "--title", "<value>", "--source", "feature", "--dest", "main", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
@@ -384,6 +490,12 @@ func TestPRStep_BitbucketCreatesNewPR(t *testing.T) {
 	if got := countLogLines(t, logFile, "pull-requests update"); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
 	}
+	description := twgCreateDescriptionForTest(t, logFile)
+	for _, leak := range []string{"<details>", "<summary>", "<code>", "<video", pipelineAttestationCommentPrefix} {
+		if strings.Contains(description, leak) {
+			t.Errorf("Bitbucket PR create shipped HTML %q:\n%s", leak, description)
+		}
+	}
 
 	run, err := sctx.DB.GetRun(sctx.Run.ID)
 	if err != nil {
@@ -401,7 +513,7 @@ func TestPRStep_BitbucketCreatesNewPRWithoutHTMLLink(t *testing.T) {
 	doctorKey, doctorResp := twgDoctorOK()
 	env, _ := fakeTwg(t, map[string]fakeTwgResponse{
 		doctorKey: doctorResp,
-		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--output", "json"): {
 			Stdout: twgEnvelope(`[]`),
 		},
 		twgArgsKey("bitbucket", "pull-requests", "create", "--title", "<value>", "--source", "feature", "--dest", "main", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
@@ -478,7 +590,7 @@ func TestPRStep_BitbucketUsesProcessEnvWhenStepEnvIsNil(t *testing.T) {
 	doctorKey, doctorResp := twgDoctorOK()
 	env, logFile := fakeTwg(t, map[string]fakeTwgResponse{
 		doctorKey: doctorResp,
-		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--dest", "main", "--output", "json"): {
+		twgArgsKey("bitbucket", "pull-requests", "query", "--scope", "repo", "--source", "feature", "--state", "OPEN", "--workspace", "test", "--repo", "repo", "--output", "json"): {
 			Stdout: twgEnvelope(`[]`),
 		},
 		twgArgsKey("bitbucket", "pull-requests", "create", "--title", "<value>", "--source", "feature", "--dest", "main", "--description", "<value>", "--workspace", "test", "--repo", "repo", "--output", "json"): {
@@ -786,6 +898,30 @@ func TestAssemblePRBody_ClampsWhenCoreAloneExceedsCap(t *testing.T) {
 	}
 }
 
+func TestAssemblePRBody_RetainsAttestationWhenCoreExceedsAzureCap(t *testing.T) {
+	t.Parallel()
+	sctx := &pipeline.StepContext{UserIntent: strings.Repeat("intent 😀 ", 1000)}
+	limit := scm.MaxPRBodyChars(scm.ProviderAzureDevOps)
+	steps := []*db.StepResult{
+		{StepName: types.StepReview, Status: types.StepStatusCompleted},
+		{StepName: types.StepTest, Status: types.StepStatusFailed},
+	}
+	attestation := buildPipelineAttestation(steps, testPipelineHeadSHA)
+	pipelineMD := pipelineMarkdownForTest(strings.Repeat("review detail 😀 ", 1000))
+	pipelineMD = strings.Replace(pipelineMD, noMistakesPRSignature+"\n\n", noMistakesPRSignature+"\n\n"+attestation+"\n\n", 1)
+
+	got := assemblePRBody(sctx, "## What Changed\n\n"+strings.Repeat("change 😀 ", 1000), strings.Repeat("risk 😀 ", 1000), "", pipelineMD, limit)
+
+	if scm.PRBodyLen(got) > limit {
+		t.Fatalf("assembled body = %d units, want <= %d", scm.PRBodyLen(got), limit)
+	}
+	for _, want := range []string{"## Pipeline", noMistakesPRSignature, attestation} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("budgeted body dropped required pipeline content %q:\n%s", want, got)
+		}
+	}
+}
+
 func prTruncationTail() string {
 	// Mirror of scm's truncation marker for assertions; kept here so the test
 	// reads naturally without exporting the constant.
@@ -869,6 +1005,74 @@ func TestAppendGeneratedSections_TruncatesPipelineUpdatesBeforeGitHubLimit(t *te
 	assertNoPartialRoundLinesForTest(t, got, rounds)
 	if strings.Count(got, "<details>") != strings.Count(got, "</details>") {
 		t.Fatalf("expected details tags to remain balanced, got:\n%s", got)
+	}
+}
+
+func TestAppendGeneratedSections_TruncatesBitbucketHeadingGroups(t *testing.T) {
+	body := "## What Changed\n\n- essential summary survives\n\n" + strings.Repeat("essential details stay intact\n", 350)
+	riskLine := "✅ Low: generated PR body length guard only"
+	testingMD := "## Testing\n\nEvidence was collected."
+	rounds := make([]string, 0, 160)
+	for i := 1; i <= 160; i++ {
+		rounds = append(rounds, fmt.Sprintf("review round %03d - %s", i, strings.Repeat("x", 700)))
+	}
+	pipelineMD := bitbucketPipelineMarkdownForTest(rounds...)
+
+	got := appendGeneratedSections(body, riskLine, testingMD, pipelineMD)
+
+	assertGitHubBodyLimitForTest(t, got)
+	if strings.Contains(got, "<details>") || strings.Contains(got, pipelineAttestationCommentPrefix) {
+		t.Fatalf("Bitbucket truncation reintroduced HTML:\n%s", got)
+	}
+	if !strings.Contains(got, "### ✅ **Review** - passed") {
+		t.Fatalf("expected Bitbucket heading fold to survive truncation, got:\n%s", got)
+	}
+	if strings.Contains(got, "review round 001") {
+		t.Fatalf("expected oldest Bitbucket pipeline update to be omitted, got:\n%s", got)
+	}
+	if !strings.Contains(got, "review round 160") {
+		t.Fatalf("expected newest Bitbucket pipeline update to be retained, got:\n%s", got)
+	}
+}
+
+func TestAppendGeneratedSections_RetainsPipelineAttestationWhenTruncated(t *testing.T) {
+	steps := []*db.StepResult{
+		{StepName: types.StepReview, Status: types.StepStatusCompleted},
+		{StepName: types.StepTest, Status: types.StepStatusSkipped},
+	}
+	attestation := buildPipelineAttestation(steps, testPipelineHeadSHA)
+	pipelineMD := pipelineMarkdownForTest(strings.Repeat("review round - "+strings.Repeat("x", 1000), 100))
+	pipelineMD = strings.Replace(pipelineMD, noMistakesPRSignature+"\n\n", noMistakesPRSignature+"\n\n"+attestation+"\n\n", 1)
+
+	got := appendGeneratedSections("## What Changed\n\n- summary", "", "", pipelineMD)
+
+	assertGitHubBodyLimitForTest(t, got)
+	if !strings.Contains(got, attestation) {
+		t.Fatalf("expected truncated PR body to retain the pipeline attestation, got:\n%s", got)
+	}
+}
+
+func TestAppendGeneratedSections_RetainsAttestationWhenEssentialSectionsOverflow(t *testing.T) {
+	steps := []*db.StepResult{
+		{StepName: types.StepReview, Status: types.StepStatusCompleted},
+		{StepName: types.StepTest, Status: types.StepStatusFailed},
+	}
+	attestation := buildPipelineAttestation(steps, testPipelineHeadSHA)
+	pipelineMD := pipelineMarkdownForTest("review round 001")
+	pipelineMD = strings.Replace(pipelineMD, noMistakesPRSignature+"\n\n", noMistakesPRSignature+"\n\n"+attestation+"\n\n", 1)
+
+	got := appendGeneratedSections(
+		"## What Changed\n\n"+strings.Repeat("change detail\n", 5000),
+		strings.Repeat("risk detail ", 5000),
+		"## Testing\n\n"+strings.Repeat("test detail\n", 5000),
+		pipelineMD,
+	)
+
+	assertGitHubBodyLimitForTest(t, got)
+	for _, want := range []string{"## Pipeline", noMistakesPRSignature, attestation} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("budgeted body dropped required pipeline content %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -1195,6 +1399,10 @@ func TestPRStep_CreateKeepsGeneratedSectionsAfterOversizedIntent(t *testing.T) {
 
 	body := readFakeGHBodyArg(t, logFile)
 	assertGitHubBodyLimitForTest(t, body)
+	attestation := parsePipelineAttestationForTest(t, body)
+	if attestation.HeadSHA != headSHA {
+		t.Fatalf("attested head = %q, want created PR head %q", attestation.HeadSHA, headSHA)
+	}
 	for _, want := range []string{
 		"## Intent",
 		"Keep generated sections visible.",
@@ -1244,7 +1452,7 @@ func TestPRStep_BuildPRContentTruncatesGeneratedPipelineUpdates(t *testing.T) {
 		}
 	}
 
-	content, err := (&PRStep{}).buildPRContent(sctx, "feature", baseSHA, 0)
+	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1373,6 +1581,27 @@ func TestFallbackPRContentCapsBodyAfterPrependedIntent(t *testing.T) {
 	}
 }
 
+// twgCreateDescriptionForTest recovers the real (unmasked) --description
+// value the pipeline passed to the fake twg binary for the most recent
+// `bitbucket pull-requests create` invocation in logFile. fakeTwg matches
+// invocations by a masked argv key (see twgArgsKey/twgMaskedFlags), but the
+// dispatcher still writes the real, unmasked argv to the invocation log, so
+// content assertions read it from there instead of an HTTP request body.
+var twgCreateDescriptionRE = regexp.MustCompile(`(?s)bitbucket pull-requests create.*?--description (.*?) --workspace`)
+
+func twgCreateDescriptionForTest(t *testing.T, logFile string) string {
+	t.Helper()
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read twg log: %v", err)
+	}
+	match := twgCreateDescriptionRE.FindSubmatch(data)
+	if match == nil {
+		t.Fatalf("no bitbucket pull-requests create --description invocation found in log:\n%s", data)
+	}
+	return string(match[1])
+}
+
 func pipelineMarkdownForTest(rounds ...string) string {
 	var b strings.Builder
 	b.WriteString("## Pipeline\n\nUpdates from [git push no-mistakes](https://github.com/kunchenguid/no-mistakes)\n\n")
@@ -1384,6 +1613,35 @@ func pipelineMarkdownForTest(rounds ...string) string {
 	}
 	b.WriteString("</details>\n")
 	return b.String()
+}
+
+func bitbucketPipelineMarkdownForTest(rounds ...string) string {
+	var b strings.Builder
+	b.WriteString("## Pipeline\n\nUpdates from [git push no-mistakes](https://github.com/kunchenguid/no-mistakes)\n\n")
+	b.WriteString("### ✅ **Review** - passed\n\n")
+	for _, round := range rounds {
+		b.WriteString(round)
+		b.WriteString("\n\n")
+	}
+	return b.String()
+}
+
+func parsePipelineAttestationForTest(t *testing.T, body string) pipelineAttestation {
+	t.Helper()
+	start := strings.Index(body, pipelineAttestationCommentPrefix)
+	if start < 0 {
+		t.Fatalf("PR body missing pipeline attestation:\n%s", body)
+	}
+	start += len(pipelineAttestationCommentPrefix)
+	end := strings.Index(body[start:], pipelineAttestationCommentClosingToken)
+	if end < 0 {
+		t.Fatalf("PR body contains unclosed pipeline attestation:\n%s", body)
+	}
+	var attestation pipelineAttestation
+	if err := json.Unmarshal([]byte(body[start:start+end]), &attestation); err != nil {
+		t.Fatalf("parse pipeline attestation: %v", err)
+	}
+	return attestation
 }
 
 func readFakeGHBodyArg(t *testing.T, logFile string) string {
@@ -1872,7 +2130,7 @@ func TestPRStep_PromptRequiresReleaseTypesForProductImpact(t *testing.T) {
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 
 	step := &PRStep{}
-	if _, err := step.buildPRContent(sctx, "feature", baseSHA, 0); err != nil {
+	if _, err := step.buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0); err != nil {
 		t.Fatal(err)
 	}
 	if len(ag.calls) != 1 {

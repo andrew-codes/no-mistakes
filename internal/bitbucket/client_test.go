@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseRepoRefRejectsLookalikeHosts(t *testing.T) {
@@ -67,7 +68,7 @@ type fakeTwgResponse struct {
 // logFile records one line per invocation (joined argv) for assertions.
 func newFakeTwgClient(t *testing.T, responses map[string]fakeTwgResponse) (*Client, string) {
 	t.Helper()
-	binDir := t.TempDir()
+	binDir := fakeTwgBinDir(t)
 	linkTestBinaryAs(t, binDir, "twg")
 
 	respFile := filepath.Join(t.TempDir(), "responses.json")
@@ -101,6 +102,28 @@ func newFakeTwgClient(t *testing.T, responses map[string]fakeTwgResponse) (*Clie
 		return cmd
 	}
 	return NewClient(cmdFactory), logFile
+}
+
+// fakeTwgBinDir creates a temporary directory for the fake twg binary.
+// Unlike t.TempDir(), cleanup tolerates a lingering file lock on the
+// just-executed twg.exe on Windows (Defender's on-execution scan holds
+// it briefly after the child process exits), which would otherwise fail
+// TempDir's own RemoveAll with "Access is denied".
+func fakeTwgBinDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "faketwg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for i := 0; i < 10; i++ {
+			if err := os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	})
+	return dir
 }
 
 func linkTestBinaryAs(t *testing.T, binDir, name string) {

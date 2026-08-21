@@ -15,6 +15,15 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 )
 
+func TestMain(m *testing.M) {
+	// Agent harnesses inject git config (e.g. core.hooksPath=/dev/null to
+	// disable hooks for their own session) via GIT_CONFIG_COUNT/KEY_n/VALUE_n;
+	// this package's fixtures shell out to git directly, so tests that need
+	// ambient config re-set it with t.Setenv (issue #362).
+	os.Unsetenv("GIT_CONFIG_COUNT")
+	os.Exit(m.Run())
+}
+
 type mutatingAgent struct {
 	run func(context.Context, agent.RunOpts) (*agent.Result, error)
 }

@@ -227,13 +227,12 @@ Symptom: pipeline completes but the PR step shows `skipped`.
 
 Check the [Provider Integration](/no-mistakes/guides/provider-integration/) requirements. Most common causes:
 
-- `gh` or `glab` not installed
-- `gh auth status` shows not authenticated
-- Bitbucket env vars not set in the daemon's environment
-- Upstream is on a host that isn't supported (GitHub, GitLab, `bitbucket.org`, or Azure DevOps)
+- `gh`, `glab`, `forgejo-axi`, or `twg` not installed
+- The provider CLI reports that it is not authenticated
+- Upstream is not one of the hosts listed in Provider Integration
 - Self-hosted GitHub Enterprise on a hostname that is not `github.com` isn't detected because `gh` isn't configured for the host; run `gh auth login --hostname your-ghe.example.com` so detection finds it. Once detection succeeds, the availability check is host-scoped (`gh auth status --hostname your-ghe.example.com`), so a stale token on `github.com` or any other configured gh host can no longer falsely mark the GHE repo as unauthenticated.
 - Self-hosted GitLab on a hostname with no `gitlab` marker isn't detected because `glab` isn't configured for the host; run `glab auth login --hostname your-gitlab.example.com` so detection finds it. Once detection succeeds, the availability check is host-scoped (`glab auth status --hostname your-gitlab.example.com`), so a stale token on `gitlab.com` or any other configured glab host can no longer falsely mark the self-hosted repo as unauthenticated.
-- A GitLab, Bitbucket, or Azure DevOps repo record has a fork URL set; fork MR/PR routing is currently GitHub-only
+- A non-GitHub repo record has a fork URL set; fork MR/PR routing is currently GitHub-only
 - You pushed the PR base branch (PR step always skips there; this is the repository's default branch, or the configured [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) when set)
 
 ## CI step stuck or timed out
@@ -241,7 +240,7 @@ Check the [Provider Integration](/no-mistakes/guides/provider-integration/) requ
 Symptom: CI step keeps monitoring an open PR longer than expected, or pauses after the idle timeout.
 
 Monitoring while the PR remains open - even after checks are currently healthy - is intended behavior, because a later default-branch update can make the PR conflict or rerun CI.
-Once the CI monitor reports readiness and the PR is mergeable, the CI panel shows `✓ Checks passed` and the terminal title switches to `Checks passed`, so you can tell when to go merge the PR; the signal clears automatically if checks start re-running or a new failure appears. A trusted [`no_ci: true` declaration](/no-mistakes/reference/repo-config/#no_ci) can establish readiness for a zero-check repository; an empty forge response without that declaration is not ready.
+Once the CI monitor reports readiness and the PR is mergeable, the CI panel shows `✓ Checks passed` and the terminal title switches to `Checks passed`, so you can tell when to go merge the PR; the signal clears automatically if checks start re-running or a new failure appears. A trusted [`no_ci: true` declaration](/no-mistakes/reference/repo-config/#no_ci) can establish readiness for a zero-check repository; an empty forge response without that declaration is not ready. The [CI step reference](/no-mistakes/reference/pipeline-steps/#ci) owns the exact readiness and signal-clearing rules, including GitHub Actions runs that do not appear in the PR check rollup.
 
 How long the monitor runs is controlled by `ci_timeout` in `~/.no-mistakes/config.yaml`, an idle timeout that re-arms whenever the upstream default branch advances; the [`ci_timeout` field reference](/no-mistakes/reference/global-config/#ci_timeout) owns the default, the `unlimited` keyword and its aliases, and the exact re-arm semantics.
 Older config files may still contain an explicit `ci_timeout: "4h"` value; update it if you want the newer default behavior.

@@ -42,6 +42,8 @@ const (
 	// DefaultDaemonConnectTimeout bounds client IPC connection attempts to a
 	// daemon socket that exists but is not accepting connections.
 	DefaultDaemonConnectTimeout = 3 * time.Second
+	// DefaultBranchSyncRemoteTimeout bounds each remote Git operation (ls-remote, fetch) in internal/branchsync. Global-config-only; a pushed branch cannot change it. Timeout still fails closed.
+	DefaultBranchSyncRemoteTimeout = 60 * time.Second
 	// CITimeoutUnlimited is the sentinel meaning "monitor until the PR is
 	// merged, closed, or the run is aborted - never self-terminate".
 	// Any non-positive ci_timeout, or the keywords "unlimited", "none",
@@ -88,6 +90,7 @@ type GlobalConfig struct {
 	Agent                types.AgentName     `yaml:"agent"`
 	Agents               []types.AgentName   `yaml:"-"`
 	ACPXPath             string              `yaml:"acpx_path"`
+	ForgejoAXIPath       string              `yaml:"forgejo_axi_path"`
 	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
 	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
@@ -98,11 +101,12 @@ type GlobalConfig struct {
 	// directory-scoped toolchain configuration (mise, direnv), which resolves
 	// by path ancestry and therefore never reaches a worktree under NM_HOME.
 	// Placement is resolved for every consumer in internal/worktrees.
-	WorktreeRoots        map[string]string `yaml:"worktree_roots"`
-	CITimeout            time.Duration     `yaml:"-"`
-	StepQuietWarning     time.Duration     `yaml:"-"`
-	DaemonConnectTimeout time.Duration     `yaml:"-"`
-	LogLevel             string            `yaml:"log_level"`
+	WorktreeRoots           map[string]string `yaml:"worktree_roots"`
+	CITimeout               time.Duration     `yaml:"-"`
+	StepQuietWarning        time.Duration     `yaml:"-"`
+	DaemonConnectTimeout    time.Duration     `yaml:"-"`
+	BranchSyncRemoteTimeout time.Duration     `yaml:"-"`
+	LogLevel                string            `yaml:"log_level"`
 	// SessionReuse controls per-run agent session reuse in the review loop:
 	// one durable fixer session across review-fix turns. Review turns always
 	// run session-free so the rereview never resumes the session whose
@@ -127,24 +131,26 @@ type GlobalConfig struct {
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
 type globalConfigRaw struct {
-	Agent                agentList           `yaml:"agent"`
-	ACPXPath             string              `yaml:"acpx_path"`
-	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
-	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
-	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
-	WorktreeRoots        map[string]string   `yaml:"worktree_roots"`
-	CITimeout            string              `yaml:"ci_timeout"`
-	DaemonConnectTimeout string              `yaml:"daemon_connect_timeout"`
-	BabysitTimeout       string              `yaml:"babysit_timeout"`
-	StepQuietWarning     string              `yaml:"step_quiet_warning"`
-	LogLevel             string              `yaml:"log_level"`
-	SessionReuse         *bool               `yaml:"session_reuse"`
-	AutoFix              AutoFixRaw          `yaml:"auto_fix"`
-	CI                   CIRaw               `yaml:"ci"`
-	Commit               CommitRaw           `yaml:"commit"`
-	Intent               IntentRaw           `yaml:"intent"`
-	Test                 TestRaw             `yaml:"test"`
-	Eval                 EvalRaw             `yaml:"eval"`
+	Agent                   agentList           `yaml:"agent"`
+	ACPXPath                string              `yaml:"acpx_path"`
+	ForgejoAXIPath          string              `yaml:"forgejo_axi_path"`
+	ACPRegistryOverrides    map[string]string   `yaml:"acp_registry_overrides"`
+	AgentPathOverride       map[string]string   `yaml:"agent_path_override"`
+	AgentArgsOverride       map[string][]string `yaml:"agent_args_override"`
+	WorktreeRoots           map[string]string   `yaml:"worktree_roots"`
+	CITimeout               string              `yaml:"ci_timeout"`
+	DaemonConnectTimeout    string              `yaml:"daemon_connect_timeout"`
+	BranchSyncRemoteTimeout string              `yaml:"branch_sync_remote_timeout"`
+	BabysitTimeout          string              `yaml:"babysit_timeout"`
+	StepQuietWarning        string              `yaml:"step_quiet_warning"`
+	LogLevel                string              `yaml:"log_level"`
+	SessionReuse            *bool               `yaml:"session_reuse"`
+	AutoFix                 AutoFixRaw          `yaml:"auto_fix"`
+	CI                      CIRaw               `yaml:"ci"`
+	Commit                  CommitRaw           `yaml:"commit"`
+	Intent                  IntentRaw           `yaml:"intent"`
+	Test                    TestRaw             `yaml:"test"`
+	Eval                    EvalRaw             `yaml:"eval"`
 }
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
@@ -434,6 +440,7 @@ type Config struct {
 	Agent                 types.AgentName
 	Agents                []types.AgentName
 	ACPXPath              string
+	ForgejoAXIPath        string
 	ACPRegistryOverrides  map[string]string
 	AgentPathOverride     map[string]string
 	AgentArgsOverride     map[string][]string
@@ -677,6 +684,9 @@ agent: auto
 # Optional path to the user-installed acpx binary for acp:<target> agents and ACP aliases
 # acpx_path: acpx
 
+# forgejo-axi executable used for Forgejo provider operations
+forgejo_axi_path: forgejo-axi
+
 # Optional ACP target command overrides for acp:<target> agents and ACP aliases
 # acp_registry_overrides:
 #   local-gemini: node /opt/mock-acp-agent.mjs
@@ -698,6 +708,10 @@ step_quiet_warning: "10m"
 # Maximum time a CLI client waits for an existing daemon socket to accept a
 # connection before failing instead of hanging.
 daemon_connect_timeout: "3s"
+
+# Maximum time guarded branch synchronization waits for one remote Git operation
+# (ls-remote or fetch) before treating the target as offline. Global-only.
+branch_sync_remote_timeout: "60s"
 
 # Reuse one durable fixer session per run across review-fix turns. Review turns
 # always run session-free so a rereview never resumes the session that prescribed
@@ -1375,14 +1389,16 @@ func EnsureDefaultGlobalConfig(path string) {
 // DefaultGlobalConfig returns the built-in global defaults.
 func DefaultGlobalConfig() *GlobalConfig {
 	return &GlobalConfig{
-		Agent:                types.AgentAuto,
-		Agents:               []types.AgentName{types.AgentAuto},
-		CITimeout:            DefaultCITimeout,
-		StepQuietWarning:     DefaultStepQuietWarning,
-		DaemonConnectTimeout: DefaultDaemonConnectTimeout,
-		LogLevel:             "info",
-		SessionReuse:         true,
-		Eval:                 evalDefaults(),
+		Agent:                   types.AgentAuto,
+		Agents:                  []types.AgentName{types.AgentAuto},
+		ForgejoAXIPath:          "forgejo-axi",
+		CITimeout:               DefaultCITimeout,
+		StepQuietWarning:        DefaultStepQuietWarning,
+		DaemonConnectTimeout:    DefaultDaemonConnectTimeout,
+		BranchSyncRemoteTimeout: DefaultBranchSyncRemoteTimeout,
+		LogLevel:                "info",
+		SessionReuse:            true,
+		Eval:                    evalDefaults(),
 	}
 }
 
@@ -1560,6 +1576,9 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if raw.ACPXPath != "" {
 		cfg.ACPXPath = raw.ACPXPath
 	}
+	if raw.ForgejoAXIPath != "" {
+		cfg.ForgejoAXIPath = raw.ForgejoAXIPath
+	}
 	if raw.ACPRegistryOverrides != nil {
 		cfg.ACPRegistryOverrides = raw.ACPRegistryOverrides
 	}
@@ -1604,6 +1623,13 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 			return nil, err
 		}
 		cfg.DaemonConnectTimeout = d
+	}
+	if raw.BranchSyncRemoteTimeout != "" {
+		d, err := parsePositiveDuration("branch_sync_remote_timeout", raw.BranchSyncRemoteTimeout)
+		if err != nil {
+			return nil, err
+		}
+		cfg.BranchSyncRemoteTimeout = d
 	}
 	if raw.LogLevel != "" {
 		cfg.LogLevel = raw.LogLevel
@@ -2200,6 +2226,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Agent:                global.Agent,
 		Agents:               copyAgents(global.Agents),
 		ACPXPath:             global.ACPXPath,
+		ForgejoAXIPath:       global.ForgejoAXIPath,
 		ACPRegistryOverrides: global.ACPRegistryOverrides,
 		AgentPathOverride:    global.AgentPathOverride,
 		AgentArgsOverride:    global.AgentArgsOverride,

@@ -67,9 +67,9 @@ func stripPort(host string) string {
 }
 
 // ExtractPRNumber returns the trailing numeric segment from a PR/MR URL.
-// Supports GitHub (/pull/N), GitLab (/-/merge_requests/N), Bitbucket
-// (/pull-requests/N), and Azure DevOps (/pullrequest/N) URLs; all of them
-// end in a digit path segment.
+// Supports GitHub (/pull/N), GitLab (/-/merge_requests/N), Forgejo
+// (/pulls/N), Bitbucket (/pull-requests/N), and Azure DevOps (/pullrequest/N)
+// URLs; all of them end in a digit path segment.
 func ExtractPRNumber(prURL string) (string, error) {
 	trimmed := strings.TrimRight(prURL, "/")
 	parts := strings.Split(trimmed, "/")
@@ -90,6 +90,10 @@ func ExtractPRNumber(prURL string) (string, error) {
 type PR struct {
 	Number string
 	URL    string
+	// HeadSHA scopes provider check discovery to the exact commit currently
+	// being certified. Providers that expose CI outside the PR check rollup
+	// use it to include those runs.
+	HeadSHA string
 	// BaseBranch is the forge's actual target branch for this PR. It is
 	// authoritative once a PR exists and protects resumed CI repair from a
 	// later configuration change.
@@ -151,9 +155,9 @@ type Check struct {
 	// provider reported no state.
 	State       string
 	CompletedAt time.Time // zero when unknown; used to detect CI re-runs between polls
-	// Link is the provider's details URL for this check. It identifies the job
-	// behind the check, so a rerun can target that job instead of the whole PR.
-	// Empty when the provider reported no link.
+	// Link is the provider's details URL for this check. It may identify an
+	// individual job or a provider-side workflow run for targeted reruns. Empty
+	// when the provider reported no link.
 	Link string
 }
 
@@ -168,12 +172,37 @@ func (c Check) Pending() bool { return c.Bucket == CheckBucketPending }
 type Capabilities struct {
 	MergeableState  bool
 	FailedCheckLogs bool
+	MergedProof     bool
 }
 
-// ErrUnsupported is returned by optional Host methods that the provider
-// cannot fulfil. Callers should gate calls on Capabilities rather than
-// relying on this error, but implementations return it as a fallback.
-var ErrUnsupported = errors.New("operation not supported by this provider")
+var (
+	// ErrUnsupported is returned by optional Host methods that the provider
+	// cannot fulfil. Callers should gate calls on Capabilities rather than
+	// relying on this error, but implementations return it as a fallback.
+	ErrUnsupported = errors.New("operation not supported by this provider")
+	// ErrHeadChanged rejects results for a different PR head than the run is
+	// monitoring. It prevents a late status or already-merged race from proving
+	// the wrong commit.
+	ErrHeadChanged = errors.New("pull request head changed")
+)
+
+// MergedProof is provider evidence that a specific PR head was merged.
+type MergedProof struct {
+	Merged         bool
+	Number         string
+	URL            string
+	HeadSHA        string
+	MergeCommitSHA string
+	MergedAt       time.Time
+	MergedBy       string
+}
+
+// MergedProofHost is implemented by hosts that can prove which exact PR head
+// was merged. The expected head must be checked even when the PR is already
+// merged, because merge and monitor polling can race.
+type MergedProofHost interface {
+	GetMergedProof(ctx context.Context, pr *PR, expectedHead string) (MergedProof, error)
+}
 
 // Host is the provider-agnostic interface to a PR-hosting service.
 // Transport (CLI vs HTTP API) is an implementation detail.
@@ -209,7 +238,7 @@ type PRBaseBranchReader interface {
 	GetPRBaseBranch(ctx context.Context, pr *PR) (string, error)
 }
 
-// CheckRerunner re-runs the provider-side job behind a failed check without
+// CheckRerunner re-runs the provider-side work behind a failed check without
 // changing the commit under test. It is deliberately a separate interface
 // rather than a Host method: a backend whose provider exposes no rerun
 // primitive simply does not implement it, and callers type-assert
@@ -218,7 +247,7 @@ type PRBaseBranchReader interface {
 type CheckRerunner interface {
 	// RerunCheck asks the provider to run check again for the same commit. It
 	// returns an error when the request could not be made, including when the
-	// check names no job the provider can re-run.
+	// check names no job or workflow run the provider can re-run.
 	RerunCheck(ctx context.Context, pr *PR, check Check) error
 }
 

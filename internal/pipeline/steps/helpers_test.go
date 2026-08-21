@@ -401,9 +401,10 @@ func fakeCIGH(t *testing.T, state, checksJSON string) []string {
 	binDir := fakeCLIBinDir(t)
 	linkTestBinary(t, binDir, "gh")
 	return fakeCLIEnv(binDir, map[string]string{
-		"FAKE_CLI_MODE":   "ci-gh",
-		"FAKE_CLI_STATE":  state,
-		"FAKE_CLI_CHECKS": checksJSON,
+		"FAKE_CLI_MODE":        "ci-gh",
+		"FAKE_CLI_STATE":       state,
+		"FAKE_CLI_CHECKS":      checksJSON,
+		"FAKE_CLI_PR_HEAD_SHA": "deadbeef",
 	})
 }
 
@@ -412,10 +413,11 @@ func fakeCIGHMergeable(t *testing.T, state, checksJSON, mergeable string) []stri
 	binDir := fakeCLIBinDir(t)
 	linkTestBinary(t, binDir, "gh")
 	return fakeCLIEnv(binDir, map[string]string{
-		"FAKE_CLI_MODE":      "ci-gh",
-		"FAKE_CLI_STATE":     state,
-		"FAKE_CLI_CHECKS":    checksJSON,
-		"FAKE_CLI_MERGEABLE": mergeable,
+		"FAKE_CLI_MODE":        "ci-gh",
+		"FAKE_CLI_STATE":       state,
+		"FAKE_CLI_CHECKS":      checksJSON,
+		"FAKE_CLI_MERGEABLE":   mergeable,
+		"FAKE_CLI_PR_HEAD_SHA": "deadbeef",
 	})
 }
 
@@ -428,6 +430,7 @@ func fakeCIGHMergeableError(t *testing.T, state, checksJSON, mergeableErr string
 		"FAKE_CLI_STATE":         state,
 		"FAKE_CLI_CHECKS":        checksJSON,
 		"FAKE_CLI_MERGEABLE_ERR": mergeableErr,
+		"FAKE_CLI_PR_HEAD_SHA":   "deadbeef",
 	})
 }
 
@@ -436,9 +439,10 @@ func fakeCIGHStateError(t *testing.T, stateErr, checksJSON string) []string {
 	binDir := fakeCLIBinDir(t)
 	linkTestBinary(t, binDir, "gh")
 	return fakeCLIEnv(binDir, map[string]string{
-		"FAKE_CLI_MODE":      "ci-gh",
-		"FAKE_CLI_STATE_ERR": stateErr,
-		"FAKE_CLI_CHECKS":    checksJSON,
+		"FAKE_CLI_MODE":        "ci-gh",
+		"FAKE_CLI_STATE_ERR":   stateErr,
+		"FAKE_CLI_CHECKS":      checksJSON,
+		"FAKE_CLI_PR_HEAD_SHA": "deadbeef",
 	})
 }
 
@@ -447,10 +451,11 @@ func fakeCIGHChecksError(t *testing.T, state, mergeable, checksErr string) []str
 	binDir := fakeCLIBinDir(t)
 	linkTestBinary(t, binDir, "gh")
 	return fakeCLIEnv(binDir, map[string]string{
-		"FAKE_CLI_MODE":       "ci-gh",
-		"FAKE_CLI_STATE":      state,
-		"FAKE_CLI_MERGEABLE":  mergeable,
-		"FAKE_CLI_CHECKS_ERR": checksErr,
+		"FAKE_CLI_MODE":        "ci-gh",
+		"FAKE_CLI_STATE":       state,
+		"FAKE_CLI_MERGEABLE":   mergeable,
+		"FAKE_CLI_CHECKS_ERR":  checksErr,
+		"FAKE_CLI_PR_HEAD_SHA": "deadbeef",
 	})
 }
 
@@ -475,6 +480,7 @@ func fakeCIGHSequenceMergeable(t *testing.T, state string, checks []string, merg
 		"FAKE_CLI_CHECKS_PATH":       checksPath,
 		"FAKE_CLI_CHECKS_INDEX_PATH": indexPath,
 		"FAKE_CLI_MERGEABLE":         mergeable,
+		"FAKE_CLI_PR_HEAD_SHA":       "deadbeef",
 	})
 }
 
@@ -498,6 +504,7 @@ func fakeCIGHSequence(t *testing.T, state string, checks []string) []string {
 		"FAKE_CLI_STATE":             state,
 		"FAKE_CLI_CHECKS_PATH":       checksPath,
 		"FAKE_CLI_CHECKS_INDEX_PATH": indexPath,
+		"FAKE_CLI_PR_HEAD_SHA":       "deadbeef",
 	})
 }
 
@@ -530,6 +537,7 @@ func fakeCIGHLoggedSequence(t *testing.T, state string, checks []string, mergeab
 		"FAKE_CLI_MERGEABLE":         mergeable,
 		"FAKE_CLI_LOG":               logFile,
 		"FAKE_CLI_RERUN_ERR":         rerunErr,
+		"FAKE_CLI_PR_HEAD_SHA":       "deadbeef",
 	}), logFile
 }
 
@@ -538,7 +546,8 @@ func fakeCIGHNoChecks(t *testing.T) []string {
 	binDir := fakeCLIBinDir(t)
 	linkTestBinary(t, binDir, "gh")
 	return fakeCLIEnv(binDir, map[string]string{
-		"FAKE_CLI_MODE": "ci-gh-nochecks",
+		"FAKE_CLI_MODE":        "ci-gh-nochecks",
+		"FAKE_CLI_PR_HEAD_SHA": "deadbeef",
 	})
 }
 
@@ -605,4 +614,13 @@ func fakeCIGlabSequence(t *testing.T, state string, checks []string) []string {
 		"FAKE_CLI_CHECKS_PATH":       checksPath,
 		"FAKE_CLI_CHECKS_INDEX_PATH": indexPath,
 	})
+}
+
+// runGitDirect runs git without any of the repository's step helpers, so a test
+// can observe what a plain, hook-verified git invocation does in dir.
+func runGitDirect(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }

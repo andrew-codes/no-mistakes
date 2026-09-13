@@ -158,16 +158,17 @@ twg doctor
 
 **What you get:**
 
-- PR creation and update
+- PR creation and update, including [draft PRs](/no-mistakes/reference/repo-config/#providersbitbucketdraft_pull_requests)
 - CI pipeline status polling until the PR is merged, declined, or the configured `ci_timeout` idle window elapses
-- Failed pipeline step log fetching for the CI auto-fix step
+- Failed pipeline step log fetching for the CI auto-fix step, fetched directly by pipeline build number
 
 **What you don't get (yet):**
 
 - PR mergeability polling
 - Merge-conflict auto-fix
+- [`pr.template`](/no-mistakes/reference/repo-config/#prtemplate): Bitbucket Cloud has no raw PR-content read, so generated PR bodies always use the ordinary narrative rather than a repository-supplied template
 
-These are GitHub, GitLab, Forgejo, and Azure DevOps only right now.
+Mergeability polling and merge-conflict auto-fix are GitHub, GitLab, Forgejo, and Azure DevOps only right now.
 
 ## Azure DevOps
 

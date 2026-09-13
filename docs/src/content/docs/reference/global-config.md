@@ -857,4 +857,4 @@ This is a global default. Per-repo config can override it via `providers.azurede
 
 ## Environment variables
 
-See [Environment Variables](/no-mistakes/reference/environment/) for `NM_HOME`, `NM_DAEMON_CONNECT_TIMEOUT`, Forgejo host and token settings, Bitbucket Cloud credentials, and update-check suppression.
+See [Environment Variables](/no-mistakes/reference/environment/) for `NM_HOME`, `NM_DAEMON_CONNECT_TIMEOUT`, Forgejo host and token settings, and update-check suppression. Bitbucket Cloud has no dedicated environment variables; see [Bitbucket Cloud](/no-mistakes/guides/provider-integration/#bitbucket-cloud) for its `twg`-based auth.

@@ -3,7 +3,7 @@ package db
 import (
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 const declinedFindings = `{"findings":[{"id":"keep-a","severity":"error","description":"switch to B","action":"ask-user"}]}`

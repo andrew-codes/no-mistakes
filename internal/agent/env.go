@@ -1,6 +1,6 @@
 package agent
 
-import "github.com/kunchenguid/no-mistakes/internal/git"
+import "github.com/andrew-codes/no-mistakes/internal/git"
 
 // GateRoleEnvVar is exported into every spawned gate agent's environment as an
 // coarse diagnostic marker that the process is a no-mistakes gate agent (a

@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	"github.com/kunchenguid/no-mistakes/internal/pipeline"
-	"github.com/kunchenguid/no-mistakes/internal/testguidance"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/testguidance"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // TestStep runs baseline tests, gathers evidence for user intent, and optionally asks the agent to fix failures.

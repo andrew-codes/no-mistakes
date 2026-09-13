@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/andrew-codes/no-mistakes/internal/scm"
 )
 
 func TestProjectPath(t *testing.T) {

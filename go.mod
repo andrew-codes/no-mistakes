@@ -1,4 +1,4 @@
-module github.com/kunchenguid/no-mistakes
+module github.com/andrew-codes/no-mistakes
 
 go 1.25.0
 

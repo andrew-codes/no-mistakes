@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/pipeline"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 var demoWait = func(ctx context.Context, d time.Duration) bool {
@@ -64,7 +64,7 @@ func DemoSteps() []pipeline.Step {
 			name:       types.StepTest,
 			delay:      4 * time.Second,
 			displayDur: 32 * time.Second,
-			log:        "Running: go test -race ./...\n\nok  \tgithub.com/kunchenguid/no-mistakes/internal/handler\t1.2s\nok  \tgithub.com/kunchenguid/no-mistakes/internal/config\t0.8s\nok  \tgithub.com/kunchenguid/no-mistakes/internal/server\t1.5s\n\nPASS",
+			log:        "Running: go test -race ./...\n\nok  \tgithub.com/andrew-codes/no-mistakes/internal/handler\t1.2s\nok  \tgithub.com/andrew-codes/no-mistakes/internal/config\t0.8s\nok  \tgithub.com/andrew-codes/no-mistakes/internal/server\t1.5s\n\nPASS",
 		},
 		&demoStep{
 			name:       types.StepDocument,
@@ -97,8 +97,8 @@ func DemoSteps() []pipeline.Step {
 			name:       types.StepPR,
 			delay:      3 * time.Second,
 			displayDur: 8 * time.Second,
-			log:        "Creating pull request...\nhttps://github.com/kunchenguid/no-mistakes/pull/42",
-			prURL:      "https://github.com/kunchenguid/no-mistakes/pull/42",
+			log:        "Creating pull request...\nhttps://github.com/andrew-codes/no-mistakes/pull/42",
+			prURL:      "https://github.com/andrew-codes/no-mistakes/pull/42",
 		},
 		&demoCIStep{
 			displayDur: 120 * time.Second,

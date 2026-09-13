@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/git"
 )
 
 // newForcePushFixture builds a local repo whose "origin" points at a bare

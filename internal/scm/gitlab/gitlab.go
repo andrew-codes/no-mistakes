@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/andrew-codes/no-mistakes/internal/scm"
 )
 
 // CmdFactory builds an exec.Cmd in the caller's workdir with the caller's env.

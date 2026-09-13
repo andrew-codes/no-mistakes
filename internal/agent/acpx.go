@@ -11,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/andrew-codes/no-mistakes/internal/shellenv"
 )
 
 const acpxScannerMaxTokenSize = 256 * 1024 * 1024

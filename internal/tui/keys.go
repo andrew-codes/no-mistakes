@@ -1,8 +1,8 @@
 package tui
 
 import (
+	"github.com/andrew-codes/no-mistakes/internal/types"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
 )
 
 func TestMain(m *testing.M) {

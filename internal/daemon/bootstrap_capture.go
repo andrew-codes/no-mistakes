@@ -9,9 +9,9 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/logstore"
-	"github.com/kunchenguid/no-mistakes/internal/paths"
-	"github.com/kunchenguid/no-mistakes/internal/winproc"
+	"github.com/andrew-codes/no-mistakes/internal/logstore"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/winproc"
 )
 
 type bootstrapCapture struct {

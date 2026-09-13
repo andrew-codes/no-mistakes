@@ -3,8 +3,8 @@ package db
 import (
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/buildinfo"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 func TestRunInsertAndGet(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/telemetry"
+	"github.com/andrew-codes/no-mistakes/internal/telemetry"
 )
 
 // TestDoctorListsCopilotAgent exercises the user-facing `no-mistakes doctor`

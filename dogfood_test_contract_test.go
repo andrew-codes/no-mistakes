@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/config"
 )
 
 // Local Test is targeted validation of the requested intent. This repository

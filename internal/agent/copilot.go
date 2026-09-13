@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/andrew-codes/no-mistakes/internal/shellenv"
 )
 
 // copilotAgent spawns the GitHub Copilot CLI for each invocation. Copilot

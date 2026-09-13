@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
 )
 
 var dialNetworkWithTimeout = func(network, address string, timeout time.Duration) (net.Conn, error) {

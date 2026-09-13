@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/conventional"
+	"github.com/andrew-codes/no-mistakes/internal/conventional"
 )
 
 // branchNameRules and commitSubjectRules are shared between the single-purpose

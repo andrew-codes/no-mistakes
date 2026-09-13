@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/db"
 )
 
 // A case identifies its repository only by the fingerprint of the redacted

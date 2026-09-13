@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/bitbucket"
-	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/andrew-codes/no-mistakes/internal/bitbucket"
+	"github.com/andrew-codes/no-mistakes/internal/safeurl"
 )
 
 // resolveBitbucketRepoRef parses a Bitbucket repo reference from the upstream

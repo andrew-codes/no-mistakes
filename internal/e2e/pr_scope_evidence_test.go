@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 const staleTwoFileEvidence = "Inspected only final files: internal/example/flag.go and cmd/example/main.go."

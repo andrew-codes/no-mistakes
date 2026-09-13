@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/lifecycle"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/lifecycle"
 )
 
 func (u *updater) confirmActiveRunsBeforeUpdate() error {

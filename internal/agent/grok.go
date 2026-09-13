@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/andrew-codes/no-mistakes/internal/shellenv"
 )
 
 const grokScannerMaxTokenSize = 256 * 1024 * 1024

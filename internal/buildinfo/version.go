@@ -4,11 +4,11 @@ import "runtime/debug"
 
 // Set via ldflags at build time:
 //
-//	-ldflags "-X github.com/kunchenguid/no-mistakes/internal/buildinfo.Version=v1.0.0
-//	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.Commit=abc1234
-//	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.Date=2024-01-01
-//	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.TelemetryHost=https://a.example.com
-//	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.TelemetryWebsiteID=abc123"
+//	-ldflags "-X github.com/andrew-codes/no-mistakes/internal/buildinfo.Version=v1.0.0
+//	          -X github.com/andrew-codes/no-mistakes/internal/buildinfo.Commit=abc1234
+//	          -X github.com/andrew-codes/no-mistakes/internal/buildinfo.Date=2024-01-01
+//	          -X github.com/andrew-codes/no-mistakes/internal/buildinfo.TelemetryHost=https://a.example.com
+//	          -X github.com/andrew-codes/no-mistakes/internal/buildinfo.TelemetryWebsiteID=abc123"
 var (
 	Version            = "dev"
 	Commit             = "unknown"

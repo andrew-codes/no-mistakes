@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
+	"github.com/andrew-codes/no-mistakes/internal/buildinfo"
 )
 
 func TestDefaultUsesDotEnvInDevBuildWhenEnvMissing(t *testing.T) {

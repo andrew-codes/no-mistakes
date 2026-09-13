@@ -1,7 +1,7 @@
 package cli
 
 import (
-	"github.com/kunchenguid/no-mistakes/internal/update"
+	"github.com/andrew-codes/no-mistakes/internal/update"
 	"github.com/spf13/cobra"
 )
 

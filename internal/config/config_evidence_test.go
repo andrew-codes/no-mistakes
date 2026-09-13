@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/evidence"
+	"github.com/andrew-codes/no-mistakes/internal/evidence"
 )
 
 func TestTestEvidenceDefaults(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/ipc"
 )
 
 // The subscriber mailbox is the single owner of run-event overflow policy.

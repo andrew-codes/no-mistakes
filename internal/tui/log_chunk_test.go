@@ -3,8 +3,8 @@ package tui
 import (
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/ipc"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 func TestModel_ApplyEvent_LogChunk_PartialLines(t *testing.T) {

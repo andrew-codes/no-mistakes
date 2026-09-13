@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/telemetry"
+	"github.com/andrew-codes/no-mistakes/internal/telemetry"
 )
 
 type recordedTelemetryEvent struct {

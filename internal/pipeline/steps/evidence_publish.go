@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/evidence"
-	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/evidence"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
 )
 
 // evidenceLinks describes a published evidence commit well enough to turn a

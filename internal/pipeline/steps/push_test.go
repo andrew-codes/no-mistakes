@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/config"
 )
 
 // TestPushStep_RefusesPostReviewClobberWithoutLaterPipelineCommit reproduces

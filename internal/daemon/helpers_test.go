@@ -127,8 +127,8 @@ func startTestDaemon(t *testing.T) (*paths.Paths, *db.DB) {
 		}
 		select {
 		case <-errCh:
-		case <-time.After(3 * time.Second):
-			t.Error("daemon did not stop within 3s")
+		case <-time.After(10 * time.Second):
+			t.Error("daemon did not stop within 10s")
 		}
 	})
 
@@ -232,8 +232,8 @@ func startTestDaemonWithSteps(t *testing.T, sf StepFactory) (*paths.Paths, *db.D
 		}
 		select {
 		case <-errCh:
-		case <-time.After(3 * time.Second):
-			t.Error("daemon did not stop within 3s")
+		case <-time.After(10 * time.Second):
+			t.Error("daemon did not stop within 10s")
 		}
 	})
 

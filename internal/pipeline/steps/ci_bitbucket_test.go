@@ -70,7 +70,7 @@ func TestCIStep_BitbucketPassesWhenStatusesPass(t *testing.T) {
 			return ctx.Err()
 		},
 	}
-	_, err := step.Execute(sctx)
+	_, err := driveCI(t, step, sctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected Bitbucket CI pass to keep monitoring while PR is open, got %v", err)
 	}
@@ -116,7 +116,7 @@ func TestCIStep_BitbucketUsesProcessEnvWhenStepEnvIsNil(t *testing.T) {
 			return ctx.Err()
 		},
 	}
-	_, err := step.Execute(sctx)
+	_, err := driveCI(t, step, sctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected Bitbucket CI pass to keep monitoring while PR is open, got %v", err)
 	}
@@ -128,7 +128,7 @@ func TestCIStep_BitbucketUsesProcessEnvWhenStepEnvIsNil(t *testing.T) {
 func TestCIStep_BitbucketFailureNeedsApproval(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	env, logFile := newFakeBitbucketCI(t, "OPEN", `[{"name":"build","state":"FAILED"}]`)
+	env, logFile := newFakeBitbucketCI(t, "OPEN", `[{"name":"build","key":"build-linux","state":"FAILED","url":"https://bitbucket.org/test/repo/addon/pipelines/home#!/results/1"}]`)
 
 	prURL := "https://bitbucket.org/test/repo/pull-requests/42"
 	ag := &mockAgent{name: "test"}
@@ -140,7 +140,7 @@ func TestCIStep_BitbucketFailureNeedsApproval(t *testing.T) {
 	sctx.Config.AutoFix = config.AutoFix{CI: 0}
 
 	step := &CIStep{}
-	outcome, err := step.Execute(sctx)
+	outcome, err := driveCI(t, step, sctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,6 +157,9 @@ func TestCIStep_BitbucketFailureNeedsApproval(t *testing.T) {
 	}
 	if len(findings.Items) == 0 || !strings.Contains(findings.Items[0].Description, "build") {
 		t.Fatalf("expected failing Bitbucket check finding, got %+v", findings.Items)
+	}
+	if findings.Items[0].CheckID != "bitbucket-status:build-linux" {
+		t.Fatalf("Bitbucket finding CheckID = %q, want exact status identity", findings.Items[0].CheckID)
 	}
 }
 
@@ -193,7 +196,7 @@ func TestCIStep_BitbucketStoppedCheckParksForADecision(t *testing.T) {
 			return nil
 		},
 	}
-	outcome, err := step.Execute(sctx)
+	outcome, err := driveCI(t, step, sctx)
 	if err != nil {
 		t.Fatalf("expected an approval outcome, got error: %v", err)
 	}
@@ -246,9 +249,9 @@ func TestCIStep_BitbucketAutoFixIncludesPipelineLogs(t *testing.T) {
 			Stdout: twgEnvelope(`{"id":42,"state":"OPEN"}`),
 		},
 		bitbucketPRGetKey(true): {
-			Stdout: twgEnvelope(`{"id":42,"_statuses":[{"name":"test","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/{pipeline-1}"}]}`),
+			Stdout: twgEnvelope(`{"id":42,"_statuses":[{"name":"test","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/1"}]}`),
 		},
-		twgArgsKey("bitbucket", "pipeline", "get", "--pipeline", "pipeline-1", "--logs", "--failed-steps", "--workspace", "test", "--repo", "repo", "--output", "json"): {
+		twgArgsKey("bitbucket", "pipeline", "get", "--pipeline", "1", "--logs", "--failed-steps", "--workspace", "test", "--repo", "repo", "--output", "json"): {
 			Stdout: twgEnvelope(`{"steps":[{"state":{"result":{"name":"FAILED"}},"log":"error log output"}]}`),
 		},
 	})
@@ -271,6 +274,7 @@ func TestCIStep_BitbucketAutoFixIncludesPipelineLogs(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 	sctx.Config.CITimeout = 30 * time.Second
 	sctx.Config.AutoFix = config.AutoFix{CI: 1}
+	sctx.Config.CI.RevalidateRepairs = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -282,10 +286,8 @@ func TestCIStep_BitbucketAutoFixIncludesPipelineLogs(t *testing.T) {
 			return ctx.Err()
 		},
 	}
-	_, err := step.Execute(sctx)
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context cancellation after auto-fix poll, got %v", err)
-	}
+	outcome, err := driveCI(t, step, sctx)
+	assertCIRestartsValidation(t, outcome, err)
 	if capturedPrompt == "" {
 		t.Fatal("expected Bitbucket auto-fix to call the agent")
 	}
@@ -297,9 +299,9 @@ func TestCIStep_BitbucketAutoFixIncludesPipelineLogs(t *testing.T) {
 	}
 }
 
-// Two failing checks link to two different pipelines; only the log for the
-// pipeline behind the actually-failing check name must be fetched and used.
-func TestCIStep_BitbucketAutoFixUsesMatchingPipelineLogs(t *testing.T) {
+// Two failing checks link to two different pipelines; both selected pipelines'
+// logs must be fetched and aggregated into the fix prompt.
+func TestCIStep_BitbucketAutoFixAggregatesSelectedPipelineLogs(t *testing.T) {
 	t.Parallel()
 	upstream := t.TempDir()
 	gitCmd(t, upstream, "init", "--bare")
@@ -335,12 +337,15 @@ func TestCIStep_BitbucketAutoFixUsesMatchingPipelineLogs(t *testing.T) {
 		},
 		bitbucketPRGetKey(true): {
 			Stdout: twgEnvelope(`{"id":42,"_statuses":[` +
-				`{"name":"lint","state":"SUCCESSFUL","url":"https://bitbucket.org/test/repo/pipelines/results/{pipeline-1}"},` +
-				`{"name":"test","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/{pipeline-2}"}` +
+				`{"name":"build","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/1"},` +
+				`{"name":"test","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/2"}` +
 				`]}`),
 		},
-		twgArgsKey("bitbucket", "pipeline", "get", "--pipeline", "pipeline-2", "--logs", "--failed-steps", "--workspace", "test", "--repo", "repo", "--output", "json"): {
-			Stdout: twgEnvelope(`{"steps":[{"state":{"result":{"name":"FAILED"}},"log":"matching pipeline log"}]}`),
+		twgArgsKey("bitbucket", "pipeline", "get", "--pipeline", "1", "--logs", "--failed-steps", "--workspace", "test", "--repo", "repo", "--output", "json"): {
+			Stdout: twgEnvelope(`{"steps":[{"state":{"result":{"name":"FAILED"}},"log":"build pipeline log"}]}`),
+		},
+		twgArgsKey("bitbucket", "pipeline", "get", "--pipeline", "2", "--logs", "--failed-steps", "--workspace", "test", "--repo", "repo", "--output", "json"): {
+			Stdout: twgEnvelope(`{"steps":[{"state":{"result":{"name":"FAILED"}},"log":"test pipeline log"}]}`),
 		},
 	})
 
@@ -364,6 +369,7 @@ func TestCIStep_BitbucketAutoFixUsesMatchingPipelineLogs(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 	sctx.Config.CITimeout = 30 * time.Second
 	sctx.Config.AutoFix = config.AutoFix{CI: 1}
+	sctx.Config.CI.RevalidateRepairs = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -375,15 +381,13 @@ func TestCIStep_BitbucketAutoFixUsesMatchingPipelineLogs(t *testing.T) {
 			return ctx.Err()
 		},
 	}
-	_, err := step.Execute(sctx)
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context cancellation after auto-fix poll, got %v", err)
-	}
+	outcome, err := driveCI(t, step, sctx)
+	assertCIRestartsValidation(t, outcome, err)
 	if capturedPrompt == "" {
 		t.Fatal("expected Bitbucket auto-fix to call the agent")
 	}
-	if !strings.Contains(capturedPrompt, "matching pipeline log") {
-		t.Fatalf("expected prompt to include matching pipeline log, got:\n%s", capturedPrompt)
+	if !strings.Contains(capturedPrompt, "build pipeline log") || !strings.Contains(capturedPrompt, "test pipeline log") {
+		t.Fatalf("expected prompt to include both selected pipeline logs, got:\n%s", capturedPrompt)
 	}
 }
 
@@ -461,7 +465,7 @@ func TestCIStep_GetCIChecksBitbucketFallsBackToKeyWhenNameMissing(t *testing.T) 
 	env, _ := fakeTwg(t, map[string]fakeTwgResponse{
 		doctorKey: doctorResp,
 		bitbucketPRGetKey(true): {
-			Stdout: twgEnvelope(`{"id":42,"_statuses":[{"key":"build","state":"FAILED"}]}`),
+			Stdout: twgEnvelope(`{"id":42,"_statuses":[{"key":"build","state":"FAILED","url":"https://bitbucket.org/test/repo/addon/pipelines/home#!/results/42"}]}`),
 		},
 	})
 
@@ -472,7 +476,7 @@ func TestCIStep_GetCIChecksBitbucketFallsBackToKeyWhenNameMissing(t *testing.T) 
 		return cmd
 	}
 	client := bitbucket.NewClient(cmdFactory)
-	host := bitbucket.NewHost(client, bitbucket.RepoRef{Workspace: "test", RepoSlug: "repo"}, nil)
+	host := bitbucket.NewHost(client, bitbucket.RepoRef{Workspace: "test", RepoSlug: "repo"}, nil, false)
 	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "42"})
 	if err != nil {
 		t.Fatalf("GetChecks returned error: %v", err)
@@ -485,5 +489,8 @@ func TestCIStep_GetCIChecksBitbucketFallsBackToKeyWhenNameMissing(t *testing.T) 
 	}
 	if checks[0].Bucket != "fail" {
 		t.Fatalf("checks[0].Bucket = %q, want fail", checks[0].Bucket)
+	}
+	if checks[0].ExecutionID != "42" {
+		t.Fatalf("checks[0].ExecutionID = %q, want pipeline build number", checks[0].ExecutionID)
 	}
 }

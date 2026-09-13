@@ -14,8 +14,11 @@ import (
 
 	"github.com/andrew-codes/no-mistakes/internal/agent"
 	"github.com/andrew-codes/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/forgecontext"
 	"github.com/andrew-codes/no-mistakes/internal/git"
 	"github.com/andrew-codes/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/runenv"
 	"github.com/andrew-codes/no-mistakes/internal/scm"
 	"github.com/andrew-codes/no-mistakes/internal/types"
 )
@@ -706,6 +709,139 @@ func TestCommitPipelineCorrection_ReportsCleanupFailureWithoutMaskingCommit(t *t
 	}
 }
 
+func TestCommitPipelineCorrection_EmptyIndexIsSuccessfulNoOp(t *testing.T) {
+	t.Parallel()
+	dir, _, headSHA := setupGitRepo(t)
+
+	err := commitPipelineCorrection(context.Background(), dir, "no-mistakes: empty handoff", nil)
+	if err != nil {
+		t.Fatalf("empty-index correction must be a successful no-op: %v", err)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("empty-index correction moved HEAD to %s, want %s", got, headSHA)
+	}
+	t.Logf("Correction result: error=%v; HEAD before=%s after=%s; staged paths=%q", err, headSHA, gitCmd(t, dir, "rev-parse", "HEAD"), gitCmd(t, dir, "diff", "--cached", "--name-only"))
+}
+
+func TestCommitPipelineCorrection_RealCommitFailureStillFails(t *testing.T) {
+	t.Parallel()
+	dir, _, _ := setupGitRepo(t)
+	if err := os.WriteFile(filepath.Join(dir, "staged.txt"), []byte("staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, dir, "add", "staged.txt")
+	if err := os.WriteFile(filepath.Join(dir, ".git", "index.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := commitPipelineCorrection(context.Background(), dir, "no-mistakes: must fail", nil)
+	if err == nil {
+		t.Fatal("commit with a locked index unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "index.lock") {
+		t.Fatalf("commit failure lost its cause: %v", err)
+	}
+}
+
+func TestCommitAgentFixes_EmptyIndexIsReportedAsNoOpNotAsACommit(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	// A dirty worktree whose dirt `git add -A` cannot place in the superproject
+	// index: a submodule with untracked content of its own. Status is non-empty,
+	// the staged index stays empty, and no commit can be created.
+	submodule := t.TempDir()
+	gitCmd(t, submodule, "init", ".")
+	gitCmd(t, submodule, "config", "user.email", "t@example.com")
+	gitCmd(t, submodule, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(submodule, "sub.txt"), []byte("sub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, submodule, "add", "-A")
+	gitCmd(t, submodule, "commit", "-m", "sub base")
+	gitCmd(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", submodule, "sub")
+	gitCmd(t, dir, "commit", "-m", "add submodule")
+	if err := os.WriteFile(filepath.Join(dir, "sub", "untracked.txt"), []byte("agent scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	headSHA = gitCmd(t, dir, "rev-parse", "HEAD")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	var logs []string
+	sctx.Log = func(line string) { logs = append(logs, line) }
+
+	if err := commitAgentFixes(sctx, types.StepReview, "apply review fixes", ""); err != nil {
+		t.Fatalf("empty-index handoff must be a successful no-op: %v", err)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("no-op handoff moved HEAD to %s, want %s", got, headSHA)
+	}
+	if sctx.Run.HeadSHA != headSHA {
+		t.Fatalf("no-op handoff recorded head %s, want %s", sctx.Run.HeadSHA, headSHA)
+	}
+	joined := strings.Join(logs, "\n")
+	if strings.Contains(joined, "committed agent fixes") {
+		t.Fatalf("no-op handoff reported a commit it never made: %q", joined)
+	}
+	if !strings.Contains(joined, "no staged agent changes to commit") {
+		t.Fatalf("no-op handoff was not reported: %q", joined)
+	}
+}
+
+func TestCommitAgentFixes_EmptyIndexRecordsAgentAdvancedHead(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, startingHead := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", startingHead)
+
+	submodule := t.TempDir()
+	gitCmd(t, submodule, "init", ".")
+	gitCmd(t, submodule, "config", "user.email", "t@example.com")
+	gitCmd(t, submodule, "config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(submodule, "sub.txt"), []byte("sub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, submodule, "add", "-A")
+	gitCmd(t, submodule, "commit", "-m", "sub base")
+	gitCmd(t, dir, "-c", "protocol.file.allow=always", "submodule", "add", submodule, "sub")
+	gitCmd(t, dir, "commit", "-m", "add submodule")
+	if err := os.WriteFile(filepath.Join(dir, "sub", "untracked.txt"), []byte("agent scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, startingHead, config.Commands{})
+	var logs []string
+	sctx.Log = func(line string) { logs = append(logs, line) }
+
+	if err := commitAgentFixes(sctx, types.StepReview, "apply review fixes", ""); err != nil {
+		t.Fatalf("empty-index handoff must be a successful no-op: %v", err)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("no-op handoff moved HEAD to %s, want %s", got, headSHA)
+	}
+	if sctx.Run.HeadSHA != headSHA {
+		t.Fatalf("no-op handoff recorded head %s, want %s", sctx.Run.HeadSHA, headSHA)
+	}
+	persisted, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil || persisted == nil || persisted.HeadSHA != headSHA {
+		t.Fatalf("persisted run = %+v, err = %v, want head %s", persisted, err, headSHA)
+	}
+	if got := gitCmd(t, dir, "rev-parse", normalizedBranchRef(sctx.Run.Branch)); got != headSHA {
+		t.Fatalf("branch ref = %s, want agent head %s", got, headSHA)
+	}
+	rng, err := sctx.DB.GetUncertifiedPipelineRange(sctx.Repo.ID, sctx.Run.Branch)
+	if err != nil || rng == nil || rng.FromSHA != startingHead || rng.ToSHA != headSHA {
+		t.Fatalf("uncertified range = %+v, err = %v, want %s..%s", rng, err, startingHead, headSHA)
+	}
+	joined := strings.Join(logs, "\n")
+	if strings.Contains(joined, "committed agent fixes") {
+		t.Fatalf("no-op handoff reported a commit it never made: %q", joined)
+	}
+	if !strings.Contains(joined, "no staged agent changes to commit") {
+		t.Fatalf("no-op handoff was not reported: %q", joined)
+	}
+}
+
 func TestCommitAgentFixes_BypassesLegacyHuskyPrepareCommitMsgHook(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, _ := setupGitRepo(t)
@@ -889,6 +1025,67 @@ func TestCommitAgentFixes_DocumentDoesNotPersistUncertifiedRange(t *testing.T) {
 	}
 }
 
+func TestStepCmd_AppliesRunForgeEnvironmentAfterInjectedEnvironment(t *testing.T) {
+	sctx := &pipeline.StepContext{
+		Ctx:     context.Background(),
+		WorkDir: t.TempDir(),
+		Env: []string{
+			"GH_TOKEN=injected",
+			"GH_CONFIG_DIR=/injected",
+			"KEEP=value",
+		},
+		ForgeContext: &forgecontext.Context{Environment: runenv.Overlay{
+			Set:   map[string]string{"GH_CONFIG_DIR": "/profiles/personal"},
+			Unset: []string{"GH_TOKEN"},
+		}},
+	}
+
+	cmd := stepCmd(sctx, filepath.Join(string(filepath.Separator), "usr", "bin", "env"))
+	values := make(map[string]string)
+	for _, entry := range cmd.Env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	if _, exists := values["GH_TOKEN"]; exists {
+		t.Fatal("injected GH_TOKEN survived run forge environment")
+	}
+	if values["GH_CONFIG_DIR"] != "/profiles/personal" {
+		t.Fatalf("GH_CONFIG_DIR = %q, want /profiles/personal", values["GH_CONFIG_DIR"])
+	}
+	if values["KEEP"] != "value" {
+		t.Fatalf("unrelated value = %q, want value", values["KEEP"])
+	}
+}
+
+func TestStepCmdPreservesAmbientMultiAccountSelectionWithoutProfiles(t *testing.T) {
+	profileDir := t.TempDir()
+	hosts := "github.com:\n    users:\n        personal:\n        work:\n    user: work\n"
+	if err := os.WriteFile(filepath.Join(profileDir, "hosts.yml"), []byte(hosts), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sctx := &pipeline.StepContext{
+		Ctx:     context.Background(),
+		WorkDir: t.TempDir(),
+		Env: []string{
+			"GH_CONFIG_DIR=" + profileDir,
+			"GH_TOKEN=ambient-active-account-token",
+		},
+	}
+
+	values := make(map[string]string)
+	for _, entry := range stepCmd(sctx, filepath.Join(string(filepath.Separator), "usr", "bin", "env")).Env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[key] = value
+		}
+	}
+	if values["GH_CONFIG_DIR"] != profileDir || values["GH_TOKEN"] != "ambient-active-account-token" {
+		t.Fatalf("profile-free run changed ambient GitHub account selection: %#v", values)
+	}
+}
+
 func TestCommitAgentFixes_NoChanges(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
@@ -904,6 +1101,91 @@ func TestCommitAgentFixes_NoChanges(t *testing.T) {
 	}
 	if sctx.Run.HeadSHA != originalHeadSHA {
 		t.Errorf("HeadSHA changed unexpectedly: %s -> %s", originalHeadSHA, sctx.Run.HeadSHA)
+	}
+}
+
+func TestExecuteFixMode_NoWorktreeChangesCanonicalizesAgentSummary(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: json.RawMessage(`{"summary":"no changes were necessary"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Fixing = true
+
+	summary, err := executeFixMode(sctx, types.StepReview, fixExecutionOptions{FallbackSummary: "apply review fix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary != noChangesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q", summary, noChangesAppliedSummary)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("HEAD after no-op fix = %q, want %q", got, headSHA)
+	}
+	findings := `{"findings":[{"id":"review-1","severity":"warning","description":"accepted warning"}],"summary":"1 warning"}`
+	md, _ := BuildPipelineSummary(
+		[]*db.StepResult{{ID: "s1", StepName: types.StepReview, Status: types.StepStatusCompleted}},
+		map[string][]*db.StepRound{"s1": {
+			{Round: 1, Trigger: "initial", FindingsJSON: &findings},
+			{Round: 2, Trigger: "auto_fix", FixSummary: &summary},
+		}},
+		testPipelineHeadSHA,
+	)
+	if !strings.Contains(md, "🔧 **Review** - 1 issue found → no changes applied ✅") {
+		t.Fatalf("expected canonical no-change result in PR summary, got:\n%s", md)
+	}
+	if strings.Contains(md, "auto-fixed") {
+		t.Fatalf("did not expect no-op fix to be called auto-fixed, got:\n%s", md)
+	}
+}
+
+func TestExecuteFixMode_WorktreeChangesCanonicalizesMisleadingAgentSummary(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(_ context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			if err := os.WriteFile(filepath.Join(opts.CWD, "fix.go"), []byte("package fix\n"), 0o644); err != nil {
+				return nil, err
+			}
+			return &agent.Result{Output: json.RawMessage(`{"summary":"no changes applied: checked formatting"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Fixing = true
+
+	summary, err := executeFixMode(sctx, types.StepReview, fixExecutionOptions{FallbackSummary: "apply review fix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary != changesAppliedSummary {
+		t.Fatalf("fix summary = %q, want %q", summary, changesAppliedSummary)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got == headSHA {
+		t.Fatal("expected committed fix to advance HEAD")
+	}
+	findings := `{"findings":[{"id":"review-1","severity":"warning","description":"fixable warning"}],"summary":"1 warning"}`
+	md, _ := BuildPipelineSummary(
+		[]*db.StepResult{{ID: "s1", StepName: types.StepReview, Status: types.StepStatusCompleted}},
+		map[string][]*db.StepRound{"s1": {
+			{Round: 1, Trigger: "initial", FindingsJSON: &findings},
+			{Round: 2, Trigger: "auto_fix", FixSummary: &summary},
+		}},
+		testPipelineHeadSHA,
+	)
+	if !strings.Contains(md, "🔧 **Review** - 1 issue found → auto-fixed ✅") {
+		t.Fatalf("expected committed fix in PR summary, got:\n%s", md)
+	}
+	if strings.Contains(md, "no changes applied") {
+		t.Fatalf("did not expect misleading agent prose in PR summary, got:\n%s", md)
 	}
 }
 
@@ -924,6 +1206,52 @@ func TestCommitAgentFixes_InvalidTemplateDoesNotStageChanges(t *testing.T) {
 	}
 	if got := gitCmd(t, dir, "diff", "--cached", "--name-only"); got != "" {
 		t.Fatalf("staged files after template error = %q, want none", got)
+	}
+}
+
+func TestCommitAgentFixes_UsesBranchIdentifier(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Run.Branch = "refs/heads/topic-PROJ-123-add-widget"
+	sctx.Config.Commit = config.Commit{
+		FixMessage:    "{{.Branch}}: {{.Summary}}",
+		BranchPattern: `([A-Z]+-[0-9]+)`,
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "agent-change.txt"), []byte("change"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitAgentFixes(sctx, types.StepReview, "repair widget", "fallback"); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := lastCommitMessage(t, dir), "PROJ-123: repair widget"; got != want {
+		t.Fatalf("commit subject = %q, want %q", got, want)
+	}
+}
+
+func TestCommitAgentFixes_MissingBranchIdentifierDoesNotStageChanges(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Run.Branch = "refs/heads/topic-no-issue"
+	sctx.Config.Commit = config.Commit{
+		FixMessage:    "{{.Branch}}: {{.Summary}}",
+		BranchPattern: `([A-Z]+-[0-9]+)`,
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "agent-change.txt"), []byte("change"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := commitAgentFixes(sctx, types.StepReview, "repair widget", "fallback")
+	if err == nil || !strings.Contains(err.Error(), "did not find an identifier") {
+		t.Fatalf("commitAgentFixes() error = %v, want missing-identifier error", err)
+	}
+	if got := gitCmd(t, dir, "diff", "--cached", "--name-only"); got != "" {
+		t.Fatalf("staged files after missing identifier = %q, want none", got)
+	}
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != headSHA {
+		t.Fatalf("HEAD = %q, want unchanged %q", got, headSHA)
 	}
 }
 
@@ -1434,5 +1762,28 @@ func TestSanitizedPreviousFindingsForPrompt_PreservesSourceAndInstructions(t *te
 	}
 	if findings.Items[1].Source != types.FindingSourceUser {
 		t.Errorf("expected Source %q, got %q", types.FindingSourceUser, findings.Items[1].Source)
+	}
+}
+
+func TestCommitAgentFixes_CleanWorktreeRecordsAgentAdvancedHead(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, startingHead := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", startingHead)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, startingHead, config.Commands{})
+	gitCmd(t, dir, "commit", "--allow-empty", "-m", "agent commit")
+	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	if err := commitAgentFixes(sctx, types.StepReview, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil || persisted == nil || persisted.HeadSHA != headSHA {
+		t.Fatalf("persisted run = %+v, err = %v, want head %s", persisted, err, headSHA)
+	}
+	if got := gitCmd(t, dir, "rev-parse", normalizedBranchRef(sctx.Run.Branch)); got != headSHA {
+		t.Fatalf("branch ref = %s, want agent head %s", got, headSHA)
+	}
+	rng, err := sctx.DB.GetUncertifiedPipelineRange(sctx.Repo.ID, sctx.Run.Branch)
+	if err != nil || rng == nil || rng.FromSHA != startingHead || rng.ToSHA != headSHA {
+		t.Fatalf("uncertified range = %+v, err = %v, want %s..%s", rng, err, startingHead, headSHA)
 	}
 }

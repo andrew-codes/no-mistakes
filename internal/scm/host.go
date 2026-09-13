@@ -144,10 +144,19 @@ const (
 	CheckBucketSkip    CheckBucket = "skipping"
 )
 
+type CheckKind string
+
+const (
+	CheckKindRun    CheckKind = "run"
+	CheckKindStatus CheckKind = "status"
+)
+
 // Check is a single CI check result on a PR.
 type Check struct {
-	Name   string
-	Bucket CheckBucket
+	Name       string
+	ProviderID string `json:"provider_id,omitempty"`
+	Bucket     CheckBucket
+	Kind       CheckKind
 	// State is the provider's own outcome string for the check (GitHub
 	// conclusions such as FAILURE, TIMED_OUT, CANCELLED). Buckets collapse
 	// several outcomes into one value, so callers that must tell an
@@ -155,14 +164,97 @@ type Check struct {
 	// provider reported no state.
 	State       string
 	CompletedAt time.Time // zero when unknown; used to detect CI re-runs between polls
+	ExecutionID string    // provider execution discriminator when completion time is unavailable
+	// StartedAt is when this specific check run began. It is the ordering key
+	// backends use to collapse superseded same-name check runs (e.g. a raw
+	// commit rollup that keeps every run a commit ever had) down to the
+	// latest one; zero when the provider did not report it.
+	StartedAt time.Time
+	// WorkflowID identifies the provider workflow that emitted the check. It
+	// distinguishes independent same-name workflows while allowing reruns of
+	// one workflow to use latest-wins ordering. Zero when unavailable.
+	WorkflowID int64
 	// Link is the provider's details URL for this check. It may identify an
 	// individual job or a provider-side workflow run for targeted reruns. Empty
 	// when the provider reported no link.
 	Link string
+	// PreRunFailure marks a check the provider failed before the repository's own
+	// steps ran - its setup/action-resolution phase failed (e.g. a GitHub Actions
+	// action-download outage), so no repository step executed. It is an
+	// infrastructure outcome, not a verdict on the code, and the CI step treats it
+	// as re-runnable rather than a code failure. A PreRunFailureDetector sets it;
+	// it can never be true for a genuine test or lint failure, whose job cleared
+	// setup and failed a later step.
+	PreRunFailure bool
+	// App identifies the provider application that published the check, when
+	// the provider reports one: on GitHub it is the check suite's app slug
+	// ("github-actions" for every Actions job, "greptile-apps" for Greptile's
+	// review check). It is structural provider identity, never a check name,
+	// so the CI step can tell a third-party review bot's verdict from the
+	// repository's own CI without matching names. Empty when unknown.
+	App string
 }
 
 // Failing reports whether the check is in a failed bucket.
 func (c Check) Failing() bool { return c.Bucket == CheckBucketFail }
+
+// ReviewBot describes a third-party review bot whose pull request check is an
+// opinion about the change rather than a job verdict on it. The CI step routes
+// such a check's failure to a human decision carrying the bot's unresolved
+// review comments, instead of spending an auto-fix round on it, and the
+// GitHub backend collects only these bots' review-thread comments.
+type ReviewBot struct {
+	// AppSlug is the provider app slug the bot publishes its check under.
+	AppSlug string
+	// Logins are the account logins the bot posts review comments as.
+	Logins []string
+}
+
+// ReviewBots is the registry of supported review bots. Both halves of the
+// integration - check identity and comment authorship - read it, so adding a
+// bot is one entry here.
+var ReviewBots = []ReviewBot{
+	{AppSlug: "greptile-apps", Logins: []string{"greptile-apps[bot]", "greptile-apps"}},
+}
+
+// ReviewBotForApp returns the registered review bot that publishes checks
+// under slug. An empty slug never matches: a provider that reported no app
+// identity has not identified a bot.
+func ReviewBotForApp(slug string) (ReviewBot, bool) {
+	slug = strings.ToLower(strings.TrimSpace(slug))
+	if slug == "" {
+		return ReviewBot{}, false
+	}
+	for _, bot := range ReviewBots {
+		if strings.EqualFold(bot.AppSlug, slug) {
+			return bot, true
+		}
+	}
+	return ReviewBot{}, false
+}
+
+// ReviewBotForLogin returns the registered review bot that posts review
+// comments as login.
+func ReviewBotForLogin(login string) (ReviewBot, bool) {
+	login = strings.ToLower(strings.TrimSpace(login))
+	if login == "" {
+		return ReviewBot{}, false
+	}
+	for _, bot := range ReviewBots {
+		for _, known := range bot.Logins {
+			if strings.EqualFold(known, login) {
+				return bot, true
+			}
+		}
+	}
+	return ReviewBot{}, false
+}
+
+// IsReviewBotLogin reports whether login belongs to a registered review bot.
+func IsReviewBotLogin(login string) bool {
+	_, ok := ReviewBotForLogin(login)
+	return ok
+}
 
 // Pending reports whether the check is still running or queued.
 func (c Check) Pending() bool { return c.Bucket == CheckBucketPending }
@@ -173,6 +265,7 @@ type Capabilities struct {
 	MergeableState  bool
 	FailedCheckLogs bool
 	MergedProof     bool
+	ReviewComments  bool
 }
 
 var (
@@ -185,6 +278,68 @@ var (
 	// the wrong commit.
 	ErrHeadChanged = errors.New("pull request head changed")
 )
+
+// ReviewComment represents a code review comment or bot finding on a pull request.
+type CheckTarget struct {
+	Name       string `json:"name"`
+	ProviderID string `json:"provider_id,omitempty"`
+}
+
+func (t CheckTarget) Identity() string {
+	if t.ProviderID != "" {
+		return t.ProviderID
+	}
+	return t.Name
+}
+
+type FailedCheckLog struct {
+	Target CheckTarget
+	Output string
+	Err    error
+}
+
+type TargetedFailedCheckLogsHost interface {
+	FetchFailedCheckTargetLogs(ctx context.Context, pr *PR, branch, headSHA string, targets []CheckTarget) ([]FailedCheckLog, error)
+}
+
+func CombineFailedCheckLogs(logs []FailedCheckLog) (string, error) {
+	var outputs []string
+	var errs []error
+	for _, log := range logs {
+		if output := strings.TrimSpace(log.Output); output != "" {
+			outputs = append(outputs, output)
+		}
+		if log.Err != nil {
+			errs = append(errs, log.Err)
+		}
+	}
+	return strings.Join(outputs, "\n\n"), errors.Join(errs...)
+}
+
+type ReviewComment struct {
+	ID        string
+	Author    string
+	Path      string
+	Line      int
+	Body      string
+	CreatedAt time.Time
+	URL       string
+}
+
+// ReviewCommentsHost is an optional interface for SCM hosts that support fetching
+// unresolved review comments on a pull request.
+type ReviewCommentsHost interface {
+	GetReviewComments(ctx context.Context, pr *PR) ([]ReviewComment, error)
+}
+
+// PRContentReader is an optional interface for hosts that can read the current
+// title and raw body of an existing PR. Readers must distinguish an explicitly
+// empty body from missing, null, or malformed content and reject the latter.
+// Author-preserving publication and pre-push/CI attestation refresh depend on
+// this distinction to avoid replacing author text after an incomplete read.
+type PRContentReader interface {
+	GetPRContent(ctx context.Context, pr *PR) (PRContent, error)
+}
 
 // MergedProof is provider evidence that a specific PR head was merged.
 type MergedProof struct {
@@ -214,7 +369,11 @@ type Host interface {
 	// error explaining why it is not (missing CLI, unauthenticated, etc).
 	Available(ctx context.Context) error
 
-	// FindPR returns the open PR for the source branch, or nil if none exists.
+	// FindPR returns the open PR for the source branch, or nil only when a
+	// successfully decoded and validated PR listing contains no matching PR. It
+	// returns an error for lookup, response-decoding, or validation failures
+	// (including empty, malformed, null, or incoherent payloads) so callers do
+	// not create a duplicate PR after an indeterminate lookup.
 	FindPR(ctx context.Context, branch, base string) (*PR, error)
 	CreatePR(ctx context.Context, branch, base string, content PRContent) (*PR, error)
 	UpdatePR(ctx context.Context, pr *PR, content PRContent) (*PR, error)
@@ -236,6 +395,40 @@ type Host interface {
 // resumed after repository configuration changes.
 type PRBaseBranchReader interface {
 	GetPRBaseBranch(ctx context.Context, pr *PR) (string, error)
+}
+
+// PRBaseRetargeter is implemented by providers that can change an existing
+// PR's target branch. The PR step uses it when a per-run --base-branch override
+// disagrees with the live forge base of an already-open PR. A host that does
+// not implement this, including when the live base is unread, must fail closed
+// rather than rewrite title and body against a base it did not move. A
+// repo-config pr.base_branch change still does not retarget; that path updates
+// title and body only so a still-open PR is not orphaned behind a duplicate.
+type PRBaseRetargeter interface {
+	SetPRBaseBranch(ctx context.Context, pr *PR, baseBranch string) error
+}
+
+// PreRunFailureDetector reports which failed checks the provider failed before
+// the repository's own steps ran - a setup/action-resolution outcome (for GitHub
+// Actions, an action-download outage) rather than a verdict on the code. It
+// reads the provider's own step-level conclusions, never log text, so a flagged
+// check is one whose job never executed a repository step. A genuine test or
+// lint failure can never be flagged, because that job cleared setup and failed a
+// later step: this is what keeps the transient-rerun path from masking real
+// failures.
+//
+// Like CheckRerunner it is optional: a backend whose provider exposes no
+// step-level phase simply does not implement it, and the CI step consults it
+// only when transient reruns are enabled.
+type PreRunFailureDetector interface {
+	// PreRunFailures returns a slice parallel to checks: entry i is true when
+	// checks[i] failed before any repository step ran. Check names are not unique
+	// on a PR, so the result is positional rather than name-keyed - a same-named
+	// genuine failure must never inherit another check's infrastructure flag. It
+	// must fail closed - leaving false any check whose phase it cannot determine -
+	// so an unreadable job stays a genuine failure rather than being masked as
+	// infrastructure.
+	PreRunFailures(ctx context.Context, checks []Check) ([]bool, error)
 }
 
 // CheckRerunner re-runs the provider-side work behind a failed check without

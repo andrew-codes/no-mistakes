@@ -37,6 +37,12 @@ func (m *Model) applyEvent(event ipc.Event) bool {
 		}
 		m.stateRev = event.StateRev
 	}
+	// A client can subscribe before the executor inserts the run's dynamic gate
+	// rows. The first event for an unknown step means the synthetic core-only
+	// plan is stale, so read the authoritative snapshot before applying it.
+	if event.StepName != nil && ipc.ClassOf(event.Type) == ipc.ClassState && !m.hasStep(*event.StepName) {
+		return true
+	}
 	switch event.Type {
 	case ipc.EventRunUpdated, ipc.EventRunCreated:
 		m.err = nil
@@ -66,6 +72,12 @@ func (m *Model) applyEvent(event ipc.Event) bool {
 		}
 		if event.PRURL != nil {
 			m.run.PRURL = event.PRURL
+		}
+		// Carry the CI approval override onto the model so renderOutcomeBanner
+		// shows "passed with override" on the live event path, not just after a
+		// snapshot. Without this the banner disagrees with axi's outcome word.
+		if event.CIOverrideReason != nil {
+			m.run.CIOverrideReason = *event.CIOverrideReason
 		}
 		if m.syntheticSteps {
 			m.steps = nil
@@ -98,6 +110,9 @@ func (m *Model) applyEvent(event ipc.Event) bool {
 		}
 		if event.StepName != nil && event.ReportedFindings != nil {
 			m.setStepReportedFindings(*event.StepName, *event.ReportedFindings)
+		}
+		if event.StepName != nil && event.WorkScope != "" {
+			m.setStepWorkScope(*event.StepName, event.WorkScope)
 		}
 		// Persist duration so the step continues to display its elapsed time.
 		// Prefer the event's execution-only duration; fall back to local timing.
@@ -326,6 +341,15 @@ func (m *Model) updateStepStatus(name types.StepName, status types.StepStatus) {
 	}
 }
 
+func (m Model) hasStep(name types.StepName) bool {
+	for i := range m.steps {
+		if m.steps[i].StepName == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (m Model) stepInFixReview(name types.StepName) bool {
 	if m.done || m.run == nil || m.run.Status == types.RunCompleted || m.run.Status == types.RunFailed || m.run.Status == types.RunCancelled {
 		return false
@@ -396,6 +420,15 @@ func (m *Model) setStepDuration(name types.StepName, durationMS *int64) {
 	for i := range m.steps {
 		if m.steps[i].StepName == name {
 			m.steps[i].DurationMS = durationMS
+			return
+		}
+	}
+}
+
+func (m *Model) setStepWorkScope(name types.StepName, workScope string) {
+	for i := range m.steps {
+		if m.steps[i].StepName == name {
+			m.steps[i].WorkScope = workScope
 			return
 		}
 	}

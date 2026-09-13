@@ -20,14 +20,48 @@ type StepResult struct {
 	FindingsJSON   *string
 	Error          *string
 	StartedAt      *int64
+	RoundStartedAt *int64
 	CompletedAt    *int64
 	LastActivityAt *int64
 	LastActivity   *string
 	AgentPID       *int
 	AutoFixLimit   *int
+	// OverrideReason is non-nil exactly when a human answered ActionApprove on
+	// this step's gate despite an unresolved external condition (currently:
+	// the CI step's live checks were still failing). See
+	// pipeline.ApprovalOverrideVerifier and Executor's two ActionApprove sites.
+	OverrideReason *string
+	// SkipReason records an automatic PR/CI skip, distinct from an explicit
+	// per-run skip. Legacy rows have no recorded reason.
+	SkipReason *string
 }
 
 const stepResultColumns = `id, run_id, step_name, step_order, status, exit_code, duration_ms, log_path, findings_json, error, started_at, completed_at, last_activity_at, last_activity, agent_pid, auto_fix_limit`
+
+// readableStepResultColumns tolerates databases that predate the optional
+// columns. The ci_fix_attempts column is no longer read: the CI step's fix
+// rounds are counted by the executor from the round history, exactly like
+// every other step's, and the column only remains because migrations are
+// append-only.
+func (d *DB) readableStepResultColumns() string {
+	columns := stepResultColumns
+	if d.hasColumn("step_results", "round_started_at") {
+		columns += ", round_started_at"
+	} else {
+		columns += ", NULL AS round_started_at"
+	}
+	if d.hasColumn("step_results", "override_reason") {
+		columns += ", override_reason"
+	} else {
+		columns += ", NULL AS override_reason"
+	}
+	if d.hasColumn("step_results", "skip_reason") {
+		columns += ", skip_reason"
+	} else {
+		columns += ", NULL AS skip_reason"
+	}
+	return columns
+}
 
 // InsertStepResult creates a new step result record.
 func (d *DB) InsertStepResult(runID string, stepName types.StepName) (*StepResult, error) {
@@ -52,8 +86,8 @@ func (d *DB) InsertStepResult(runID string, stepName types.StepName) (*StepResul
 func (d *DB) GetStepResult(id string) (*StepResult, error) {
 	s := &StepResult{}
 	err := d.sql.QueryRow(
-		`SELECT `+stepResultColumns+` FROM step_results WHERE id = ?`, id,
-	).Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit)
+		`SELECT `+d.readableStepResultColumns()+` FROM step_results WHERE id = ?`, id,
+	).Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.RoundStartedAt, &s.OverrideReason, &s.SkipReason)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -64,9 +98,17 @@ func (d *DB) GetStepResult(id string) (*StepResult, error) {
 }
 
 // GetStepsByRun returns all step results for a run, in execution order.
+//
+// The `id` tie-break is load-bearing: a custom gate shares its anchor's
+// step_order, so a run can hold duplicate sort keys, and SQLite does not define
+// the order of rows with equal keys. Executor.recoveredGate matches these rows
+// to the executor's step list POSITIONALLY, so an unspecified tie order would
+// make every parked run in a gates-configured repository unrecoverable. Step
+// ids are monotonic ULIDs, so ordering by id reproduces insertion - that is,
+// execution - order deterministically.
 func (d *DB) GetStepsByRun(runID string) ([]*StepResult, error) {
 	rows, err := d.sql.Query(
-		`SELECT `+stepResultColumns+` FROM step_results WHERE run_id = ? ORDER BY step_order`, runID,
+		`SELECT `+d.readableStepResultColumns()+` FROM step_results WHERE run_id = ? ORDER BY step_order, id`, runID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get steps by run: %w", err)
@@ -75,12 +117,26 @@ func (d *DB) GetStepsByRun(runID string) ([]*StepResult, error) {
 	var steps []*StepResult
 	for rows.Next() {
 		s := &StepResult{}
-		if err := rows.Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit); err != nil {
+		if err := rows.Scan(&s.ID, &s.RunID, &s.StepName, &s.StepOrder, &s.Status, &s.ExitCode, &s.DurationMS, &s.LogPath, &s.FindingsJSON, &s.Error, &s.StartedAt, &s.CompletedAt, &s.LastActivityAt, &s.LastActivity, &s.AgentPID, &s.AutoFixLimit, &s.RoundStartedAt, &s.OverrideReason, &s.SkipReason); err != nil {
 			return nil, fmt.Errorf("scan step result: %w", err)
 		}
 		steps = append(steps, s)
 	}
 	return steps, rows.Err()
+}
+
+func (d *DB) ResetStepsFrom(runID string, stepOrder int) error {
+	_, err := d.sql.Exec(`
+		UPDATE step_results
+		SET status = ?, exit_code = NULL, duration_ms = NULL, log_path = NULL,
+			findings_json = NULL, error = NULL, started_at = NULL,
+			round_started_at = NULL, completed_at = NULL, last_activity_at = NULL, last_activity = NULL,
+			agent_pid = NULL, auto_fix_limit = NULL
+		WHERE run_id = ? AND step_order >= ? AND status != ?`, types.StepStatusPending, runID, stepOrder, types.StepStatusSkipped)
+	if err != nil {
+		return fmt.Errorf("reset steps for revalidation: %w", err)
+	}
+	return nil
 }
 
 // UpdateStepStatus updates a step's status.
@@ -152,9 +208,22 @@ func (d *DB) StartStep(id string) error {
 // auto-fix limit that status surfaces use while the step is active.
 func (d *DB) StartStepWithAutoFixLimit(id string, autoFixLimit int) error {
 	ts := now()
-	_, err := d.sql.Exec(`UPDATE step_results SET status = ?, started_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL, auto_fix_limit = ? WHERE id = ?`, types.StepStatusRunning, ts, ts, "step started", autoFixLimitDBValue(autoFixLimit), id)
+	_, err := d.sql.Exec(`UPDATE step_results SET status = ?, started_at = ?, round_started_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL, auto_fix_limit = ? WHERE id = ?`, types.StepStatusRunning, ts, ts, ts, "step started", autoFixLimitDBValue(autoFixLimit), id)
 	if err != nil {
 		return fmt.Errorf("start step: %w", err)
+	}
+	return nil
+}
+
+// StartStepFixRound marks the beginning of a distinct fix execution while
+// preserving started_at as the clock for the enclosing step. Recovery can use
+// a newly loaded trusted configuration, so its supplied limit replaces the
+// one recorded by an earlier execution.
+func (d *DB) StartStepFixRound(id string, autoFixLimit int) error {
+	ts := now()
+	_, err := d.sql.Exec(`UPDATE step_results SET status = ?, round_started_at = ?, last_activity_at = ?, last_activity = ?, auto_fix_limit = ? WHERE id = ?`, types.StepStatusFixing, ts, ts, fmt.Sprintf("status: %s", types.StepStatusFixing), autoFixLimitDBValue(autoFixLimit), id)
+	if err != nil {
+		return fmt.Errorf("start step fix round: %w", err)
 	}
 	return nil
 }
@@ -162,6 +231,23 @@ func (d *DB) StartStepWithAutoFixLimit(id string, autoFixLimit int) error {
 func (d *DB) SetStepAutoFixLimit(id string, autoFixLimit int) error {
 	if _, err := d.sql.Exec(`UPDATE step_results SET auto_fix_limit = ? WHERE id = ?`, autoFixLimitDBValue(autoFixLimit), id); err != nil {
 		return fmt.Errorf("set step auto-fix limit: %w", err)
+	}
+	return nil
+}
+
+// SetStepOverrideReason records that a human answered ActionApprove on this
+// step's gate despite an unresolved external condition (see
+// pipeline.ApprovalOverrideVerifier). Called alongside, not instead of, the
+// normal step-completion write: it never changes Status, only annotates why
+// the completion happened without the condition that raised the gate having
+// cleared. reason must be non-empty; the column stays NULL for every
+// ordinarily-resolved step, which is what marks a run "verified green".
+func (d *DB) SetStepOverrideReason(id string, reason string) error {
+	if reason == "" {
+		return fmt.Errorf("set step override reason: reason must not be empty")
+	}
+	if _, err := d.sql.Exec(`UPDATE step_results SET override_reason = ? WHERE id = ?`, reason, id); err != nil {
+		return fmt.Errorf("set step override reason: %w", err)
 	}
 	return nil
 }
@@ -180,9 +266,18 @@ func (d *DB) CompleteStep(id string, exitCode int, durationMS int64, logPath str
 
 // CompleteStepWithStatus marks a step as finished with timing and result info.
 func (d *DB) CompleteStepWithStatus(id string, status types.StepStatus, exitCode int, durationMS int64, logPath string) error {
+	return d.completeStep(id, status, exitCode, durationMS, logPath, "")
+}
+
+// CompleteSkippedStep atomically preserves the automatic skip cause with its status.
+func (d *DB) CompleteSkippedStep(id string, exitCode int, durationMS int64, logPath, reason string) error {
+	return d.completeStep(id, types.StepStatusSkipped, exitCode, durationMS, logPath, reason)
+}
+
+func (d *DB) completeStep(id string, status types.StepStatus, exitCode int, durationMS int64, logPath, skipReason string) error {
 	_, err := d.sql.Exec(
-		`UPDATE step_results SET status = ?, exit_code = ?, duration_ms = ?, log_path = ?, completed_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL WHERE id = ?`,
-		status, exitCode, durationMS, logPath, now(), now(), fmt.Sprintf("status: %s", status), id,
+		`UPDATE step_results SET status = ?, exit_code = ?, duration_ms = ?, log_path = ?, completed_at = ?, last_activity_at = ?, last_activity = ?, agent_pid = NULL, skip_reason = NULLIF(?, '') WHERE id = ?`,
+		status, exitCode, durationMS, logPath, now(), now(), fmt.Sprintf("status: %s", status), skipReason, id,
 	)
 	if err != nil {
 		return fmt.Errorf("complete step: %w", err)

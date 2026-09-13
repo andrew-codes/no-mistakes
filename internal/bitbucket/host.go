@@ -17,14 +17,16 @@ type Host struct {
 	client       *Client
 	repo         RepoRef
 	cliAvailable func() bool
+	draft        bool // open created PRs as drafts ("--draft" on twg's create)
 }
 
 // NewHost builds a Host from a twg-backed client and a parsed repository
 // reference. cliAvailable reports whether the twg binary is resolvable on
 // the caller's PATH (possibly overridden by env); when nil, availability is
-// determined solely by the doctor check in Available.
-func NewHost(client *Client, repo RepoRef, cliAvailable func() bool) *Host {
-	return &Host{client: client, repo: repo, cliAvailable: cliAvailable}
+// determined solely by the doctor check in Available. When draft is true,
+// created PRs are opened as drafts.
+func NewHost(client *Client, repo RepoRef, cliAvailable func() bool, draft bool) *Host {
+	return &Host{client: client, repo: repo, cliAvailable: cliAvailable, draft: draft}
 }
 
 func (h *Host) Provider() scm.Provider { return scm.ProviderBitbucket }
@@ -81,7 +83,7 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 }
 
 func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PRContent) (*scm.PR, error) {
-	pr, err := h.client.CreatePR(ctx, h.repo, branch, base, content.Title, content.Body)
+	pr, err := h.client.CreatePR(ctx, h.repo, branch, base, content.Title, content.Body, h.draft)
 	if err != nil {
 		return nil, err
 	}
@@ -128,8 +130,10 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 	checks := make([]scm.Check, 0, len(statuses))
 	for _, status := range statuses {
 		checks = append(checks, scm.Check{
-			Name:   statusName(status),
-			Bucket: statusBucket(status.State),
+			Name:        statusName(status),
+			ProviderID:  statusProviderID(status),
+			Bucket:      statusBucket(status.State),
+			ExecutionID: pipelineBuildNumberFromStatusURL(status.URL),
 		})
 	}
 	return checks, nil
@@ -139,33 +143,68 @@ func (h *Host) GetMergeableState(_ context.Context, _ *scm.PR) (scm.MergeableSta
 	return "", scm.ErrUnsupported
 }
 
-// FetchFailedCheckLogs finds the pipeline behind a failing check by reading
-// the check's status URL (Bitbucket Pipelines build statuses always link to
-// their pipeline result: .../pipelines/results/<uuid>) and fetches its
-// failed step's log directly. twg has no "list pipelines by commit" primitive,
-// so this only covers checks whose status carries a result URL - the case
-// every real caller hits, since failingNames always comes from a prior
-// GetChecks pass over the same statuses.
-func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, _ string, _ string, failingNames []string) (string, error) {
-	if h.client == nil || len(failingNames) == 0 {
-		return "", nil
+// FetchFailedCheckLogs finds the pipeline behind each named failing check by
+// reading the check's status URL (Bitbucket Pipelines build statuses always
+// link to their pipeline result, whose trailing path segment is the build
+// number: .../pipelines/results/<build-number>) and fetches its failed
+// step's log directly via twg, which accepts a pipeline build number, UUID,
+// or result URL interchangeably as --pipeline.
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
+	targets := make([]scm.CheckTarget, 0, len(failingNames))
+	for _, name := range failingNames {
+		targets = append(targets, scm.CheckTarget{Name: name})
 	}
-	id, err := strconv.Atoi(pr.Number)
+	logs, err := h.FetchFailedCheckTargetLogs(ctx, pr, branch, headSHA, targets)
 	if err != nil {
 		return "", err
 	}
+	return scm.CombineFailedCheckLogs(logs)
+}
+
+// FetchFailedCheckTargetLogs implements scm.TargetedFailedCheckLogsHost,
+// fetching the failed-step log for exactly the selected checks rather than
+// every failing check on the PR.
+func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, pr *scm.PR, _ string, _ string, selected []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
+	if h.client == nil {
+		return nil, errors.New("bitbucket client is not configured")
+	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+	id, err := strconv.Atoi(pr.Number)
+	if err != nil {
+		return nil, err
+	}
 	statuses, err := h.client.ListPRStatuses(ctx, h.repo, id)
 	if err != nil {
-		return "", nil
+		return nil, fmt.Errorf("resolve selected Bitbucket checks: %w", err)
 	}
-	for _, uuid := range failedPipelineUUIDs(statuses, failingNames) {
-		logOutput, err := h.client.GetFailedStepLog(ctx, h.repo, uuid)
-		if err != nil || strings.TrimSpace(logOutput) == "" {
+	results := make([]scm.FailedCheckLog, 0, len(selected))
+	for _, target := range selected {
+		result := scm.FailedCheckLog{Target: target}
+		buildNumbers, resolveErr := failedPipelineBuildNumberTargets(statuses, []scm.CheckTarget{target})
+		if resolveErr != nil {
+			result.Err = resolveErr
+			results = append(results, result)
 			continue
 		}
-		return strings.TrimSpace(logOutput), nil
+		var outputs []string
+		var logErrors []error
+		for buildNumber := range buildNumbers {
+			logOutput, err := h.client.GetFailedStepLog(ctx, h.repo, buildNumber)
+			if err != nil {
+				logErrors = append(logErrors, fmt.Errorf("fetch Bitbucket pipeline %s log: %w", buildNumber, err))
+				continue
+			}
+			if log := strings.TrimSpace(logOutput); log != "" {
+				outputs = append(outputs, log)
+			}
+		}
+		result.Output = strings.Join(outputs, "\n\n")
+		result.Err = errors.Join(logErrors...)
+		results = append(results, result)
 	}
-	return "", nil
+	return results, nil
 }
 
 func (h *Host) toPR(pr *PullRequest) *scm.PR {
@@ -232,6 +271,19 @@ func statusName(status CommitStatus) string {
 	return strings.TrimSpace(status.Key)
 }
 
+// statusProviderID derives a stable identity for a status beyond its display
+// name, so same-named statuses (e.g. a matrix job repeated across platforms)
+// can be told apart by callers matching on scm.CheckTarget.ProviderID.
+func statusProviderID(status CommitStatus) string {
+	if key := strings.TrimSpace(status.Key); key != "" {
+		return "bitbucket-status:" + key
+	}
+	if buildNumber := pipelineBuildNumberFromStatusURL(status.URL); buildNumber != "" {
+		return "bitbucket-pipeline-build:" + buildNumber
+	}
+	return ""
+}
+
 func statusBucket(state string) scm.CheckBucket {
 	switch strings.ToUpper(strings.TrimSpace(state)) {
 	case "SUCCESSFUL", "SUCCESS":
@@ -247,16 +299,12 @@ func statusBucket(state string) scm.CheckBucket {
 	}
 }
 
-func normalizePipelineUUID(raw string) string {
-	trimmed := strings.TrimSpace(raw)
-	trimmed = strings.Trim(trimmed, "{}")
-	if trimmed == "" {
-		return ""
-	}
-	return strings.ToLower(trimmed)
-}
-
-func pipelineUUIDFromStatusURL(raw string) string {
+// pipelineBuildNumberFromStatusURL extracts the pipeline build number from a
+// Bitbucket Pipelines status URL. The trailing "/results/<N>" path segment
+// (in either the URL path or its fragment) is the build number Bitbucket's
+// own web UI links to, not a UUID; twg's --pipeline flag accepts this number
+// directly.
+func pipelineBuildNumberFromStatusURL(raw string) string {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return ""
@@ -267,45 +315,63 @@ func pipelineUUIDFromStatusURL(raw string) string {
 		if idx < 0 {
 			continue
 		}
-		uuid := fragment[idx+len("/results/"):]
-		uuid = strings.TrimSpace(strings.SplitN(uuid, "?", 2)[0])
-		uuid = strings.TrimSpace(strings.SplitN(uuid, "/", 2)[0])
-		return normalizePipelineUUID(uuid)
+		buildNumber := fragment[idx+len("/results/"):]
+		buildNumber = strings.TrimSpace(strings.SplitN(buildNumber, "?", 2)[0])
+		buildNumber = strings.TrimSpace(strings.SplitN(buildNumber, "/", 2)[0])
+		buildNumber = strings.Trim(buildNumber, "{}")
+		if number, err := strconv.Atoi(buildNumber); err == nil && number > 0 {
+			return strconv.Itoa(number)
+		}
+		return ""
 	}
 	return ""
 }
 
-// failedPipelineUUIDs returns the pipeline UUIDs (in stable order) behind the
-// named failing statuses, derived from each status's result URL.
-func failedPipelineUUIDs(statuses []CommitStatus, failingNames []string) []string {
-	if len(failingNames) == 0 {
-		return nil
-	}
-	failing := make(map[string]struct{}, len(failingNames))
-	for _, name := range failingNames {
-		trimmed := strings.TrimSpace(name)
-		if trimmed != "" {
-			failing[trimmed] = struct{}{}
+// failedPipelineBuildNumberTargets resolves each selected check target to the
+// pipeline build number(s) behind it, matching by ProviderID when the target
+// carries one (so two same-named checks are never conflated) and falling
+// back to name otherwise. It fails closed - a selection that cannot be
+// matched to a failed status with a resolvable pipeline identity is an error,
+// never a silently empty result.
+func failedPipelineBuildNumberTargets(statuses []CommitStatus, selected []scm.CheckTarget) (map[string]struct{}, error) {
+	latest := LatestStatuses(statuses)
+	targets := make(map[string]struct{}, len(selected))
+	var resolveErrors []error
+	for _, target := range selected {
+		matched := false
+		for _, status := range latest {
+			if statusBucket(status.State) != scm.CheckBucketFail {
+				continue
+			}
+			if target.ProviderID != "" {
+				if statusProviderID(status) != target.ProviderID {
+					continue
+				}
+			} else if statusName(status) != strings.TrimSpace(target.Name) {
+				continue
+			}
+			matched = true
+			if buildNumber := pipelineBuildNumberFromStatusURL(status.URL); buildNumber != "" {
+				targets[buildNumber] = struct{}{}
+			} else {
+				resolveErrors = append(resolveErrors, fmt.Errorf("selected Bitbucket check %q has no pipeline identity", statusName(status)))
+			}
+		}
+		if !matched {
+			identity := target.ProviderID
+			if identity == "" {
+				identity = target.Name
+			}
+			resolveErrors = append(resolveErrors, fmt.Errorf("selected Bitbucket check %q was not found", identity))
 		}
 	}
-	if len(failing) == 0 {
-		return nil
+	if err := errors.Join(resolveErrors...); err != nil {
+		return nil, err
 	}
-	seen := make(map[string]struct{})
-	var uuids []string
-	for _, status := range LatestStatuses(statuses) {
-		if _, ok := failing[statusName(status)]; !ok {
-			continue
-		}
-		uuid := pipelineUUIDFromStatusURL(status.URL)
-		if uuid == "" {
-			continue
-		}
-		if _, ok := seen[uuid]; ok {
-			continue
-		}
-		seen[uuid] = struct{}{}
-		uuids = append(uuids, uuid)
+	if len(targets) == 0 {
+		return nil, errors.New("no selected Bitbucket checks resolved to pipelines")
 	}
-	return uuids
+	return targets, nil
 }
+
+var _ scm.TargetedFailedCheckLogsHost = (*Host)(nil)

@@ -2,12 +2,16 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net/http"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +28,12 @@ type Host struct {
 	host         string // repo's GitHub hostname; scopes the auth check
 	repo         string // "owner/name" slug for --repo; empty when unknown
 	forkOwner    string // fork owner for cross-repository PR heads
+	draft        bool   // open created PRs as drafts (gh pr create --draft)
+	// assetHTTP and assetUploadPrefix override the unofficial user-attachments
+	// upload transport in tests. Production leaves both nil/empty and uses
+	// http.DefaultClient against uploads.github.com (or uploads.<ghec-host>).
+	assetHTTP         *http.Client
+	assetUploadPrefix string
 }
 
 // New builds a Host. cliAvailable reports whether the gh binary is
@@ -48,10 +58,11 @@ func New(cmd CmdFactory, cliAvailable func() bool, host, repo string) *Host {
 // NewWithFork builds a Host that opens PRs on repo using forkRepo as the head
 // repository owner. forkRepo is an "owner/name" slug; only the owner is needed
 // because gh pr create expects --head <owner>:<branch>. host is optional; see
-// New for its role in scoping the auth check.
-func NewWithFork(cmd CmdFactory, cliAvailable func() bool, host, repo, forkRepo string) *Host {
+// New for its role in scoping the auth check. draft opens created PRs as drafts.
+func NewWithFork(cmd CmdFactory, cliAvailable func() bool, host, repo, forkRepo string, draft bool) *Host {
 	h := New(cmd, cliAvailable, host, repo)
 	h.forkOwner = repoOwner(forkRepo)
+	h.draft = draft
 	return h
 }
 
@@ -133,7 +144,7 @@ func repoOwner(slug string) string {
 func (h *Host) Provider() scm.Provider { return scm.ProviderGitHub }
 
 func (h *Host) Capabilities() scm.Capabilities {
-	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true}
+	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true, ReviewComments: true}
 }
 
 func (h *Host) Available(ctx context.Context) error {
@@ -150,10 +161,79 @@ func (h *Host) Available(ctx context.Context) error {
 	if h.host != "" {
 		authArgs = append(authArgs, "--hostname", h.host)
 	}
-	if err := h.cmd(ctx, "gh", authArgs...).Run(); err != nil {
-		return errors.New("gh CLI is not authenticated")
+	cmd := h.cmd(ctx, "gh", authArgs...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		// Keep timeout / missing-binary failures distinct from auth failure so a
+		// cancelled reconcile context is not reported as "log in again".
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("gh auth status timed out: %w", ctx.Err())
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("gh auth status interrupted: %w", ctx.Err())
+		}
+		if isMissingExecutable(err) {
+			return fmt.Errorf("gh CLI is not on PATH: %w", err)
+		}
+		detail := strings.TrimSpace(stderr.String())
+		if detail != "" {
+			return fmt.Errorf("gh CLI is not authenticated: %s: %w", detail, err)
+		}
+		return fmt.Errorf("gh CLI is not authenticated: %w", err)
 	}
 	return nil
+}
+
+func isMissingExecutable(err error) bool {
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return errors.Is(execErr.Err, exec.ErrNotFound) || errors.Is(execErr.Err, fs.ErrNotExist)
+	}
+	return false
+}
+
+func parsePullRequestURL(raw, expectedHost, expectedRepo string) (int, error) {
+	trimmed := strings.TrimSpace(raw)
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return 0, errors.New("expected absolute GitHub pull request URL")
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return 0, errors.New("expected HTTP GitHub pull request URL")
+	}
+	if expectedHost != "" && !strings.EqualFold(parsed.Hostname(), expectedHost) {
+		return 0, fmt.Errorf("URL host %q does not match GitHub host %q", parsed.Hostname(), expectedHost)
+	}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(segments) != 4 || segments[2] != "pull" {
+		return 0, errors.New("expected GitHub /owner/repo/pull/number URL")
+	}
+	for _, segment := range segments[:2] {
+		if segment == "" || segment == "." || segment == ".." {
+			return 0, errors.New("expected unambiguous GitHub owner/repository path")
+		}
+	}
+	actualRepo := segments[0] + "/" + segments[1]
+	expectedRepo = strings.Trim(strings.TrimSpace(expectedRepo), "/")
+	if expectedRepo != "" && !strings.EqualFold(actualRepo, expectedRepo) {
+		return 0, fmt.Errorf("URL repository %q does not match GitHub repository %q", actualRepo, expectedRepo)
+	}
+	number, err := strconv.Atoi(segments[3])
+	if err != nil || number <= 0 {
+		return 0, errors.New("expected positive GitHub pull request number")
+	}
+	escapedSegments := strings.Split(strings.Trim(parsed.EscapedPath(), "/"), "/")
+	if len(escapedSegments) != len(segments) || escapedSegments[len(escapedSegments)-1] != strconv.Itoa(number) {
+		return 0, errors.New("expected canonical GitHub pull request number path")
+	}
+	if parsed.ForceQuery || parsed.RawQuery != "" || strings.Contains(trimmed, "#") {
+		return 0, errors.New("expected GitHub pull request URL without query or fragment")
+	}
+	return number, nil
 }
 
 func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error) {
@@ -181,21 +261,49 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 			Login string `json:"login"`
 		} `json:"headRepositoryOwner"`
 	}
-	if err := json.Unmarshal(out, &prs); err != nil || len(prs) == 0 {
+	if err := json.Unmarshal(out, &prs); err != nil {
+		return nil, fmt.Errorf("parse gh pr list JSON: %w", err)
+	}
+	if prs == nil {
+		return nil, errors.New("parse gh pr list JSON: expected array")
+	}
+	if len(prs) == 0 {
 		return nil, nil
 	}
-	for _, candidate := range prs {
+	prNumbers := make([]string, len(prs))
+	for i, candidate := range prs {
+		if candidate.Number <= 0 {
+			return nil, fmt.Errorf("parse gh pr list JSON: entry %d missing positive PR number", i)
+		}
+		url := strings.TrimSpace(candidate.URL)
+		if url == "" {
+			return nil, fmt.Errorf("parse gh pr list JSON: entry %d missing PR URL", i)
+		}
+		number, err := parsePullRequestURL(url, h.host, h.repoSlug())
+		if err != nil {
+			return nil, fmt.Errorf("parse gh pr list JSON: entry %d invalid PR URL: %w", i, err)
+		}
+		if candidate.Number != number {
+			return nil, fmt.Errorf("parse gh pr list JSON: entry %d PR number %d does not match URL number %d", i, candidate.Number, number)
+		}
+		prNumbers[i] = strconv.Itoa(candidate.Number)
+		if h.forkOwner != "" {
+			if strings.TrimSpace(candidate.HeadRefName) == "" {
+				return nil, fmt.Errorf("parse gh pr list JSON: entry %d missing headRefName", i)
+			}
+			if candidate.HeadRepositoryOwner == nil || strings.TrimSpace(candidate.HeadRepositoryOwner.Login) == "" {
+				return nil, fmt.Errorf("parse gh pr list JSON: entry %d missing headRepositoryOwner login", i)
+			}
+		}
+	}
+	for i, candidate := range prs {
 		if !h.matchesHead(candidate.HeadRefName, candidate.HeadRepositoryOwner, branch) {
 			continue
 		}
-		pr := &scm.PR{URL: strings.TrimSpace(candidate.URL), BaseBranch: strings.TrimSpace(candidate.BaseRefName)}
-		if candidate.Number > 0 {
-			pr.Number = fmt.Sprintf("%d", candidate.Number)
-		} else if num, nerr := scm.ExtractPRNumber(pr.URL); nerr == nil {
-			pr.Number = num
-		}
-		if pr.URL == "" {
-			return nil, nil
+		pr := &scm.PR{
+			Number:     prNumbers[i],
+			URL:        strings.TrimSpace(candidate.URL),
+			BaseBranch: strings.TrimSpace(candidate.BaseRefName),
 		}
 		return pr, nil
 	}
@@ -222,6 +330,9 @@ func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PR
 		"--head", h.headRef(branch),
 		"--base", base,
 	}, h.repoArgs()...)
+	if h.draft {
+		args = append(args, "--draft")
+	}
 	args = append(args, "--title", content.Title, "--body-file", "-")
 	cmd := h.cmd(ctx, "gh", args...)
 	cmd.Stdin = strings.NewReader(content.Body)
@@ -243,13 +354,56 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 		return nil, err
 	}
 	args := append([]string{"pr", "edit", selector}, h.repoArgs()...)
-	args = append(args, "--title", content.Title, "--body-file", "-")
+	if strings.TrimSpace(content.Title) != "" {
+		args = append(args, "--title", content.Title)
+	}
+	args = append(args, "--body-file", "-")
 	cmd := h.cmd(ctx, "gh", args...)
 	cmd.Stdin = strings.NewReader(content.Body)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("gh pr edit: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	return pr, nil
+}
+
+var _ scm.PRContentReader = (*Host)(nil)
+
+func (h *Host) GetPRContent(ctx context.Context, pr *scm.PR) (scm.PRContent, error) {
+	selector, err := prSelector(pr)
+	if err != nil {
+		return scm.PRContent{}, err
+	}
+	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
+	args = append(args, "--json", "title,body")
+	out, err := h.cmd(ctx, "gh", args...).Output()
+	if err != nil {
+		return scm.PRContent{}, fmt.Errorf("gh pr view: %w", err)
+	}
+	var parsed struct {
+		Title *string `json:"title"`
+		Body  *string `json:"body"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		return scm.PRContent{}, fmt.Errorf("parse gh pr view: %w", err)
+	}
+	if parsed.Title == nil || parsed.Body == nil {
+		return scm.PRContent{}, fmt.Errorf("parse gh pr view: missing or null title/body")
+	}
+	return scm.PRContent{Title: *parsed.Title, Body: *parsed.Body}, nil
+}
+
+func (h *Host) SetPRBaseBranch(ctx context.Context, pr *scm.PR, baseBranch string) error {
+	selector, err := prSelector(pr)
+	if err != nil {
+		return err
+	}
+	args := append([]string{"pr", "edit", selector}, h.repoArgs()...)
+	args = append(args, "--base", baseBranch)
+	cmd := h.cmd(ctx, "gh", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gh pr edit --base: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func (h *Host) GetPRState(ctx context.Context, pr *scm.PR) (scm.PRState, error) {
@@ -309,6 +463,7 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 			return nil, err
 		}
 		checks = h.appendUnrepresentedWorkflowRuns(checks, runs)
+		checks = h.collapseLatestByName(checks)
 		currentHeadSHA, err := h.getPRHeadSHA(ctx, selector)
 		if err != nil {
 			return nil, err
@@ -329,7 +484,7 @@ func (h *Host) getPRChecks(ctx context.Context, selector string) ([]scm.Check, e
 		if strings.Contains(string(out), "no checks reported") {
 			out = []byte("[]")
 		} else {
-			return nil, fmt.Errorf("gh pr checks: %w", err)
+			return nil, fmt.Errorf("gh pr checks: %s: %w", strings.TrimSpace(string(out)), err)
 		}
 	}
 	var raw []struct {
@@ -361,7 +516,13 @@ func (h *Host) getPRChecks(ctx context.Context, selector string) ([]scm.Check, e
 	return checks, nil
 }
 
-const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$cursor:String){repository(owner:$owner,name:$name){object(expression:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{name status conclusion completedAt detailsUrl} ... on StatusContext{context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`
+// commitChecksQuery reads the head commit's check rollup. A CheckRun also
+// carries its check suite's app slug: that is the structural identity the CI
+// step uses to tell a third-party review bot's check (scm.ReviewBots) from the
+// repository's own Actions jobs, without matching check names.
+const commitChecksQuery = `query($owner:String!,$name:String!,$oid:String!,$cursor:String){repository(owner:$owner,name:$name){object(expression:$oid){... on Commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{databaseId name status conclusion completedAt startedAt detailsUrl checkSuite{app{slug}}} ... on StatusContext{id context state targetUrl}} pageInfo{hasNextPage endCursor}}}}}}}`
+
+const reviewThreadsQuery = `query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100,after:$cursor){nodes{isResolved comments(first:100){nodes{databaseId body path line url createdAt author{login}}}} pageInfo{hasNextPage endCursor}}}}}`
 
 func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check, error) {
 	repo := h.repoSlug()
@@ -393,14 +554,22 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 							Contexts struct {
 								Nodes []struct {
 									Type        string `json:"__typename"`
+									DatabaseID  int64  `json:"databaseId"`
+									ID          string `json:"id"`
 									Name        string `json:"name"`
 									Status      string `json:"status"`
 									Conclusion  string `json:"conclusion"`
 									CompletedAt string `json:"completedAt"`
+									StartedAt   string `json:"startedAt"`
 									DetailsURL  string `json:"detailsUrl"`
-									Context     string `json:"context"`
-									State       string `json:"state"`
-									TargetURL   string `json:"targetUrl"`
+									CheckSuite  *struct {
+										App *struct {
+											Slug string `json:"slug"`
+										} `json:"app"`
+									} `json:"checkSuite"`
+									Context   string `json:"context"`
+									State     string `json:"state"`
+									TargetURL string `json:"targetUrl"`
 								} `json:"nodes"`
 								PageInfo struct {
 									HasNextPage bool   `json:"hasNextPage"`
@@ -426,7 +595,11 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 			check := scm.Check{}
 			switch node.Type {
 			case "CheckRun":
+				check.Kind = scm.CheckKindRun
 				check.Name = strings.TrimSpace(node.Name)
+				if node.DatabaseID != 0 {
+					check.ProviderID = fmt.Sprintf("github-check-run:%d", node.DatabaseID)
+				}
 				check.State = strings.ToUpper(strings.TrimSpace(node.Conclusion))
 				if check.State == "" {
 					check.State = strings.ToUpper(strings.TrimSpace(node.Status))
@@ -436,11 +609,21 @@ func (h *Host) getCommitChecks(ctx context.Context, headSHA string) ([]scm.Check
 					check.Bucket = normalizeCheckBucket("", node.Status)
 				}
 				check.Link = strings.TrimSpace(node.DetailsURL)
+				if node.CheckSuite != nil && node.CheckSuite.App != nil {
+					check.App = strings.TrimSpace(node.CheckSuite.App.Slug)
+				}
 				if parsed, parseErr := time.Parse(time.RFC3339, node.CompletedAt); parseErr == nil {
 					check.CompletedAt = parsed
 				}
+				if parsed, parseErr := time.Parse(time.RFC3339, node.StartedAt); parseErr == nil {
+					check.StartedAt = parsed
+				}
 			case "StatusContext":
+				check.Kind = scm.CheckKindStatus
 				check.Name = strings.TrimSpace(node.Context)
+				if node.ID != "" {
+					check.ProviderID = "github-status:" + node.ID
+				}
 				check.State = strings.ToUpper(strings.TrimSpace(node.State))
 				check.Bucket = normalizeCheckBucket("", node.State)
 				check.Link = strings.TrimSpace(node.TargetURL)
@@ -471,23 +654,110 @@ func (h *Host) repoSlug() string {
 }
 
 func (h *Host) appendUnrepresentedWorkflowRuns(checks, runs []scm.Check) []scm.Check {
-	represented := make(map[string]struct{}, len(checks))
-	for _, check := range checks {
+	represented := make(map[string][]int, len(checks))
+	for i, check := range checks {
 		if runID := h.actionsRunID(check.Link); runID != "" {
-			represented[runID] = struct{}{}
+			represented[runID] = append(represented[runID], i)
 		}
 	}
 	for _, run := range runs {
 		runID := h.actionsRunID(run.Link)
-		if _, exists := represented[runID]; runID != "" && exists {
+		if indices := represented[runID]; runID != "" && len(indices) > 0 {
+			for _, i := range indices {
+				if checks[i].StartedAt.IsZero() && !run.StartedAt.IsZero() {
+					checks[i].StartedAt = run.StartedAt
+				}
+				checks[i].WorkflowID = run.WorkflowID
+			}
 			continue
 		}
 		checks = append(checks, run)
 		if runID != "" {
-			represented[runID] = struct{}{}
+			represented[runID] = []int{len(checks) - 1}
 		}
 	}
 	return checks
+}
+
+// collapseLatestByName collapses orderable same-name reruns of one workflow
+// to the most recently started one. Independent workflows and records whose
+// provider metadata cannot establish an order remain visible. GitHub's raw
+// commit statusCheckRollup returns every check run ever attached to the commit,
+// including runs a later same-named run has
+// already superseded - e.g. a CI monitor's auto-fix push re-triggers the
+// same gate check, and the rollup keeps both the old FAILURE and the new
+// SUCCESS forever. Without this collapse the superseded failure stays
+// visible even after the later run at the same head turns green, which
+// manufactures an unrecoverable auto-fix loop (see AGENTS.md "CI Monitor
+// Lifecycle"). This restores the semantics `gh pr checks` already applies
+// (collapse by startedAt) to the commit-rollup path, which never had it.
+//
+// Must run AFTER appendUnrepresentedWorkflowRuns, never before: that call
+// dedupes by Actions run ID against the FULL uncollapsed rollup. Collapsing
+// first would drop a superseded run's ID out of the "represented" set the
+// union checks against, letting the union re-add the same stale run under
+// its own workflow run name - resurrecting exactly the failure this is
+// meant to hide.
+func (h *Host) collapseLatestByName(checks []scm.Check) []scm.Check {
+	collapsed := make([]scm.Check, 0, len(checks))
+	for _, check := range checks {
+		keep := true
+		for i := 0; i < len(collapsed); {
+			other := collapsed[i]
+			if !h.sameCheckReplacementGroup(check, other) {
+				i++
+				continue
+			}
+			after, ordered := h.checkStartedAfter(check, other)
+			if !ordered {
+				i++
+				continue
+			}
+			if !after {
+				keep = false
+				break
+			}
+			collapsed = append(collapsed[:i], collapsed[i+1:]...)
+		}
+		if keep {
+			collapsed = append(collapsed, check)
+		}
+	}
+	return collapsed
+}
+
+func (h *Host) sameCheckReplacementGroup(a, b scm.Check) bool {
+	if a.Kind != scm.CheckKindRun || b.Kind != scm.CheckKindRun || a.Name != b.Name {
+		return false
+	}
+	// Only distinct runs of the same known workflow establish rerun identity.
+	// Missing workflow/run identities may be independent external checks, while
+	// equal run identities may be independent same-name jobs within one run.
+	// Collapsing either case could hide a failing requirement.
+	aRunID := h.actionsRunID(a.Link)
+	bRunID := h.actionsRunID(b.Link)
+	return a.WorkflowID != 0 && a.WorkflowID == b.WorkflowID &&
+		aRunID != "" && bRunID != "" && aRunID != bRunID
+}
+
+// checkStartedAfter reports whether a is newer and whether the available
+// provider metadata establishes an order between the checks.
+func (h *Host) checkStartedAfter(a, b scm.Check) (bool, bool) {
+	if !a.StartedAt.IsZero() && !b.StartedAt.IsZero() && !a.StartedAt.Equal(b.StartedAt) {
+		return a.StartedAt.After(b.StartedAt), true
+	}
+	if aID, aErr := strconv.ParseUint(h.actionsRunID(a.Link), 10, 64); aErr == nil {
+		if bID, bErr := strconv.ParseUint(h.actionsRunID(b.Link), 10, 64); bErr == nil && aID != bID {
+			return aID > bID, true
+		}
+	}
+	if a.StartedAt.IsZero() != b.StartedAt.IsZero() {
+		return false, false
+	}
+	if !a.CompletedAt.IsZero() && !b.CompletedAt.IsZero() && !a.CompletedAt.Equal(b.CompletedAt) {
+		return a.CompletedAt.After(b.CompletedAt), true
+	}
+	return false, false
 }
 
 func (h *Host) getPRHeadSHA(ctx context.Context, selector string) (string, error) {
@@ -524,13 +794,16 @@ func (h *Host) getWorkflowRunChecks(ctx context.Context, headSHA string) ([]scm.
 		return nil, fmt.Errorf("gh api workflow runs for head commit: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	type workflowRun struct {
-		ID          int64  `json:"id"`
-		Name        string `json:"name"`
-		DisplayName string `json:"display_title"`
-		Status      string `json:"status"`
-		Conclusion  string `json:"conclusion"`
-		UpdatedAt   string `json:"updated_at"`
-		HTMLURL     string `json:"html_url"`
+		ID           int64  `json:"id"`
+		WorkflowID   int64  `json:"workflow_id"`
+		Name         string `json:"name"`
+		DisplayName  string `json:"display_title"`
+		Status       string `json:"status"`
+		Conclusion   string `json:"conclusion"`
+		RunStartedAt string `json:"run_started_at"`
+		CreatedAt    string `json:"created_at"`
+		UpdatedAt    string `json:"updated_at"`
+		HTMLURL      string `json:"html_url"`
 	}
 	var pages []struct {
 		TotalCount   *int          `json:"total_count"`
@@ -577,6 +850,13 @@ func (h *Host) getWorkflowRunChecks(ctx context.Context, headSHA string) ([]scm.
 		if name == "" {
 			name = "GitHub Actions workflow"
 		}
+		var startedAt time.Time
+		for _, timestamp := range []string{run.RunStartedAt, run.CreatedAt} {
+			if parsed, parseErr := time.Parse(time.RFC3339, timestamp); parseErr == nil {
+				startedAt = parsed
+				break
+			}
+		}
 		var completedAt time.Time
 		if run.UpdatedAt != "" {
 			if parsed, parseErr := time.Parse(time.RFC3339, run.UpdatedAt); parseErr == nil {
@@ -605,7 +885,7 @@ func (h *Host) getWorkflowRunChecks(ctx context.Context, headSHA string) ([]scm.
 			}
 			link = fmt.Sprintf("https://%s/%s/actions/runs/%d", host, repo, run.ID)
 		}
-		checks = append(checks, scm.Check{Name: name, Bucket: bucket, State: state, CompletedAt: completedAt, Link: link})
+		checks = append(checks, scm.Check{Name: name, ProviderID: fmt.Sprintf("github-workflow-run:%d", run.ID), Bucket: bucket, Kind: scm.CheckKindRun, State: state, CompletedAt: completedAt, StartedAt: startedAt, WorkflowID: run.WorkflowID, Link: link})
 	}
 	return checks, nil
 }
@@ -713,6 +993,89 @@ func (h *Host) actionsRerunTarget(link string) (runID, jobID string, ok bool) {
 	}
 }
 
+// PreRunFailures reports which of the given failed checks GitHub Actions failed
+// during the job's setup phase - before any repository step ran. Actions
+// resolves and downloads every action a job uses inside "Set up job", so an
+// action-download outage ("Failed to resolve action download info", HTTP 503)
+// fails that step and the job never executes a repository step. It reads the
+// job's own step-level conclusions, never log text, and fails closed: a check
+// whose job it cannot resolve or read is simply not flagged, so it stays a
+// genuine failure. The result is positional (parallel to checks), so a
+// same-named genuine failure never inherits another check's infrastructure flag.
+func (h *Host) PreRunFailures(ctx context.Context, checks []scm.Check) ([]bool, error) {
+	result := make([]bool, len(checks))
+	// Cache each run's jobs so several checks from one run cost one API call.
+	runJobs := map[string][]githubRunJob{}
+	for i, check := range checks {
+		runID, jobID, ok := h.actionsRerunTarget(check.Link)
+		if !ok {
+			continue
+		}
+		jobs, seen := runJobs[runID]
+		if !seen {
+			jobs = h.fetchRunJobs(ctx, runID)
+			runJobs[runID] = jobs
+		}
+		job, found := matchRunJob(jobs, jobID, check.Name)
+		if found && jobFailedAtSetup(job) {
+			result[i] = true
+		}
+	}
+	return result, nil
+}
+
+// fetchRunJobs reads a run's jobs (with their steps) from Actions. A run it
+// cannot read yields no jobs, so every check on it fails closed to a genuine
+// failure rather than being guessed as infrastructure.
+func (h *Host) fetchRunJobs(ctx context.Context, runID string) []githubRunJob {
+	viewArgs := append([]string{"run", "view", runID}, h.repoArgs()...)
+	viewArgs = append(viewArgs, "--json", "jobs")
+	out, err := h.cmd(ctx, "gh", viewArgs...).Output()
+	if err != nil {
+		return nil
+	}
+	var payload githubRunView
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return nil
+	}
+	return payload.Jobs
+}
+
+// matchRunJob finds the job a check names: by databaseId when the check's link
+// carried one, otherwise by job name. A re-run can renumber jobs, so the name
+// fallback keeps a check matchable when its link named only the run.
+func matchRunJob(jobs []githubRunJob, jobID, checkName string) (githubRunJob, bool) {
+	if jobID != "" {
+		for _, job := range jobs {
+			if strconv.Itoa(job.DatabaseID) == jobID {
+				return job, true
+			}
+		}
+	}
+	for _, job := range jobs {
+		if normalizeRunName(job.Name) == normalizeRunName(checkName) {
+			return job, true
+		}
+	}
+	return githubRunJob{}, false
+}
+
+// jobFailedAtSetup reports whether a failed job failed in its setup step, before
+// any repository step ran. It requires the job itself to be failed and its setup
+// step ("Set up job", always step 1) to carry a failure conclusion; a job whose
+// setup succeeded and failed a later step is a real failure and is never matched.
+func jobFailedAtSetup(job githubRunJob) bool {
+	if !isFailedJob(job) {
+		return false
+	}
+	for _, step := range job.Steps {
+		if step.Number == 1 || strings.EqualFold(strings.TrimSpace(step.Name), "Set up job") {
+			return strings.EqualFold(strings.TrimSpace(step.Conclusion), "failure")
+		}
+	}
+	return false
+}
+
 func isNumericID(value string) bool {
 	if value == "" {
 		return false
@@ -740,19 +1103,35 @@ func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.Mergeable
 	return normalizeMergeableState(strings.TrimSpace(string(out))), nil
 }
 
-func (h *Host) FetchFailedCheckLogs(ctx context.Context, _ *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
-	if len(failingNames) == 0 {
-		return "", nil
-	}
-	targets := make(map[string]struct{}, len(failingNames))
+func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
+	targets := make([]scm.CheckTarget, 0, len(failingNames))
 	for _, name := range failingNames {
-		name = normalizeRunName(name)
-		if name != "" {
-			targets[name] = struct{}{}
+		targets = append(targets, scm.CheckTarget{Name: name})
+	}
+	logs, err := h.FetchFailedCheckTargetLogs(ctx, pr, branch, headSHA, targets)
+	if err != nil {
+		return "", err
+	}
+	return scm.CombineFailedCheckLogs(logs)
+}
+
+func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, _ *scm.PR, branch, headSHA string, checkTargets []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
+	if len(checkTargets) == 0 {
+		return nil, nil
+	}
+	names := make(map[string]struct{}, len(checkTargets))
+	ids := make(map[string]struct{}, len(checkTargets))
+	for _, target := range checkTargets {
+		if id := strings.TrimSpace(target.ProviderID); id != "" {
+			ids[id] = struct{}{}
+			continue
+		}
+		if name := normalizeRunName(target.Name); name != "" {
+			names[name] = struct{}{}
 		}
 	}
-	if len(targets) == 0 {
-		return "", nil
+	if len(names) == 0 && len(ids) == 0 {
+		return nil, nil
 	}
 	args := []string{"run", "list", "--branch", branch}
 	if strings.TrimSpace(headSHA) != "" {
@@ -767,29 +1146,67 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, _ *scm.PR, branch, head
 	listCmd := h.cmd(ctx, "gh", args...)
 	listOut, err := listCmd.Output()
 	if err != nil {
-		return "", nil
+		return nil, fmt.Errorf("list GitHub runs for selected logs: %w", err)
 	}
 	var runs []githubRun
 	if err := json.Unmarshal(listOut, &runs); err != nil {
-		return "", nil
+		return nil, fmt.Errorf("parse GitHub runs for selected logs: %w", err)
 	}
+	results := make([]scm.FailedCheckLog, len(checkTargets))
+	for i, target := range checkTargets {
+		results[i].Target = target
+	}
+	matched := make(map[string]bool, len(ids))
 	for _, run := range runs {
-		if !runMatchesTargets(ctx, h, run, targets) {
-			continue
+		workflowID := fmt.Sprintf("github-workflow-run:%d", run.DatabaseID)
+		_, exactWorkflow := ids[workflowID]
+		nameMatch := runMatchesTargets(ctx, h, run, names)
+		if exactWorkflow || nameMatch {
+			viewArgs := append([]string{"run", "view", fmt.Sprintf("%d", run.DatabaseID)}, h.repoArgs()...)
+			viewArgs = append(viewArgs, "--log-failed")
+			out, fetchErr := h.cmd(ctx, "gh", viewArgs...).Output()
+			for i, target := range checkTargets {
+				matches := target.ProviderID == workflowID
+				if target.ProviderID == "" && nameMatch {
+					matches = true
+				}
+				if !matches {
+					continue
+				}
+				matched[target.Identity()] = true
+				results[i].Output = strings.TrimSpace(string(out))
+				if fetchErr != nil {
+					results[i].Err = fmt.Errorf("fetch GitHub run %d failed logs: %w", run.DatabaseID, fetchErr)
+				}
+			}
 		}
-		viewArgs := append([]string{"run", "view", fmt.Sprintf("%d", run.DatabaseID)}, h.repoArgs()...)
-		viewArgs = append(viewArgs, "--log-failed")
-		viewCmd := h.cmd(ctx, "gh", viewArgs...)
-		out, err := viewCmd.Output()
+		jobIDs, err := selectedRunJobIDs(ctx, h, run, ids)
 		if err != nil {
 			continue
 		}
-		logs := strings.TrimSpace(string(out))
-		if logs != "" {
-			return logs, nil
+		for _, jobID := range jobIDs {
+			jobProviderID := fmt.Sprintf("github-check-run:%d", jobID)
+			viewArgs := append([]string{"run", "view", fmt.Sprintf("%d", run.DatabaseID)}, h.repoArgs()...)
+			viewArgs = append(viewArgs, "--job", strconv.Itoa(jobID), "--log")
+			out, fetchErr := h.cmd(ctx, "gh", viewArgs...).Output()
+			for i, target := range checkTargets {
+				if target.ProviderID != jobProviderID {
+					continue
+				}
+				matched[target.Identity()] = true
+				results[i].Output = strings.TrimSpace(string(out))
+				if fetchErr != nil {
+					results[i].Err = fmt.Errorf("fetch GitHub job %d log: %w", jobID, fetchErr)
+				}
+			}
 		}
 	}
-	return "", nil
+	for i, target := range checkTargets {
+		if !matched[target.Identity()] {
+			results[i].Err = fmt.Errorf("selected GitHub check %q was not found", target.Identity())
+		}
+	}
+	return results, nil
 }
 
 type githubRun struct {
@@ -805,12 +1222,54 @@ type githubRunView struct {
 }
 
 type githubRunJob struct {
+	DatabaseID int             `json:"databaseId"`
+	Name       string          `json:"name"`
+	Conclusion string          `json:"conclusion"`
+	Status     string          `json:"status"`
+	Steps      []githubJobStep `json:"steps"`
+}
+
+type githubJobStep struct {
 	Name       string `json:"name"`
-	Conclusion string `json:"conclusion"`
+	Number     int    `json:"number"`
 	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+}
+
+func selectedRunJobIDs(ctx context.Context, h *Host, run githubRun, targets map[string]struct{}) ([]int, error) {
+	hasCheckRunTarget := false
+	for target := range targets {
+		if strings.HasPrefix(target, "github-check-run:") {
+			hasCheckRunTarget = true
+			break
+		}
+	}
+	if !hasCheckRunTarget || run.DatabaseID == 0 {
+		return nil, nil
+	}
+	viewArgs := append([]string{"run", "view", fmt.Sprintf("%d", run.DatabaseID)}, h.repoArgs()...)
+	viewArgs = append(viewArgs, "--json", "jobs")
+	out, err := h.cmd(ctx, "gh", viewArgs...).Output()
+	if err != nil {
+		return nil, fmt.Errorf("list GitHub run %d jobs for selected logs: %w", run.DatabaseID, err)
+	}
+	var view githubRunView
+	if err := json.Unmarshal(out, &view); err != nil {
+		return nil, fmt.Errorf("parse GitHub run %d jobs for selected logs: %w", run.DatabaseID, err)
+	}
+	var ids []int
+	for _, job := range view.Jobs {
+		if _, ok := targets[fmt.Sprintf("github-check-run:%d", job.DatabaseID)]; ok {
+			ids = append(ids, job.DatabaseID)
+		}
+	}
+	return ids, nil
 }
 
 func runMatchesTargets(ctx context.Context, h *Host, run githubRun, targets map[string]struct{}) bool {
+	if len(targets) == 0 {
+		return false
+	}
 	for _, candidate := range []string{run.Name, run.DisplayTitle, run.WorkflowName} {
 		if _, ok := targets[normalizeRunName(candidate)]; ok {
 			return true
@@ -903,4 +1362,126 @@ func normalizeCheckBucket(bucket, state string) scm.CheckBucket {
 	default:
 		return ""
 	}
+}
+
+// GetReviewComments implements scm.ReviewCommentsHost.
+func (h *Host) GetReviewComments(ctx context.Context, pr *scm.PR) ([]scm.ReviewComment, error) {
+	if pr == nil {
+		return nil, errors.New("pr is nil")
+	}
+	repo := h.repoSlug()
+	if repo == "" && pr.URL != "" {
+		repo = RepoSlug(pr.URL)
+	}
+	if repo == "" {
+		return nil, errors.New("cannot determine repository for PR review comments")
+	}
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return nil, fmt.Errorf("resolve GitHub repository for PR review comments: invalid repository %q", repo)
+	}
+	prNum := strings.TrimSpace(pr.Number)
+	if prNum == "" {
+		number, parseErr := parsePullRequestURL(pr.URL, h.host, repo)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		prNum = strconv.Itoa(number)
+	}
+	number, err := strconv.Atoi(prNum)
+	if err != nil || number <= 0 {
+		return nil, errors.New("expected positive GitHub pull request number")
+	}
+
+	var comments []scm.ReviewComment
+	cursor := ""
+	for {
+		args := []string{"api"}
+		if h.host != "" {
+			args = append(args, "--hostname", h.host)
+		}
+		args = append(args, "graphql", "-f", "query="+reviewThreadsQuery,
+			"-F", "owner="+parts[0], "-F", "name="+parts[1], "-F", "number="+strconv.Itoa(number))
+		if cursor != "" {
+			args = append(args, "-F", "cursor="+cursor)
+		}
+		out, commandErr := h.cmd(ctx, "gh", args...).CombinedOutput()
+		if commandErr != nil {
+			return nil, fmt.Errorf("gh api PR review comments: %s: %w", strings.TrimSpace(string(out)), commandErr)
+		}
+		var response struct {
+			Data struct {
+				Repository *struct {
+					PullRequest *struct {
+						ReviewThreads struct {
+							Nodes []struct {
+								IsResolved bool `json:"isResolved"`
+								Comments   struct {
+									Nodes []struct {
+										ID        int64     `json:"databaseId"`
+										Body      string    `json:"body"`
+										Path      string    `json:"path"`
+										Line      *int      `json:"line"`
+										URL       string    `json:"url"`
+										CreatedAt time.Time `json:"createdAt"`
+										Author    *struct {
+											Login string `json:"login"`
+										} `json:"author"`
+									} `json:"nodes"`
+								} `json:"comments"`
+							} `json:"nodes"`
+							PageInfo struct {
+								HasNextPage bool   `json:"hasNextPage"`
+								EndCursor   string `json:"endCursor"`
+							} `json:"pageInfo"`
+						} `json:"reviewThreads"`
+					} `json:"pullRequest"`
+				} `json:"repository"`
+			} `json:"data"`
+			Errors []struct {
+				Message string `json:"message"`
+			} `json:"errors"`
+		}
+		if err := json.Unmarshal(out, &response); err != nil {
+			return nil, fmt.Errorf("decode PR review comments JSON: %w", err)
+		}
+		if len(response.Errors) > 0 {
+			return nil, fmt.Errorf("gh api PR review comments: %s", response.Errors[0].Message)
+		}
+		if response.Data.Repository == nil || response.Data.Repository.PullRequest == nil {
+			return nil, errors.New("PR review comments response did not contain the pull request")
+		}
+		threads := response.Data.Repository.PullRequest.ReviewThreads
+		for _, thread := range threads.Nodes {
+			if thread.IsResolved {
+				continue
+			}
+			for _, raw := range thread.Comments.Nodes {
+				if raw.Author == nil || !scm.IsReviewBotLogin(raw.Author.Login) {
+					continue
+				}
+				line := 0
+				if raw.Line != nil {
+					line = *raw.Line
+				}
+				comments = append(comments, scm.ReviewComment{
+					ID:        strconv.FormatInt(raw.ID, 10),
+					Author:    raw.Author.Login,
+					Path:      raw.Path,
+					Line:      line,
+					Body:      raw.Body,
+					CreatedAt: raw.CreatedAt,
+					URL:       raw.URL,
+				})
+			}
+		}
+		if !threads.PageInfo.HasNextPage {
+			break
+		}
+		if threads.PageInfo.EndCursor == "" || threads.PageInfo.EndCursor == cursor {
+			return nil, errors.New("PR review comments response returned an invalid page cursor")
+		}
+		cursor = threads.PageInfo.EndCursor
+	}
+	return comments, nil
 }

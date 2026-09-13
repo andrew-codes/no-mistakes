@@ -80,9 +80,9 @@ type sourceInvocation struct {
 	Agent                string `json:"agent"`
 	Model                string `json:"model,omitempty"`
 	DurationMS           int64  `json:"duration_ms"`
-	InputTokens          int    `json:"input_tokens"`
-	OutputTokens         int    `json:"output_tokens"`
-	CacheReadTokens      int    `json:"cache_read_tokens"`
+	InputTokens          *int   `json:"input_tokens,omitempty"`
+	OutputTokens         *int   `json:"output_tokens,omitempty"`
+	CacheReadTokens      *int   `json:"cache_read_tokens,omitempty"`
 	FreshInputTokens     *int   `json:"fresh_input_tokens,omitempty"`
 	DeltaInputTokens     *int   `json:"delta_input_tokens,omitempty"`
 	DeltaOutputTokens    *int   `json:"delta_output_tokens,omitempty"`
@@ -318,10 +318,13 @@ func agentNeutralGlobalConfig(data []byte) ([]byte, error) {
 	if raw == nil {
 		raw = map[string]any{}
 	}
-	// The candidate selects agent and model explicitly. Do not accidentally
-	// inherit a captured default model or agent list into a comparison.
+	// The candidate selects agent, model, and effort explicitly. Do not
+	// accidentally inherit a captured default model, effort, or agent list into
+	// a comparison: every channel that can pin a harness knob is stripped.
 	delete(raw, "agent")
 	delete(raw, "agent_args_override")
+	delete(raw, "agent_config")
+	delete(raw, "review_agents")
 	out, err := yaml.Marshal(raw)
 	if err != nil {
 		return nil, fmt.Errorf("serialize agent-neutral global config: %w", err)

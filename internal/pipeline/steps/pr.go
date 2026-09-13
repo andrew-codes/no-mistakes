@@ -7,13 +7,13 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	"github.com/kunchenguid/no-mistakes/internal/conventional"
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/git"
-	"github.com/kunchenguid/no-mistakes/internal/pipeline"
-	"github.com/kunchenguid/no-mistakes/internal/scm"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/conventional"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/scm"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // PRStep creates or updates a pull request via the provider CLI or API.

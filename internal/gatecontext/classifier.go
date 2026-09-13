@@ -9,12 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/git"
-	"github.com/kunchenguid/no-mistakes/internal/paths"
-	"github.com/kunchenguid/no-mistakes/internal/types"
-	"github.com/kunchenguid/no-mistakes/internal/worktrees"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/worktrees"
 )
 
 const ErrorCode = "nested_gate_context"

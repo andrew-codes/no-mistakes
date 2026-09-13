@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/ipc"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // TestEvidence_CIMonitorInterruptedBanner renders the TUI outcome banner and

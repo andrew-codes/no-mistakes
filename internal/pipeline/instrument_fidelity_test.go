@@ -6,9 +6,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // cumulativeSessionAgent models codex: a stable durable session whose reported

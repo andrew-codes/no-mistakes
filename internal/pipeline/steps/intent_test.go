@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/intent"
-	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/intent"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
 )
 
 // newIntentStepContext builds a StepContext backed by a real DB and

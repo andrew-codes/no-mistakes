@@ -5,12 +5,12 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	"github.com/kunchenguid/no-mistakes/internal/branchsync"
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/pipeline"
-	"github.com/kunchenguid/no-mistakes/internal/scm"
-	"github.com/kunchenguid/no-mistakes/internal/testguidance"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/branchsync"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/scm"
+	"github.com/andrew-codes/no-mistakes/internal/testguidance"
 )
 
 // autoFixCI runs the agent to fix CI failures and/or merge conflicts, then

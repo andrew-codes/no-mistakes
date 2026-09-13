@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/andrew-codes/no-mistakes/internal/ipc"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/kunchenguid/no-mistakes/internal/ipc"
 )
 
 func (m Model) View() string {

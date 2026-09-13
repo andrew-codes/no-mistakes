@@ -9,8 +9,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/git"
-	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/andrew-codes/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/safeurl"
 )
 
 const (

@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andrew-codes/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/kunchenguid/no-mistakes/internal/ipc"
-	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*m`)

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/config"
 )
 
 // wantBlock builds the exact rendered block for one rule so assertions compare

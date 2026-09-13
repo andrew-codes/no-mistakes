@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 func TestForkRouting(t *testing.T) {

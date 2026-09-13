@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/git"
 )
 
 // isTestFile returns true if the file path matches common test file naming patterns.

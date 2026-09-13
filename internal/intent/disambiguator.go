@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	nmgit "github.com/kunchenguid/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	nmgit "github.com/andrew-codes/no-mistakes/internal/git"
 )
 
 // Disambiguator chooses among multiple accepted transcript matches when the

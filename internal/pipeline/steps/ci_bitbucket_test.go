@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	"github.com/kunchenguid/no-mistakes/internal/bitbucket"
-	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/scm"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/bitbucket"
+	"github.com/andrew-codes/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/scm"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // bitbucketPRGetKey returns the twg pull-requests get invocation key for PR 42.

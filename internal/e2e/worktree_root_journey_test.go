@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/paths"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // TestWorktreeRootJourney walks the whole worktree_roots feature the way an

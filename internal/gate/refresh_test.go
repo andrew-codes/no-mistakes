@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/db"
 )
 
 func TestRefreshRepoURLsSSHToHTTPS(t *testing.T) {

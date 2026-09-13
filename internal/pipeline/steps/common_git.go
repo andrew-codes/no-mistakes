@@ -4,10 +4,10 @@ import (
 	"context"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	"github.com/kunchenguid/no-mistakes/internal/git"
-	"github.com/kunchenguid/no-mistakes/internal/pipeline"
-	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/safeurl"
 )
 
 // reviewWorkload returns the bounded change size (files + net lines) between

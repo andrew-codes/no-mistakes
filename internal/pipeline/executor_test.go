@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/ipc"
-	"github.com/kunchenguid/no-mistakes/internal/telemetry"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/telemetry"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // TestExecutor_StepLifecycleEvents verifies the executor emits step_started

@@ -18,7 +18,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/kunchenguid/no-mistakes/internal/skill"
+	"github.com/andrew-codes/no-mistakes/internal/skill"
 )
 
 func main() {

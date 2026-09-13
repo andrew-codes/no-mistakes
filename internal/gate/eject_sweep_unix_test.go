@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
 )
 
 // TestEjectSweepsRecordedWorktreesBeforeRemovingThem is eject's half of the

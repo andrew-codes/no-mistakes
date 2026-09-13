@@ -8,12 +8,12 @@ import (
 
 	toon "github.com/toon-format/toon-go"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/daemon"
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/ipc"
-	"github.com/kunchenguid/no-mistakes/internal/paths"
-	"github.com/kunchenguid/no-mistakes/internal/skill"
+	"github.com/andrew-codes/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/daemon"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/skill"
 	"github.com/spf13/cobra"
 )
 

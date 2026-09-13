@@ -7,10 +7,10 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/andrew-codes/no-mistakes/internal/branchsync"
+	"github.com/andrew-codes/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/kunchenguid/no-mistakes/internal/branchsync"
-	"github.com/kunchenguid/no-mistakes/internal/ipc"
-	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
 const spinnerTickInterval = 120 * time.Millisecond

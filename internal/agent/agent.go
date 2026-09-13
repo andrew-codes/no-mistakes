@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // Agent is the interface for running AI agent tasks.

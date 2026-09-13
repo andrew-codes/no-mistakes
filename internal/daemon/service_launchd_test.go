@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
 )
 
 func TestStartInstallsLaunchAgentAndBootstrapsManagedDaemon(t *testing.T) {

@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/safeurl"
-	"github.com/kunchenguid/no-mistakes/internal/scm"
-	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/andrew-codes/no-mistakes/internal/safeurl"
+	"github.com/andrew-codes/no-mistakes/internal/scm"
+	"github.com/andrew-codes/no-mistakes/internal/shellenv"
 )
 
 const (

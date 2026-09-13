@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
-	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 // fakeLookPath makes every probed agent binary resolve, so agent resolution is

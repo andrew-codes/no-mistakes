@@ -3,10 +3,10 @@ package cli
 import (
 	"fmt"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/eval"
-	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/eval"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
 	"github.com/spf13/cobra"
 )
 

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/agent"
 )
 
 // maxTranscriptBytes caps the size of transcript text we send to the

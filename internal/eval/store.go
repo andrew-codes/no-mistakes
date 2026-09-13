@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/config"
 
 	_ "modernc.org/sqlite"
 )

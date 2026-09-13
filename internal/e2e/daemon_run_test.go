@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/e2edaemon"
+	"github.com/andrew-codes/no-mistakes/internal/e2edaemon"
 )
 
 func TestDaemonRunUsesProvidedRoot(t *testing.T) {

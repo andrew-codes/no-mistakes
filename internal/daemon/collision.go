@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
 )
 
 // daemonProcessInfo describes a running `no-mistakes daemon run --root <root>`

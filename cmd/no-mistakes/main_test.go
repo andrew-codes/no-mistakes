@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/daemon"
+	"github.com/andrew-codes/no-mistakes/internal/daemon"
 )
 
 func TestMain(m *testing.M) {

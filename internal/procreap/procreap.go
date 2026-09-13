@@ -48,7 +48,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/worktrees"
+	"github.com/andrew-codes/no-mistakes/internal/worktrees"
 )
 
 const (

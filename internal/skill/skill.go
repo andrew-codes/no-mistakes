@@ -11,8 +11,8 @@ package skill
 import (
 	"strings"
 
-	"github.com/kunchenguid/no-mistakes/internal/gateguidance"
-	"github.com/kunchenguid/no-mistakes/internal/testguidance"
+	"github.com/andrew-codes/no-mistakes/internal/gateguidance"
+	"github.com/andrew-codes/no-mistakes/internal/testguidance"
 )
 
 // Name is the skill directory name and frontmatter name. It must match the

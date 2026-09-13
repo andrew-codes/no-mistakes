@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/testguidance"
+	"github.com/andrew-codes/no-mistakes/internal/testguidance"
 )
 
 func TestMarkdownFrontmatter(t *testing.T) {

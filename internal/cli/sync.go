@@ -8,9 +8,9 @@ import (
 
 	toON "github.com/toon-format/toon-go"
 
-	"github.com/kunchenguid/no-mistakes/internal/branchsync"
-	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/telemetry"
+	"github.com/andrew-codes/no-mistakes/internal/branchsync"
+	"github.com/andrew-codes/no-mistakes/internal/config"
+	"github.com/andrew-codes/no-mistakes/internal/telemetry"
 	"github.com/spf13/cobra"
 )
 

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/safeurl"
-	"github.com/kunchenguid/no-mistakes/internal/winproc"
+	"github.com/andrew-codes/no-mistakes/internal/safeurl"
+	"github.com/andrew-codes/no-mistakes/internal/winproc"
 )
 
 // EmptyTreeSHA is the well-known SHA of an empty tree in git.

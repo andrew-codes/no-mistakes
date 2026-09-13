@@ -3,8 +3,8 @@ package cli
 import (
 	"fmt"
 
-	"github.com/kunchenguid/no-mistakes/internal/gate"
-	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/andrew-codes/no-mistakes/internal/gate"
+	"github.com/andrew-codes/no-mistakes/internal/safeurl"
 	"github.com/spf13/cobra"
 )
 

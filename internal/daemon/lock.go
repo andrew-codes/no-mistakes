@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/paths"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
 )
 
 // ErrSingletonLockHeld is returned by acquireSingletonLock when another live

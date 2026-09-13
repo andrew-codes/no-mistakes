@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/andrew-codes/no-mistakes/internal/shellenv"
 )
 
 type nativeAgentCommand struct {

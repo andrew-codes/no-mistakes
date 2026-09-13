@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/evidence"
-	"github.com/kunchenguid/no-mistakes/internal/types"
-	"github.com/kunchenguid/no-mistakes/internal/winproc"
-	"github.com/kunchenguid/no-mistakes/internal/worktrees"
+	"github.com/andrew-codes/no-mistakes/internal/evidence"
+	"github.com/andrew-codes/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/winproc"
+	"github.com/andrew-codes/no-mistakes/internal/worktrees"
 	"gopkg.in/yaml.v3"
 )
 

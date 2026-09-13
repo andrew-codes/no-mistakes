@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/andrew-codes/no-mistakes/internal/types"
 )
 
 func TestExecutor_ContextCancellation(t *testing.T) {

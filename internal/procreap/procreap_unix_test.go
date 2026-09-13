@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/shellenv"
+	"github.com/andrew-codes/no-mistakes/internal/shellenv"
 )
 
 // TestSweepReapsSetsidEscapeeThatProcessGroupTeardownCannotReach is the

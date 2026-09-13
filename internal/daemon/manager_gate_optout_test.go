@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/git"
 )
 
 // gateOptOutWorktree builds a bare gate repo whose default branch carries the

@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/kunchenguid/no-mistakes/internal/scm"
+	"github.com/andrew-codes/no-mistakes/internal/scm"
 )
 
 func TestHost_Available_OKWhenDoctorReportsBitbucketOK(t *testing.T) {

@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/andrew-codes/no-mistakes/internal/buildinfo"
+	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/git"
+	"github.com/andrew-codes/no-mistakes/internal/paths"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
-	"github.com/kunchenguid/no-mistakes/internal/db"
-	"github.com/kunchenguid/no-mistakes/internal/git"
-	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/muesli/termenv"
 	"github.com/spf13/cobra"
 )

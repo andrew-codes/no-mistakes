@@ -10,6 +10,7 @@ import (
 
 	"github.com/andrew-codes/no-mistakes/internal/db"
 	"github.com/andrew-codes/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
 	"github.com/andrew-codes/no-mistakes/internal/types"
 	"github.com/spf13/cobra"
 )
@@ -35,13 +36,25 @@ type stepRow struct {
 	DurationMS int64  `toon:"duration_ms"`
 }
 
+type automaticSkipRow struct {
+	Step   string `toon:"step"`
+	Reason string `toon:"reason"`
+}
+
+type sharedWorkRow struct {
+	AttributedTo string `toon:"attributed_to"`
+	Scope        string `toon:"scope"`
+	DurationMS   int64  `toon:"duration_ms"`
+}
+
 type activeStepRow struct {
-	Step         string `toon:"step"`
-	Status       string `toon:"status"`
-	ActiveFor    string `toon:"active_for"`
-	LastActivity string `toon:"last_activity"`
-	AgentPID     string `toon:"agent_pid"`
-	Round        string `toon:"round"`
+	Step           string `toon:"step"`
+	Status         string `toon:"status"`
+	ActiveFor      string `toon:"active_for"`
+	RoundActiveFor string `toon:"round_active_for"`
+	LastActivity   string `toon:"last_activity"`
+	AgentPID       string `toon:"agent_pid"`
+	Round          string `toon:"round"`
 }
 
 type findingRow struct {
@@ -80,9 +93,11 @@ type stepView struct {
 	Name             string
 	Status           string
 	DurationMS       int64
+	WorkScope        string
 	FindingsJSON     string
 	FixSummaries     []string
 	StartedAt        *int64
+	RoundStartedAt   *int64
 	LastActivityAt   *int64
 	LastActivity     string
 	AgentPID         *int
@@ -91,6 +106,7 @@ type stepView struct {
 	AutoFixLimit     int
 	PendingFixSource string
 	QuietWarning     time.Duration
+	SkipReason       string
 }
 
 // runView is a render-ready view of a pipeline run.
@@ -107,6 +123,11 @@ type runView struct {
 	// the top-level parked signal in the run object.
 	AwaitingAgentSince *int64
 	Steps              []stepView
+	// CIOverrideReason is non-empty when a human approved past a still-failing
+	// live check (see pipeline.ApprovalOverrideVerifier). outcomeForRun uses
+	// it to keep a deliberate override from reading identically to a
+	// genuinely green run in agent-facing output.
+	CIOverrideReason string
 }
 
 func runViewFromIPC(r *ipc.RunInfo) runView {
@@ -118,6 +139,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 		CIReady:            r.CIReady,
 		CIReadyNoCI:        r.CIReadyNoCI,
 		AwaitingAgentSince: r.AwaitingAgentSince,
+		CIOverrideReason:   r.CIOverrideReason,
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -129,12 +151,15 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 			Status:           string(s.Status),
 			FixSummaries:     s.FixSummaries,
 			StartedAt:        s.StartedAt,
+			RoundStartedAt:   s.RoundStartedAt,
 			LastActivityAt:   s.LastActivityAt,
 			AgentPID:         s.AgentPID,
 			RoundCount:       s.RoundCount,
 			FixRoundCount:    s.FixRoundCount,
 			AutoFixLimit:     s.AutoFixLimit,
 			PendingFixSource: s.PendingFixSource,
+			WorkScope:        s.WorkScope,
+			SkipReason:       s.SkipReason,
 		}
 		if s.LastActivity != nil {
 			sv.LastActivity = *s.LastActivity
@@ -150,7 +175,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 	return rv
 }
 
-func runViewFromDB(r *db.Run, steps []*db.StepResult) runView {
+func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	rv := runView{
 		ID:                 r.ID,
 		Branch:             r.Branch,
@@ -167,11 +192,15 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult) runView {
 			Name:           string(s.StepName),
 			Status:         string(s.Status),
 			StartedAt:      s.StartedAt,
+			RoundStartedAt: s.RoundStartedAt,
 			LastActivityAt: s.LastActivityAt,
 			AgentPID:       s.AgentPID,
 		}
 		if s.AutoFixLimit != nil {
 			sv.AutoFixLimit = *s.AutoFixLimit
+		}
+		if s.SkipReason != nil {
+			sv.SkipReason = *s.SkipReason
 		}
 		if s.LastActivity != nil {
 			sv.LastActivity = *s.LastActivity
@@ -179,8 +208,20 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult) runView {
 		if s.DurationMS != nil {
 			sv.DurationMS = *s.DurationMS
 		}
+		if database != nil && s.StepName == types.StepDocument {
+			if combined, err := database.HasAgentInvocationPurpose(s.RunID, string(s.StepName), "housekeeping"); err == nil && combined {
+				sv.WorkScope = ipc.WorkScopeDocumentLintHousekeeping
+			}
+		}
 		if s.FindingsJSON != nil {
 			sv.FindingsJSON = *s.FindingsJSON
+		}
+		// Mirror executor.runOverrideReason / RunInfo.CIOverrideReason: the run's
+		// override reason is the first step that recorded one. Without this the
+		// DB-backed status path reads a passed-with-override run as a plain pass,
+		// disagreeing with the live IPC path and outcomeForRun.
+		if rv.CIOverrideReason == "" && s.OverrideReason != nil && *s.OverrideReason != "" {
+			rv.CIOverrideReason = *s.OverrideReason
 		}
 		rv.Steps = append(rv.Steps, sv)
 	}
@@ -279,16 +320,15 @@ func (rv runView) findingsTally() string {
 	return joinComma(parts)
 }
 
-// fixRows flattens the fixes the pipeline applied across all steps into
-// renderable rows, in step then round order. A fix round that recorded no
-// summary still produced a fix commit, so it gets an explicit placeholder
-// rather than being dropped.
+// fixRows flattens fix-attempt summaries in step then round order. Dispatching
+// a fix round does not prove a change was applied; legacy empty summaries
+// must not manufacture that claim.
 func (rv runView) fixRows() []fixRow {
 	var rows []fixRow
 	for _, s := range rv.Steps {
 		for _, summary := range s.FixSummaries {
 			if summary == "" {
-				summary = "fix applied (no summary recorded)"
+				summary = "fix attempted (no result recorded)"
 			}
 			rows = append(rows, fixRow{Step: s.Name, Summary: summary})
 		}
@@ -303,12 +343,13 @@ func (rv runView) activeRows() []activeStepRow {
 			continue
 		}
 		rows = append(rows, activeStepRow{
-			Step:         s.Name,
-			Status:       s.Status,
-			ActiveFor:    s.activeFor(),
-			LastActivity: s.lastActivitySummary(),
-			AgentPID:     s.agentPIDString(),
-			Round:        s.roundSummary(),
+			Step:           s.Name,
+			Status:         s.Status,
+			ActiveFor:      s.activeFor(),
+			RoundActiveFor: s.roundActiveFor(),
+			LastActivity:   s.lastActivitySummary(),
+			AgentPID:       s.agentPIDString(),
+			Round:          s.roundSummary(),
 		})
 	}
 	return rows
@@ -319,6 +360,13 @@ func (s stepView) activeFor() string {
 		return ""
 	}
 	return formatDurationSince(*s.StartedAt)
+}
+
+func (s stepView) roundActiveFor() string {
+	if s.RoundStartedAt == nil {
+		return ""
+	}
+	return formatDurationSince(*s.RoundStartedAt)
 }
 
 func (s stepView) lastActivitySummary() string {
@@ -421,25 +469,73 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 		fields = append(fields, toon.Field{Key: "awaiting_agent", Value: formatParkedFor(*rv.AwaitingAgentSince)})
 	}
 	fields = append(fields, toon.Field{Key: "head", Value: shortSHA(rv.HeadSHA)})
+	fields = append(fields, toon.Field{Key: "head_sha", Value: rv.HeadSHA})
 	if rv.PRURL != "" {
 		fields = append(fields, toon.Field{Key: "pr", Value: rv.PRURL})
 	}
 	fields = append(fields, toon.Field{Key: "findings", Value: rv.findingsTally()})
 
 	rows := make([]stepRow, 0, len(rv.Steps))
+	sharedRows := make([]sharedWorkRow, 0, 1)
 	for _, s := range rv.Steps {
 		rows = append(rows, stepRow{Step: s.Name, Status: s.Status, Findings: s.findingCount(), DurationMS: s.DurationMS})
+		if s.WorkScope != "" {
+			sharedRows = append(sharedRows, sharedWorkRow{AttributedTo: s.Name, Scope: s.WorkScope, DurationMS: s.DurationMS})
+		}
 	}
 	fields = append(fields, toon.Field{Key: "steps", Value: rows})
+	if skips := rv.automaticSkips(); len(skips) > 0 {
+		fields = append(fields, toon.Field{Key: "automatic_skips", Value: skips})
+	}
+	if len(sharedRows) > 0 {
+		fields = append(fields, toon.Field{Key: "shared_work", Value: sharedRows})
+	}
 	if activeRows := rv.activeRows(); len(activeRows) > 0 {
 		fields = append(fields, toon.Field{Key: "active_steps", Value: activeRows})
 	}
 	return toon.Field{Key: key, Value: toon.NewObject(fields...)}
 }
 
+func (rv runView) automaticSkips() []automaticSkipRow {
+	var rows []automaticSkipRow
+	for _, s := range rv.Steps {
+		if s.Status == string(types.StepStatusSkipped) && s.SkipReason != "" &&
+			(s.Name == string(types.StepPR) || s.Name == string(types.StepCI)) {
+			rows = append(rows, automaticSkipRow{Step: s.Name, Reason: s.SkipReason})
+		}
+	}
+	return rows
+}
+
 // gateFields renders the active approval gate: the awaiting step, its findings
 // table, and the next-step commands an agent can run to clear it.
 func gateFields(gate stepView) []toon.Field {
+	help := []string{
+		"Run `no-mistakes axi respond --action approve` to accept this step and continue",
+		"Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)",
+	}
+	if pipeline.HasProtectedPathRefusal(gate.FindingsJSON) {
+		help = []string{
+			"Protected-path refusals require an explicit operator response; Approve is rejected.",
+			"Have the operator inspect and resolve the reported protected-path edit through the repository's authorized workflow, then run `no-mistakes axi respond --action fix` to retry the refused step, including its commit and publication.",
+		}
+	}
+	return gateFieldsWithHelp(gate, append(help,
+		"Run `no-mistakes axi respond --action skip` to skip this step",
+		fmt.Sprintf("Run `%s` to read the full step log", axiLogsFullCommand(gate.Name, "")),
+		"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
+		preserveGateFixCommitsGuidance,
+	))
+}
+
+func inspectionOnlyGateFields(gate stepView, runID string) []toon.Field {
+	return gateFieldsWithHelp(gate, []string{
+		fmt.Sprintf("The explicitly selected gate for run %s is inspection-only; no run-scoped response command exists", runID),
+		fmt.Sprintf("Run `%s` to read the full step log", axiLogsFullCommand(gate.Name, runID)),
+	})
+}
+
+func gateFieldsWithHelp(gate stepView, help []string) []toon.Field {
 	parsed, _ := types.ParseFindingsJSON(gate.FindingsJSON)
 	gfields := []toon.Field{
 		{Key: "step", Value: gate.Name},
@@ -471,15 +567,15 @@ func gateFields(gate stepView) []toon.Field {
 
 	return []toon.Field{
 		{Key: "gate", Value: toon.NewObject(gfields...)},
-		{Key: "help", Value: []string{
-			"Run `no-mistakes axi respond --action approve` to accept this step and continue",
-			"Run `no-mistakes axi respond --action fix --findings <ids>` to have the pipeline fix the selected findings (do not edit files yourself)",
-			"Run `no-mistakes axi respond --action skip` to skip this step",
-			fmt.Sprintf("Run `no-mistakes axi logs --step %s --full` to read the full step log", gate.Name),
-			"A long-running call is working, not stalled - background it if your harness needs to, but the run never advances past a gate on its own. Read every return; on a `gate:`, respond; loop until an `outcome:`.",
-			preserveGateFixCommitsGuidance,
-		}},
+		{Key: "help", Value: help},
 	}
+}
+
+func axiLogsFullCommand(step, runID string) string {
+	if runID != "" {
+		return fmt.Sprintf("no-mistakes axi logs --run %s --step %s --full", runID, step)
+	}
+	return fmt.Sprintf("no-mistakes axi logs --step %s --full", step)
 }
 
 // truncate shortens s to limit runes, appending a disclosure of the full size

@@ -164,8 +164,8 @@ func stepCmdContext(sctx *pipeline.StepContext, ctx context.Context, name string
 	cmd := exec.CommandContext(ctx, resolved, args...)
 	cmd.Dir = sctx.WorkDir
 	winproc.Harden(cmd)
-	if len(sctx.Env) > 0 {
-		cmd.Env = mergeEnv(sctx.Env)
+	if env := stepEnvironment(sctx); env != nil {
+		cmd.Env = env
 	}
 	if missingFromPath {
 		cmd.Err = &exec.Error{Name: name, Err: exec.ErrNotFound}
@@ -173,10 +173,27 @@ func stepCmdContext(sctx *pipeline.StepContext, ctx context.Context, name string
 	return cmd
 }
 
+func stepEnvironment(sctx *pipeline.StepContext) []string {
+	var env []string
+	if len(sctx.Env) > 0 {
+		env = mergeEnv(sctx.Env)
+	}
+	if sctx.ForgeContext != nil && !sctx.ForgeContext.Environment.Empty() {
+		env = sctx.ForgeContext.Environment.Apply(env)
+	}
+	return env
+}
+
 // stepGitRun runs git with the StepContext's environment plus the standard
 // non-interactive git overrides. It is like git.Run but respects sctx.Env so
 // step-scoped PATH and credential environment stay in effect.
 func stepGitRun(sctx *pipeline.StepContext, args ...string) (string, error) {
+	out, err := stepGitRunRaw(sctx, args...)
+	return strings.TrimSpace(out), err
+}
+
+// stepGitRunRaw preserves NUL-delimited paths and porcelain status columns.
+func stepGitRunRaw(sctx *pipeline.StepContext, args ...string) (string, error) {
 	cmd := stepCmd(sctx, "git", args...)
 	cmd.Env = git.NonInteractiveEnvFrom(cmd.Env, sctx.WorkDir)
 	out, err := cmd.Output()
@@ -187,7 +204,7 @@ func stepGitRun(sctx *pipeline.StepContext, args ...string) (string, error) {
 		}
 		return "", fmt.Errorf("git %s: %w: %s", safeurl.RedactText(strings.Join(args, " ")), err, safeurl.RedactText(stderr))
 	}
-	return strings.TrimSpace(string(out)), nil
+	return string(out), nil
 }
 
 func stepGitHeadSHA(sctx *pipeline.StepContext) (string, error) {
@@ -204,6 +221,24 @@ func stepGitPush(sctx *pipeline.StepContext, remote, ref, expectedSHA string, fo
 		}
 	}
 	args = append(args, "HEAD:"+ref)
+	_, err := stepGitRun(sctx, args...)
+	return err
+}
+
+// stepGitPushCommit pushes an explicit commit to a remote ref with the
+// StepContext's environment, mirroring git.PushCommit's argument assembly. The
+// explicit source SHA (rather than HEAD) is what lets a caller publish exactly
+// the commit it verified, even if the worktree moves underneath it.
+func stepGitPushCommit(sctx *pipeline.StepContext, remote, commitSHA, ref, expectedSHA string, forceWithLease bool) error {
+	args := []string{"push", remote}
+	if forceWithLease {
+		if expectedSHA != "" {
+			args = append(args, fmt.Sprintf("--force-with-lease=%s:%s", ref, expectedSHA))
+		} else {
+			args = append(args, "--force-with-lease")
+		}
+	}
+	args = append(args, commitSHA+":"+ref)
 	_, err := stepGitRun(sctx, args...)
 	return err
 }
@@ -263,10 +298,17 @@ func runShellCommand(ctx context.Context, dir, cmdStr string) (string, int, erro
 }
 
 func runStepShellCommand(sctx *pipeline.StepContext, cmdStr string) (string, int, error) {
-	return runShellCommandWithEnv(sctx.Ctx, sctx.WorkDir, sctx.Env, cmdStr)
+	return runShellCommandWithProcessEnv(sctx.Ctx, sctx.WorkDir, stepEnvironment(sctx), cmdStr)
 }
 
 func runShellCommandWithEnv(ctx context.Context, dir string, env []string, cmdStr string) (string, int, error) {
+	if len(env) > 0 {
+		env = mergeEnv(env)
+	}
+	return runShellCommandWithProcessEnv(ctx, dir, env, cmdStr)
+}
+
+func runShellCommandWithProcessEnv(ctx context.Context, dir string, env []string, cmdStr string) (string, int, error) {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.CommandContext(ctx, "cmd.exe", "/c", cmdStr)
@@ -275,8 +317,8 @@ func runShellCommandWithEnv(ctx context.Context, dir string, env []string, cmdSt
 	}
 	shellenv.ConfigureShellCommand(cmd)
 	cmd.Dir = dir
-	if len(env) > 0 {
-		cmd.Env = mergeEnv(env)
+	if env != nil {
+		cmd.Env = env
 	}
 	out, err := shellenv.CombinedOutputShellCommand(cmd)
 	if err != nil {

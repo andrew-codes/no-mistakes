@@ -9,6 +9,7 @@ import (
 
 	"github.com/andrew-codes/no-mistakes/internal/branchsync"
 	"github.com/andrew-codes/no-mistakes/internal/ipc"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline"
 	"github.com/andrew-codes/no-mistakes/internal/types"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -101,6 +102,9 @@ func (m Model) maybeAutoApproveCmd() tea.Cmd {
 	}
 	step := awaitingStep(m.steps)
 	if step == nil || m.yoloApproved[step.StepName] {
+		return nil
+	}
+	if pipeline.HasProtectedPathRefusal(m.stepFindings[step.StepName]) {
 		return nil
 	}
 	if !m.approvalReady(step) {
@@ -364,16 +368,21 @@ func (m Model) applyRecoverCmd() tea.Cmd {
 	if recover == nil {
 		return nil
 	}
+	keepLocal := m.branchSync != nil && m.branchSync.Recovery != nil && m.branchSync.Recovery.KeepLocal
 	return func() tea.Msg {
 		started := time.Now()
-		state := recover()
+		state := recover(keepLocal)
 		result := "refused"
 		if state.Recovered && state.Changed {
 			result = "applied"
 		} else if state.Recovered {
 			result = "noop"
 		}
-		trackTUISyncAttempt("recover", state, result, started)
+		mode := "recover"
+		if keepLocal {
+			mode = "recover_keep_local"
+		}
+		trackTUISyncAttempt(mode, state, result, started)
 		return syncAppliedMsg{state: state}
 	}
 }

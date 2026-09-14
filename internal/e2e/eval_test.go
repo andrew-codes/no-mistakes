@@ -39,6 +39,13 @@ func TestEvalJourney(t *testing.T) {
       summary: "clean"
       tested: ["fakeagent"]
       testing_summary: "simulated"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
       artifacts: []
       risk_level: low
       risk_rationale: "clean"
@@ -77,7 +84,7 @@ func TestEvalJourney(t *testing.T) {
 	}
 	t.Logf("eval sets output:\n%s", out)
 
-	out, err = h.Run("eval", "run", "--cases", "all", "--candidate", "claude+claude-opus-4-7", "--repeats", "1")
+	out, err = h.Run("eval", "run", "--cases", "all", "--candidate", "claude,model=claude-opus-4-7,effort=high", "--repeats", "1")
 	if err != nil {
 		report, reportErr := h.Run("eval", "report")
 		t.Fatalf("eval run: %v\n%s\neval report after failure (%v):\n%s", err, out, reportErr, report)
@@ -90,16 +97,26 @@ func TestEvalJourney(t *testing.T) {
 	if len(invocations) == 0 {
 		t.Fatal("expected replay agent invocation")
 	}
-	replayCWD := invocations[len(invocations)-1].CWD
+	replay := invocations[len(invocations)-1]
+	replayCWD := replay.CWD
 	if !strings.Contains(replayCWD, "nm-eval-replay-") || strings.HasPrefix(replayCWD, h.NMHome) {
 		t.Fatalf("replay used non-isolated worktree %q (source NM_HOME %q)", replayCWD, h.NMHome)
+	}
+	// The candidate's model and effort must reach the harness itself, in this
+	// harness's own spelling. Without this the candidate label would describe a
+	// tuning the replayed agent never actually ran under.
+	replayArgs := strings.Join(replay.Args, " ")
+	for _, want := range []string{"--model claude-opus-4-7", "--effort high"} {
+		if !strings.Contains(replayArgs, want) {
+			t.Fatalf("replay agent argv %q does not carry %q", replayArgs, want)
+		}
 	}
 
 	out, err = h.Run("eval", "report")
 	if err != nil {
 		t.Fatalf("eval report: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "LOCAL-ONLY EVAL REPORT") || !strings.Contains(out, "claude+claude-opus-4-7") || !strings.Contains(out, "unlabeled / pending") || !strings.Contains(out, "queued unmatched candidate findings: 1") {
+	if !strings.Contains(out, "LOCAL-ONLY EVAL REPORT") || !strings.Contains(out, "claude,model=claude-opus-4-7,effort=high") || !strings.Contains(out, "unlabeled / pending") || !strings.Contains(out, "queued unmatched candidate findings: 1") {
 		t.Fatalf("report output = %q", out)
 	}
 	t.Logf("eval report output:\n%s", out)
@@ -130,6 +147,13 @@ func TestEvalAutoCaptureJourney(t *testing.T) {
       summary: "clean"
       tested: ["fakeagent"]
       testing_summary: "simulated"
+      scenarios:
+        - name: "fakeagent: simulated end-to-end scenario"
+          result: pass
+          live: true
+          evidence: "fakeagent: simulated test run"
+          reason: ""
+      verdict: go
       artifacts: []
       risk_level: low
       risk_rationale: "clean"

@@ -21,6 +21,7 @@ import (
 type codexAgent struct {
 	bin       string
 	extraArgs []string
+	subprocessContext
 	// disableProjectSettings is the resolved, trusted-only opt-out. When true,
 	// buildArgs suppresses codex's project-level settings/instructions surface.
 	disableProjectSettings bool
@@ -93,12 +94,12 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	cmd.Dir = opts.CWD
 	cmd.Stdin = strings.NewReader(opts.Prompt)
-	cmd.Env = gitSafeEnv(opts.CWD, opts.Env)
+	cmd.Env = a.gitSafeEnv(opts.CWD, opts.Env)
 	shellenv.ConfigureShellCommand(cmd)
 
 	var stderrBuf []byte
 	var stderrWG sync.WaitGroup
-	started, err := startNativeAgentCommand(cmd)
+	started, err := startNativeAgentCommand(cmd, nativeAgentActivityObserver(opts, "codex"))
 	if err != nil {
 		return nil, fmt.Errorf("codex start: %w", err)
 	}
@@ -117,12 +118,23 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 	var codexErr string
 	var threadID string
 	metrics := newCodexMetricsAccumulator()
+	// An error return carries the same session facts the success path sets
+	// below, so cumulative thread usage is never read as a per-round delta.
+	partialResult := func() *Result {
+		res := resultFromUsage(usage)
+		if res != nil {
+			res.SessionID = threadID
+			res.Resumed = resumeID != ""
+			res.SessionUsageCumulative = true
+		}
+		return res
+	}
 	if err := parseCodexEvents(ctx, started.stdout, opts.OnChunk, &usage, &lastMessage, &codexErr, &threadID, metrics); err != nil {
 		err = started.waitAfterParseError(err)
 		stderrWG.Wait()
 		retErr := fmt.Errorf("codex parse events: %w", err)
 		emitAgentExited(opts, "codex", pid, retErr)
-		return nil, retErr
+		return partialResult(), retErr
 	}
 
 	waitErr := started.wait()
@@ -137,7 +149,7 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 		}
 		retErr := fmt.Errorf("codex exited: %w: %s", waitErr, detail)
 		emitAgentExited(opts, "codex", pid, retErr)
-		return nil, retErr
+		return partialResult(), retErr
 	}
 
 	res, err := finalizeTextResult("codex", lastMessage, validationSchema, usage)

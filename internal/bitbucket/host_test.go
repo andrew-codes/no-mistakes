@@ -2,7 +2,6 @@ package bitbucket
 
 import (
 	"context"
-	"slices"
 	"testing"
 
 	"github.com/andrew-codes/no-mistakes/internal/scm"
@@ -12,7 +11,7 @@ func TestHost_Available_OKWhenDoctorReportsBitbucketOK(t *testing.T) {
 	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
 		"doctor\x1f--output\x1fjson": {Stdout: envelope(t, `{"bitbucket":{"ok":true}}`)},
 	})
-	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil)
+	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil, false)
 
 	if err := host.Available(context.Background()); err != nil {
 		t.Fatalf("Available() = %v, want nil", err)
@@ -23,7 +22,7 @@ func TestHost_Available_ErrorsWithDoctorMessageWhenBitbucketNotOK(t *testing.T) 
 	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
 		"doctor\x1f--output\x1fjson": {Stdout: envelope(t, `{"bitbucket":{"ok":false,"message":"No Bitbucket token resolved. Run twg setup bitbucket."}}`)},
 	})
-	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil)
+	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil, false)
 
 	err := host.Available(context.Background())
 	if err == nil {
@@ -35,13 +34,13 @@ func TestHost_Available_ErrorsWithDoctorMessageWhenBitbucketNotOK(t *testing.T) 
 }
 
 func TestHost_Available_ErrorsWhenCLIUnavailable(t *testing.T) {
-	host := NewHost(nil, RepoRef{Workspace: "test", RepoSlug: "repo"}, func() bool { return false })
+	host := NewHost(nil, RepoRef{Workspace: "test", RepoSlug: "repo"}, func() bool { return false }, false)
 	if err := host.Available(context.Background()); err == nil {
 		t.Fatal("expected error when client is nil")
 	}
 
 	client, _ := newFakeTwgClient(t, nil)
-	host = NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, func() bool { return false })
+	host = NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, func() bool { return false }, false)
 	err := host.Available(context.Background())
 	if err == nil {
 		t.Fatal("expected error when twg CLI is unavailable")
@@ -51,17 +50,17 @@ func TestHost_Available_ErrorsWhenCLIUnavailable(t *testing.T) {
 	}
 }
 
-func TestHost_FetchFailedCheckLogs_UsesPipelineUUIDFromStatusURL(t *testing.T) {
+func TestHost_FetchFailedCheckLogs_UsesPipelineBuildNumberFromStatusURL(t *testing.T) {
 	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
 	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
 		"bitbucket\x1fpull-requests\x1fget\x1f42\x1f--statuses\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson": {
-			Stdout: envelope(t, `{"_statuses":[{"name":"tests","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/{pipe-1}"}]}`),
+			Stdout: envelope(t, `{"_statuses":[{"name":"tests","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/41"}]}`),
 		},
-		"bitbucket\x1fpipeline\x1fget\x1f--pipeline\x1fpipe-1\x1f--logs\x1f--failed-steps\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson": {
+		"bitbucket\x1fpipeline\x1fget\x1f--pipeline\x1f41\x1f--logs\x1f--failed-steps\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson": {
 			Stdout: envelope(t, `{"steps":[{"state":{"result":{"name":"FAILED"}},"log":"boom\n"}]}`),
 		},
 	})
-	host := NewHost(client, repo, nil)
+	host := NewHost(client, repo, nil, false)
 
 	logOutput, err := host.FetchFailedCheckLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123", []string{"tests"})
 	if err != nil {
@@ -74,7 +73,7 @@ func TestHost_FetchFailedCheckLogs_UsesPipelineUUIDFromStatusURL(t *testing.T) {
 
 func TestHost_FetchFailedCheckLogs_NoFailingNamesReturnsEmpty(t *testing.T) {
 	client, _ := newFakeTwgClient(t, nil)
-	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil)
+	host := NewHost(client, RepoRef{Workspace: "test", RepoSlug: "repo"}, nil, false)
 
 	logOutput, err := host.FetchFailedCheckLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123", nil)
 	if err != nil {
@@ -82,6 +81,52 @@ func TestHost_FetchFailedCheckLogs_NoFailingNamesReturnsEmpty(t *testing.T) {
 	}
 	if logOutput != "" {
 		t.Fatalf("logOutput = %q, want empty", logOutput)
+	}
+}
+
+func TestHost_FetchFailedCheckTargetLogs_MatchesExactProviderIDAmongSameNamedChecks(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		"bitbucket\x1fpull-requests\x1fget\x1f42\x1f--statuses\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson": {
+			Stdout: envelope(t, `{"_statuses":[
+				{"name":"test","key":"test-linux","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/41"},
+				{"name":"test","key":"test-macos","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/42"}
+			]}`),
+		},
+		"bitbucket\x1fpipeline\x1fget\x1f--pipeline\x1f42\x1f--logs\x1f--failed-steps\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson": {
+			Stdout: envelope(t, `{"steps":[{"state":{"result":{"name":"FAILED"}},"log":"macos failure\n"}]}`),
+		},
+	})
+	host := NewHost(client, repo, nil, false)
+
+	logs, err := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123", []scm.CheckTarget{
+		{Name: "test", ProviderID: "bitbucket-status:test-macos"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Output != "macos failure" {
+		t.Fatalf("logs = %+v, want exactly the macos pipeline log", logs)
+	}
+}
+
+func TestHost_FetchFailedCheckTargetLogs_FailsClosedWhenSelectionCannotResolve(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		"bitbucket\x1fpull-requests\x1fget\x1f42\x1f--statuses\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson": {
+			Stdout: envelope(t, `{"_statuses":[{"name":"test","key":"test-linux","state":"FAILED","url":"https://bitbucket.org/test/repo/pipelines/results/41"}]}`),
+		},
+	})
+	host := NewHost(client, repo, nil, false)
+
+	logs, err := host.FetchFailedCheckTargetLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123", []scm.CheckTarget{
+		{Name: "test", ProviderID: "bitbucket-status:missing"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].Err == nil {
+		t.Fatalf("logs = %+v, want an unresolved-selection error on the single result", logs)
 	}
 }
 
@@ -151,6 +196,46 @@ func TestStatusName(t *testing.T) {
 	}
 }
 
+func TestStatusProviderID(t *testing.T) {
+	t.Parallel()
+
+	if got := statusProviderID(CommitStatus{Key: "build-1", URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/1"}); got != "bitbucket-status:build-1" {
+		t.Fatalf("statusProviderID() = %q, want status key identity", got)
+	}
+	if got := statusProviderID(CommitStatus{URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/42"}); got != "bitbucket-pipeline-build:42" {
+		t.Fatalf("statusProviderID() = %q, want pipeline identity fallback", got)
+	}
+}
+
+func TestFailedPipelineBuildNumberTargetsPreservesExactSameNamedSelection(t *testing.T) {
+	t.Parallel()
+
+	statuses := []CommitStatus{
+		{Name: "test", Key: "test-linux", State: "FAILED", URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/41"},
+		{Name: "test", Key: "test-macos", State: "FAILED", URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/42"},
+	}
+	got, err := failedPipelineBuildNumberTargets(statuses, []scm.CheckTarget{{Name: "test", ProviderID: "bitbucket-status:test-macos"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("targets = %v, want one exact pipeline", got)
+	}
+	if _, ok := got["42"]; !ok {
+		t.Fatalf("targets = %v, want build 42", got)
+	}
+}
+
+func TestFailedPipelineBuildNumberTargetsFailsClosedWhenSelectionCannotResolve(t *testing.T) {
+	t.Parallel()
+
+	statuses := []CommitStatus{{Name: "test", Key: "test-linux", State: "FAILED", URL: "https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/41"}}
+	got, err := failedPipelineBuildNumberTargets(statuses, []scm.CheckTarget{{Name: "test", ProviderID: "bitbucket-status:missing"}})
+	if err == nil || got != nil {
+		t.Fatalf("failedPipelineBuildNumberTargets() = (%v, %v), want no targets and an error", got, err)
+	}
+}
+
 func TestStatusBucket(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -191,275 +276,24 @@ func TestStatusBucket(t *testing.T) {
 	}
 }
 
-func TestNormalizePipelineUUID(t *testing.T) {
+func TestPipelineBuildNumberFromStatusURL(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
-		name string
 		raw  string
 		want string
 	}{
-		{"already lowercase", "abc-def-123", "abc-def-123"},
-		{"uppercase lowered", "ABC-DEF-123", "abc-def-123"},
-		{"mixed case lowered", "AbC-dEf", "abc-def"},
-		{"with braces stripped", "{abc-def-123}", "abc-def-123"},
-		{"with braces uppercase", "{ABC-DEF}", "abc-def"},
-		{"with surrounding spaces trimmed", "  abc-def  ", "abc-def"},
-		{"spaces and braces combined", "  {abc-def}  ", "abc-def"},
-
-		// strings.Trim with cutset "{}" strips all leading/trailing { and } chars,
-		// not just one matched pair.
-		{"nested braces collapse", "{{abc-def}}", "abc-def"},
-		{"only leading brace stripped", "{abc-def", "abc-def"},
-		{"only trailing brace stripped", "abc-def}", "abc-def"},
-		{"triple trailing braces", "abc-def}}}", "abc-def"},
-		{"interior braces preserved", "a{b}c", "a{b}c"},
-
-		{"empty returns empty", "", ""},
-		{"whitespace-only returns empty", "   ", ""},
-		{"empty braces return empty", "{}", ""},
-		{"braces with whitespace return empty", "  {}  ", ""},
+		{"https://bitbucket.org/ws/repo/pipelines/results/123", "123"},
+		{"https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/456", "456"},
+		{"https://bitbucket.org/ws/repo/pipelines/results/not-a-number", ""},
+		{"https://bitbucket.org/ws/repo/pipelines", ""},
+		{"", ""},
+		{"   ", ""},
+		{"not-a-url", ""},
 	}
-
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := normalizePipelineUUID(tt.raw)
-			if got != tt.want {
-				t.Fatalf("normalizePipelineUUID(%q) = %q, want %q", tt.raw, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestPipelineUUIDFromStatusURL(t *testing.T) {
-	tests := []struct {
-		name string
-		raw  string
-		want string
-	}{
-		{
-			name: "valid results URL with braces",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/{abc-def-123}",
-			want: "abc-def-123",
-		},
-		{
-			name: "UUID without braces",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/abc-def",
-			want: "abc-def",
-		},
-		{
-			name: "uppercase UUID normalized to lowercase",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/{ABC-DEF}",
-			want: "abc-def",
-		},
-		{
-			name: "URL with query string strips query",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/{abc-def}?tab=logs",
-			want: "abc-def",
-		},
-		{
-			name: "URL with trailing path segment stops at first slash",
-			raw:  "https://bitbucket.org/ws/repo/pipelines/results/{abc-def}/steps",
-			want: "abc-def",
-		},
-		{
-			name: "fragment consulted before path",
-			raw:  "https://bitbucket.org/ws/pipelines/results/path-uuid#/pipelines/results/frag-uuid",
-			want: "frag-uuid",
-		},
-		{
-			name: "last results segment wins when duplicated",
-			raw:  "https://bitbucket.org/results/early/results/late",
-			want: "late",
-		},
-		{
-			name: "URL without results segment returns empty",
-			raw:  "https://bitbucket.org/ws/repo/pipelines",
-			want: "",
-		},
-		{
-			name: "URL whose path lacks results but fragment has it extracts fragment UUID",
-			raw:  "https://bitbucket.org/ws/repo#/pipelines/results/{frag-only}",
-			want: "frag-only",
-		},
-		{
-			name: "empty string returns empty",
-			raw:  "",
-			want: "",
-		},
-		{
-			name: "whitespace-only returns empty",
-			raw:  "   ",
-			want: "",
-		},
-		{
-			name: "plain string with no URL structure returns empty",
-			raw:  "not-a-url",
-			want: "",
-		},
-		{
-			// An invalid percent-escape makes url.Parse fail outright; the helper
-			// must return empty rather than panic or surface the parse error.
-			name: "malformed URL with invalid percent escape returns empty",
-			raw:  "https://bitbucket.org/x/results/{abc}%xx",
-			want: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := pipelineUUIDFromStatusURL(tt.raw)
-			if got != tt.want {
-				t.Fatalf("pipelineUUIDFromStatusURL(%q) = %q, want %q", tt.raw, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestFailedPipelineUUIDs(t *testing.T) {
-	resultsURL := func(uuid string) string {
-		return "https://bitbucket.org/ws/repo/pipelines/results/{" + uuid + "}"
-	}
-
-	tests := []struct {
-		name         string
-		statuses     []CommitStatus
-		failingNames []string
-		wantNil      bool
-		want         []string // pre-sorted UUIDs expected in the returned map
-	}{
-		{
-			name:         "no failing names returns nil",
-			failingNames: nil,
-			wantNil:      true,
-		},
-		{
-			name:         "empty failing names slice returns nil",
-			failingNames: []string{},
-			wantNil:      true,
-		},
-		{
-			name:         "failing names all whitespace returns nil",
-			failingNames: []string{"  ", ""},
-			wantNil:      true,
-		},
-		{
-			name:         "no statuses returns nil",
-			statuses:     nil,
-			failingNames: []string{"build"},
-			wantNil:      true,
-		},
-		{
-			name: "no status name matches a failing name returns nil",
-			statuses: []CommitStatus{
-				{Name: "lint", URL: resultsURL("lint-uuid")},
-			},
-			failingNames: []string{"build"},
-			wantNil:      true,
-		},
-		{
-			name: "matching status with no results URL returns nil",
-			statuses: []CommitStatus{
-				{Name: "build", URL: "https://bitbucket.org/ws/repo/build"},
-			},
-			failingNames: []string{"build"},
-			wantNil:      true,
-		},
-		{
-			name: "matching status with empty URL returns nil",
-			statuses: []CommitStatus{
-				{Name: "build", URL: ""},
-			},
-			failingNames: []string{"build"},
-			wantNil:      true,
-		},
-		{
-			name: "single match extracts UUID",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-			},
-			failingNames: []string{"build"},
-			want:         []string{"abc"},
-		},
-		{
-			name: "multiple distinct failing names map to distinct UUIDs",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-				{Name: "tests", URL: resultsURL("def")},
-			},
-			failingNames: []string{"build", "tests"},
-			want:         []string{"abc", "def"},
-		},
-		{
-			name: "duplicate UUIDs collapse into a single target",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-				{Name: "tests", URL: resultsURL("abc")},
-			},
-			failingNames: []string{"build", "tests"},
-			want:         []string{"abc"},
-		},
-		{
-			name: "only the requested failing names contribute UUIDs",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-				{Name: "lint", URL: resultsURL("def")},
-			},
-			failingNames: []string{"build", "nonexistent"},
-			want:         []string{"abc"},
-		},
-		{
-			name: "failing name with surrounding whitespace matches trimmed status name",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("abc")},
-			},
-			failingNames: []string{"  build  "},
-			want:         []string{"abc"},
-		},
-		{
-			name: "status matched by key when name is empty",
-			statuses: []CommitStatus{
-				{Key: "build", URL: resultsURL("abc")},
-			},
-			failingNames: []string{"build"},
-			want:         []string{"abc"},
-		},
-		{
-			name: "uppercase UUIDs in URLs are normalized",
-			statuses: []CommitStatus{
-				{Name: "build", URL: resultsURL("ABC-DEF")},
-			},
-			failingNames: []string{"build"},
-			want:         []string{"abc-def"},
-		},
-		{
-			name: "LatestStatuses dedup happens before UUID collection",
-			statuses: []CommitStatus{
-				{Name: "build", Key: "build", URL: resultsURL("first")},
-				{Name: "build", Key: "build", URL: resultsURL("second")},
-			},
-			failingNames: []string{"build"},
-			want:         []string{"first"},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := failedPipelineUUIDs(tt.statuses, tt.failingNames)
-			if tt.wantNil {
-				if got != nil {
-					t.Fatalf("failedPipelineUUIDs = %v, want nil", got)
-				}
-				return
-			}
-			if got == nil {
-				t.Fatalf("failedPipelineUUIDs = nil, want %v", tt.want)
-			}
-			keys := slices.Clone(got)
-			slices.Sort(keys)
-			want := slices.Clone(tt.want)
-			slices.Sort(want)
-			if !slices.Equal(keys, want) {
-				t.Fatalf("failedPipelineUUIDs = %v, want %v", got, tt.want)
-			}
-		})
+		if got := pipelineBuildNumberFromStatusURL(tt.raw); got != tt.want {
+			t.Fatalf("pipelineBuildNumberFromStatusURL(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
 	}
 }

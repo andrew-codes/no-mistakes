@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/andrew-codes/no-mistakes/internal/agentcfg"
 )
 
 func TestOpencodeAgent_CloseWithoutServer(t *testing.T) {
@@ -504,9 +506,6 @@ func TestOpencodeAgent_StructuredOutputError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error, got result %+v", result)
 	}
-	if result != nil {
-		t.Fatalf("expected nil result on error, got %+v", result)
-	}
 	msg := err.Error()
 	if !strings.Contains(msg, "structured output failed") {
 		t.Errorf("expected error to mention structured output failure, got %q", msg)
@@ -524,7 +523,10 @@ func TestOpencodeAgent_StructuredOutputError(t *testing.T) {
 
 func TestOpencodeAgent_ThinkingToolChoiceConflictFallsBackToValidatedText(t *testing.T) {
 	var sessions atomic.Int32
-	var nativeFormatSeen atomic.Bool
+	var eventStreams atomic.Int32
+	var nativeNestedFormatSeen atomic.Bool
+	var nativeRootFormatSeen atomic.Bool
+	var nativeProfileAndRetriesSeen atomic.Bool
 	var fallbackFormatSeen atomic.Bool
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -534,6 +536,10 @@ func TestOpencodeAgent_ThinkingToolChoiceConflictFallsBackToValidatedText(t *tes
 			fmt.Fprintf(w, `{"id":"s%d"}`, id)
 
 		case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+			if eventStreams.Add(1) == 1 {
+				fmt.Fprint(w, "data: {\"payload\":{\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"s1\",\"part\":{\"id\":\"p1\",\"messageID\":\"msg1\",\"type\":\"text\",\"text\":\"thinking before conflict\"}}}}\n\n")
+				fmt.Fprint(w, "data: {\"payload\":{\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"s1\",\"info\":{\"id\":\"msg1\",\"role\":\"assistant\"}}}}\n\n")
+			}
 			fmt.Fprint(w, "data: {\"payload\":{\"type\":\"session.idle\"}}\n\n")
 
 		case r.URL.Path == "/session/s1/message" && r.Method == http.MethodPost:
@@ -541,8 +547,18 @@ func TestOpencodeAgent_ThinkingToolChoiceConflictFallsBackToValidatedText(t *tes
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Errorf("decode native request: %v", err)
 			}
-			_, hasFormat := body["format"]
-			nativeFormatSeen.Store(hasFormat)
+			_, hasRootFormat := body["format"]
+			nativeRootFormatSeen.Store(hasRootFormat)
+			info, _ := body["info"].(map[string]any)
+			format, hasNestedFormat := info["format"].(map[string]any)
+			nativeNestedFormatSeen.Store(hasNestedFormat)
+			model, _ := body["model"].(map[string]any)
+			nativeProfileAndRetriesSeen.Store(
+				model["providerID"] == "openai" &&
+					model["modelID"] == "gpt-5" &&
+					body["variant"] == "high" &&
+					format["retryCount"] == float64(2),
+			)
 			fmt.Fprint(w, `{"info":{"id":"msg1","role":"assistant","error":{"name":"APIError","data":{"message":"Provider returned error","responseBody":"Thinking may not be enabled when tool_choice forces tool use."}}}}`)
 
 		case r.URL.Path == "/session/s2/message" && r.Method == http.MethodPost:
@@ -566,7 +582,84 @@ func TestOpencodeAgent_ThinkingToolChoiceConflictFallsBackToValidatedText(t *tes
 	a := &opencodeAgent{
 		bin:    "opencode",
 		server: &managedServer{port: mustParsePort(server.URL)},
+		profile: agentcfg.Profile{
+			Model:  "openai/gpt-5",
+			Effort: agentcfg.EffortHigh,
+		},
 	}
+	var chunks []string
+	var fallbackEvents int
+	result, err := a.Run(context.Background(), RunOpts{
+		Prompt:     "review the changes",
+		CWD:        t.TempDir(),
+		JSONSchema: json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}`),
+		OnChunk:    func(text string) { chunks = append(chunks, text) },
+		OnLifecycle: func(event LifecycleEvent) {
+			if event.Phase == LifecyclePhaseFallback {
+				fallbackEvents++
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := string(result.Output); got != `{"summary":"all good"}` {
+		t.Fatalf("output = %s", got)
+	}
+	if !nativeNestedFormatSeen.Load() {
+		t.Error("first request did not nest native json_schema format in info")
+	}
+	if nativeRootFormatSeen.Load() {
+		t.Error("first request unexpectedly used root json_schema format")
+	}
+	if !nativeProfileAndRetriesSeen.Load() {
+		t.Error("first request did not preserve model, variant, and retryCount")
+	}
+	if fallbackFormatSeen.Load() {
+		t.Error("fallback request unexpectedly used native json_schema format")
+	}
+	if got := sessions.Load(); got != 2 {
+		t.Fatalf("sessions = %d, want 2", got)
+	}
+	if !strings.Contains(strings.Join(chunks, ""), "thinking before conflict") {
+		t.Fatalf("chunks = %q, want output from the failed native-format attempt", chunks)
+	}
+	if fallbackEvents != 1 {
+		t.Fatalf("fallback lifecycle events = %d, want one fresh prompt-only attempt boundary", fallbackEvents)
+	}
+	t.Logf("native nested format=%v; native root format=%v; model/variant/retryCount preserved=%v; fallback format=%v; validated output=%s", nativeNestedFormatSeen.Load(), nativeRootFormatSeen.Load(), nativeProfileAndRetriesSeen.Load(), fallbackFormatSeen.Load(), result.Output)
+}
+
+// TestOpencodeAgent_ThinkingToolChoiceFallbackSumsBothTurnsUsage proves the
+// one row this invocation records carries both model turns. The native attempt
+// burns its input before the conflict and the prompt-only fallback burns its
+// own; reporting only the fallback would under-count the invocation by roughly
+// half. Each attempt is a fresh session and opencode never reports
+// cumulatively, so the two are independent deltas that add.
+func TestOpencodeAgent_ThinkingToolChoiceFallbackSumsBothTurnsUsage(t *testing.T) {
+	var sessions atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/session" && r.Method == http.MethodPost:
+			fmt.Fprintf(w, `{"id":"s%d"}`, sessions.Add(1))
+
+		case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+			fmt.Fprint(w, "data: {\"payload\":{\"type\":\"session.idle\"}}\n\n")
+
+		case r.URL.Path == "/session/s1/message" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"info":{"id":"msg1","role":"assistant","tokens":{"input":100,"output":10,"cache":{"read":5,"write":2}},"error":{"name":"APIError","data":{"message":"Provider returned error","responseBody":"Thinking may not be enabled when tool_choice forces tool use."}}}}`)
+
+		case r.URL.Path == "/session/s2/message" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"info":{"id":"msg2","role":"assistant","tokens":{"input":200,"output":20,"cache":{"read":7,"write":3}}},"parts":[{"type":"text","text":"{\"summary\":\"all good\"}"}]}`)
+
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	a := &opencodeAgent{bin: "opencode", server: &managedServer{port: mustParsePort(server.URL)}}
 	result, err := a.Run(context.Background(), RunOpts{
 		Prompt:     "review the changes",
 		CWD:        t.TempDir(),
@@ -575,19 +668,19 @@ func TestOpencodeAgent_ThinkingToolChoiceConflictFallsBackToValidatedText(t *tes
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := string(result.Output); got != `{"summary":"all good"}` {
-		t.Fatalf("output = %s", got)
-	}
-	if !nativeFormatSeen.Load() {
-		t.Error("first request did not use native json_schema format")
-	}
-	if fallbackFormatSeen.Load() {
-		t.Error("fallback request unexpectedly used native json_schema format")
-	}
 	if got := sessions.Load(); got != 2 {
-		t.Fatalf("sessions = %d, want 2", got)
+		t.Fatalf("sessions = %d, want the native attempt plus the fallback", got)
 	}
-	t.Logf("native format=%v; fallback format=%v; validated output=%s", nativeFormatSeen.Load(), fallbackFormatSeen.Load(), result.Output)
+	want := TokenUsage{
+		InputTokens: 300, OutputTokens: 30, CacheReadTokens: 12, CacheCreationTokens: 5,
+		Reported: true, CacheCreationReported: true,
+	}
+	if result.Usage != want {
+		t.Fatalf("usage = %+v, want both turns summed %+v", result.Usage, want)
+	}
+	if !result.UsageReported || !result.CacheCreationReported {
+		t.Fatalf("reported flags = %v/%v, want both true", result.UsageReported, result.CacheCreationReported)
+	}
 }
 
 func TestOpencodeAgent_ThinkingToolChoiceFallbackRejectsSchemaViolation(t *testing.T) {
@@ -623,9 +716,6 @@ func TestOpencodeAgent_ThinkingToolChoiceFallbackRejectsSchemaViolation(t *testi
 	})
 	if err == nil {
 		t.Fatalf("Run unexpectedly succeeded with result %+v", result)
-	}
-	if result != nil {
-		t.Fatalf("result = %+v, want nil", result)
 	}
 	if !strings.Contains(err.Error(), "summary must be string") {
 		t.Fatalf("error = %q, want original schema's string constraint", err)

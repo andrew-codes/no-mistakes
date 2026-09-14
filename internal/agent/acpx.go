@@ -20,6 +20,12 @@ type acpxAgent struct {
 	bin        string
 	target     string
 	rawCommand string
+	// model is the harness-neutral model pin resolved by internal/agentcfg.
+	// no-mistakes never speaks ACP itself, so acpx's own --model is the only
+	// mechanism that reaches the target agent; empty leaves the target on its
+	// configured default, exactly as before the common layer existed.
+	model string
+	subprocessContext
 }
 
 func (a *acpxAgent) Name() string { return "acp:" + a.target }
@@ -40,14 +46,14 @@ func (a *acpxAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) 
 	args := a.buildArgs(opts)
 	cmd := exec.CommandContext(ctx, a.bin, args...)
 	cmd.Dir = opts.CWD
-	cmd.Env = gitSafeEnv(opts.CWD, opts.Env)
+	cmd.Env = a.gitSafeEnv(opts.CWD, opts.Env)
 	shellenv.ConfigureShellCommand(cmd)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("acpx stdin pipe: %w", err)
 	}
-	started, err := startNativeAgentCommand(cmd)
+	started, err := startNativeAgentCommand(cmd, nativeAgentActivityObserver(opts, a.Name()))
 	if err != nil {
 		_ = stdin.Close()
 		return nil, fmt.Errorf("acpx start: %w", err)
@@ -68,13 +74,19 @@ func (a *acpxAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) 
 
 	var usage TokenUsage
 	text, stdoutErr, err := parseAcpxJSONEvents(ctx, started.stdout, opts.OnChunk, &usage)
+	// Estimate before any return, not just the success one: acpx can report an
+	// input-only usage event and then fail, and a reported usage with no output
+	// count would otherwise record the text it did stream as a reported zero.
+	if usage.OutputTokens == 0 {
+		usage.OutputTokens = estimateAcpxTokens(len(text))
+	}
 	if err != nil {
 		err = started.waitAfterParseError(err)
 		stderrWG.Wait()
 		err = errors.Join(err, acpxStdinError(<-stdinErrCh))
 		retErr := fmt.Errorf("acpx parse events: %w", err)
 		emitAgentExited(opts, a.Name(), pid, retErr)
-		return nil, retErr
+		return resultFromUsage(usage), retErr
 	}
 	waitErr := started.wait()
 	stderrWG.Wait()
@@ -82,17 +94,14 @@ func (a *acpxAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) 
 	if waitErr != nil {
 		retErr := fmt.Errorf("acpx exited: %w: %s", errors.Join(waitErr, stdinErr), acpxProcessErrorOutput(stderrBuf, stdoutErr))
 		emitAgentExited(opts, a.Name(), pid, retErr)
-		return nil, retErr
+		return resultFromUsage(usage), retErr
 	}
 	if stdinErr != nil {
 		if out := acpxProcessErrorOutput(stderrBuf, stdoutErr); out != "" {
 			stdinErr = fmt.Errorf("%w: %s", stdinErr, out)
 		}
 		emitAgentExited(opts, a.Name(), pid, stdinErr)
-		return nil, stdinErr
-	}
-	if usage.OutputTokens == 0 {
-		usage.OutputTokens = estimateAcpxTokens(len(text))
+		return resultFromUsage(usage), stdinErr
 	}
 	res, err := finalizeTextResult(a.Name(), text, opts.JSONSchema, usage)
 	emitAgentExited(opts, a.Name(), pid, err)
@@ -116,6 +125,11 @@ func (a *acpxAgent) buildArgs(opts RunOpts) []string {
 		"--non-interactive-permissions", "deny",
 		"--suppress-reads",
 	)
+	// --model must stay among acpx's own options, ahead of the bare target and
+	// the exec subcommand, or acpx reads it as an argument to the target.
+	if a.model != "" {
+		args = append(args, "--model", a.model)
+	}
 	if a.rawCommand == "" {
 		args = append(args, a.target)
 	}
@@ -198,6 +212,9 @@ type acpxUsageFields struct {
 	cacheCreationReported         bool
 }
 
+// parseAcpxJSONEvents streams acpx's JSON events and returns the assistant
+// text accumulated so far, on its error paths too, so a turn that fails partway
+// can still account for the output acpx already produced.
 func parseAcpxJSONEvents(ctx context.Context, r io.Reader, onChunk func(string), usage *TokenUsage) (string, string, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), acpxScannerMaxTokenSize)
@@ -207,7 +224,7 @@ func parseAcpxJSONEvents(ctx context.Context, r io.Reader, onChunk func(string),
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			return "", stdoutErr, ctx.Err()
+			return output.String(), stdoutErr, ctx.Err()
 		default:
 		}
 
@@ -245,7 +262,7 @@ func parseAcpxJSONEvents(ctx context.Context, r io.Reader, onChunk func(string),
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", stdoutErr, err
+		return output.String(), stdoutErr, err
 	}
 	return output.String(), stdoutErr, nil
 }

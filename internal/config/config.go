@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/andrew-codes/no-mistakes/internal/agentcfg"
 	"github.com/andrew-codes/no-mistakes/internal/evidence"
 	"github.com/andrew-codes/no-mistakes/internal/types"
 	"github.com/andrew-codes/no-mistakes/internal/winproc"
@@ -39,11 +40,31 @@ const (
 	// DefaultStepQuietWarning is how long a running/fixing step can go without
 	// a new log or lifecycle activity before AXI status marks it quiet.
 	DefaultStepQuietWarning = 10 * time.Minute
+	// DefaultAgentTimeout bounds one pipeline agent invocation that does not
+	// install a more specific deadline, so a stalled agent cannot leave a run
+	// active forever. Review and Test keep their own knobs; this is the
+	// default-by-construction budget for every other step.
+	DefaultAgentTimeout = 30 * time.Minute
+	// DefaultReviewAgentTimeout is the absolute wall-clock limit for one
+	// review or review-fix invocation. Every later invocation derives a fresh
+	// limit, so a stalled agent is bounded without charging the next turn.
+	DefaultReviewAgentTimeout = 30 * time.Minute
+	// DefaultTestAgentTimeout bounds one Test-step agent invocation, including
+	// the post-test evidence-gathering turn and a Test-repair turn, so a stalled
+	// agent cannot leave a run active forever.
+	DefaultTestAgentTimeout = 30 * time.Minute
 	// DefaultDaemonConnectTimeout bounds client IPC connection attempts to a
 	// daemon socket that exists but is not accepting connections.
 	DefaultDaemonConnectTimeout = 3 * time.Second
 	// DefaultBranchSyncRemoteTimeout bounds each remote Git operation (ls-remote, fetch) in internal/branchsync. Global-config-only; a pushed branch cannot change it. Timeout still fails closed.
 	DefaultBranchSyncRemoteTimeout = 60 * time.Second
+	// DefaultGateReconcileInterval is how often a parked approval gate is
+	// rechecked. Global-config-only; a pushed branch cannot change it.
+	DefaultGateReconcileInterval = 2 * time.Minute
+	// DefaultGateReconcileTimeout is the deadline for one approval-gate
+	// reconciliation check (including host.Available / gh auth status).
+	// Global-config-only; a pushed branch cannot change it.
+	DefaultGateReconcileTimeout = 30 * time.Second
 	// CITimeoutUnlimited is the sentinel meaning "monitor until the PR is
 	// merged, closed, or the run is aborted - never self-terminate".
 	// Any non-positive ci_timeout, or the keywords "unlimited", "none",
@@ -62,6 +83,20 @@ const (
 	// with an agent round, but they are not free: each one keeps the monitor
 	// polling the same commit, so the budget stays small by construction.
 	MaxCIRerunTransient = 5
+	// DefaultCIRevalidateRepairs is the policy the CI step uses when
+	// ci.revalidate_repairs is unset. It is false because restarting the whole
+	// pipeline at Review for every CI repair is the single most expensive
+	// thing the pipeline can do to a run: it replays Review, Test, Document,
+	// Lint, Push, and PR against the repaired head, so one repair costs
+	// another full agent pass over the whole change. VISION.md's cost
+	// constraint makes that opt-in.
+	//
+	// False does not mean "always publish". It means "publish when it is
+	// provably safe to": a repair is published only when its head is the run's
+	// review-approved commit or a descendant of it, and any repair that cannot
+	// show that - every merge-conflict repair, since a rebase rewrites the
+	// head - revalidates from Review instead. See CI.RevalidateRepairs.
+	DefaultCIRevalidateRepairs = false
 	// DefaultEvalMaxCases caps the auto-captured local eval corpus. Cases
 	// share one object pool per repository, so the marginal cost of a case is
 	// its JSON records plus the objects its commits actually introduced, not a
@@ -94,6 +129,19 @@ type GlobalConfig struct {
 	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
 	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
+	// AgentConfig is the harness-neutral per-agent tuning map (agent_config):
+	// model and reasoning effort stated once in a common spelling, mapped down
+	// to each harness's own mechanism by internal/agentcfg. It is additive to
+	// agent_args_override, which still wins for any knob it already pins
+	// natively, so every configuration written before this field keeps its exact
+	// previous behavior. Global-only for the same reason as
+	// agent_args_override: it describes this machine's agent setup and decides
+	// which model runs with the operator's credentials, so no pushed branch may
+	// set it.
+	AgentConfig map[string]agentcfg.Profile `yaml:"agent_config"`
+	// ReviewAgents selects independent review-loop harnesses and profiles.
+	// Global-only: repository input must not select credential/model profiles.
+	ReviewAgents map[string]ReviewAgent `yaml:"review_agents"`
 	// WorktreeRoots places a repository's pipeline run worktrees under a
 	// directory the operator chose instead of the default
 	// <NM_HOME>/worktrees/<repoID>. Keys are registered checkout paths
@@ -104,16 +152,26 @@ type GlobalConfig struct {
 	WorktreeRoots           map[string]string `yaml:"worktree_roots"`
 	CITimeout               time.Duration     `yaml:"-"`
 	StepQuietWarning        time.Duration     `yaml:"-"`
+	AgentTimeout            time.Duration     `yaml:"-"`
+	ReviewAgentTimeout      time.Duration     `yaml:"-"`
+	TestAgentTimeout        time.Duration     `yaml:"-"`
 	DaemonConnectTimeout    time.Duration     `yaml:"-"`
 	BranchSyncRemoteTimeout time.Duration     `yaml:"-"`
-	LogLevel                string            `yaml:"log_level"`
+	// GateReconcileInterval / GateReconcileTimeout bound how often and how
+	// long a parked approval gate is rechecked. They are machine-local
+	// operator knobs (slow hosts, contended gh auth) and global-only so a
+	// pushed branch cannot widen or shrink the reconcile budget.
+	GateReconcileInterval time.Duration `yaml:"-"`
+	GateReconcileTimeout  time.Duration `yaml:"-"`
+	LogLevel              string        `yaml:"log_level"`
 	// SessionReuse controls per-run agent session reuse in the review loop:
 	// one durable fixer session across review-fix turns. Review turns always
 	// run session-free so the rereview never resumes the session whose
 	// findings prescribed the fixes it certifies. Default true; set
 	// session_reuse: false to force every invocation cold.
-	SessionReuse bool `yaml:"-"`
-	AutoFix      AutoFixRaw
+	SessionReuse  bool          `yaml:"-"`
+	ForgeProfiles ForgeProfiles `yaml:"forge_profiles"`
+	AutoFix       AutoFixRaw
 	// CI is the operator's own CI-step floor. It is the only place the rerun
 	// budget can be set for a repository whose default branch this machine's
 	// user does not control (the common case when contributing to someone
@@ -126,32 +184,55 @@ type GlobalConfig struct {
 	// this machine's local eval corpus (disk, retention, whether review rounds
 	// record replay provenance), never a repository policy. Keeping it out of
 	// RepoConfig means no pushed branch can enable, disable, or resize it.
-	Eval Eval
+	Eval      Eval
+	Providers ProvidersRaw
 }
 
 // globalConfigRaw is the on-disk YAML representation with duration as string.
 type globalConfigRaw struct {
-	Agent                   agentList           `yaml:"agent"`
-	ACPXPath                string              `yaml:"acpx_path"`
-	ForgejoAXIPath          string              `yaml:"forgejo_axi_path"`
-	ACPRegistryOverrides    map[string]string   `yaml:"acp_registry_overrides"`
-	AgentPathOverride       map[string]string   `yaml:"agent_path_override"`
-	AgentArgsOverride       map[string][]string `yaml:"agent_args_override"`
-	WorktreeRoots           map[string]string   `yaml:"worktree_roots"`
-	CITimeout               string              `yaml:"ci_timeout"`
-	DaemonConnectTimeout    string              `yaml:"daemon_connect_timeout"`
-	BranchSyncRemoteTimeout string              `yaml:"branch_sync_remote_timeout"`
-	BabysitTimeout          string              `yaml:"babysit_timeout"`
-	StepQuietWarning        string              `yaml:"step_quiet_warning"`
-	LogLevel                string              `yaml:"log_level"`
-	SessionReuse            *bool               `yaml:"session_reuse"`
-	AutoFix                 AutoFixRaw          `yaml:"auto_fix"`
-	CI                      CIRaw               `yaml:"ci"`
-	Commit                  CommitRaw           `yaml:"commit"`
-	Intent                  IntentRaw           `yaml:"intent"`
-	Test                    TestRaw             `yaml:"test"`
-	Eval                    EvalRaw             `yaml:"eval"`
+	Agent                   agentList                  `yaml:"agent"`
+	ACPXPath                string                     `yaml:"acpx_path"`
+	ForgejoAXIPath          string                     `yaml:"forgejo_axi_path"`
+	ACPRegistryOverrides    map[string]string          `yaml:"acp_registry_overrides"`
+	AgentPathOverride       map[string]string          `yaml:"agent_path_override"`
+	AgentArgsOverride       map[string][]string        `yaml:"agent_args_override"`
+	AgentConfig             map[string]agentProfileRaw `yaml:"agent_config"`
+	ReviewAgents            map[string]ReviewAgent     `yaml:"review_agents"`
+	WorktreeRoots           map[string]string          `yaml:"worktree_roots"`
+	CITimeout               string                     `yaml:"ci_timeout"`
+	DaemonConnectTimeout    string                     `yaml:"daemon_connect_timeout"`
+	BranchSyncRemoteTimeout string                     `yaml:"branch_sync_remote_timeout"`
+	GateReconcileInterval   string                     `yaml:"gate_reconcile_interval"`
+	GateReconcileTimeout    string                     `yaml:"gate_reconcile_timeout"`
+	BabysitTimeout          string                     `yaml:"babysit_timeout"`
+	StepQuietWarning        string                     `yaml:"step_quiet_warning"`
+	AgentTimeout            string                     `yaml:"agent_timeout"`
+	ReviewAgentTimeout      string                     `yaml:"review_agent_timeout"`
+	TestAgentTimeout        string                     `yaml:"test_agent_timeout"`
+	LogLevel                string                     `yaml:"log_level"`
+	SessionReuse            *bool                      `yaml:"session_reuse"`
+	AutoFix                 AutoFixRaw                 `yaml:"auto_fix"`
+	CI                      CIRaw                      `yaml:"ci"`
+	Commit                  CommitRaw                  `yaml:"commit"`
+	Intent                  IntentRaw                  `yaml:"intent"`
+	Test                    TestRaw                    `yaml:"test"`
+	Eval                    EvalRaw                    `yaml:"eval"`
+	ForgeProfiles           ForgeProfiles              `yaml:"forge_profiles"`
+	Providers               ProvidersRaw               `yaml:"providers"`
 }
+
+// ForgeProfile selects one isolated provider CLI configuration directory.
+// ExpectedLogin optionally pins the account the profile must be signed in as;
+// resolution fails closed when the profile's active login differs. It carries
+// an account name only, never credentials.
+type ForgeProfile struct {
+	GHConfigDir   string `yaml:"gh_config_dir"`
+	GLabConfigDir string `yaml:"glab_config_dir"`
+	ExpectedLogin string `yaml:"expected_login"`
+}
+
+// ForgeProfiles maps a remote host token to its machine-local provider profile.
+type ForgeProfiles map[string]ForgeProfile
 
 // RepoConfig represents .no-mistakes.yaml in a repo root.
 type RepoConfig struct {
@@ -159,22 +240,34 @@ type RepoConfig struct {
 	Agents         []types.AgentName `yaml:"-"`
 	Commands       Commands          `yaml:"commands"`
 	IgnorePatterns []string          `yaml:"ignore_patterns"`
+	// ProtectedPaths prevents automatic staging of dirty matching paths. It is
+	// trusted-only, regardless of allow_repo_commands, so a pushed branch cannot
+	// remove the maintainer's protection from its own fixes.
+	ProtectedPaths []string `yaml:"protected_paths"`
 	// AllowRepoCommands opts in to honoring the code-executing selection
-	// fields (commands.{test,lint,format} and agent) from a contributor's
+	// fields (commands.{prepare,test,lint,format} and agent) from a contributor's
 	// pushed branch instead of the trusted default-branch copy. It is read
 	// ONLY from the trusted default-branch copy of .no-mistakes.yaml (never
 	// the pushed SHA), so a contributor cannot self-enable. Default false:
 	// the pushed branch controls nothing that executes.
 	AllowRepoCommands bool `yaml:"allow_repo_commands"`
-	// PR carries pull-request routing settings. BaseBranch controls where a PR
-	// lands, so EffectiveRepoConfig treats it as trusted-only unless the
-	// repository explicitly opts into pushed settings.
+	// PR carries pull-request settings. BaseBranch controls where a PR lands,
+	// Template and PublishIntent control trusted publication policy, and
+	// TitleFormat controls repository title convention. EffectiveRepoConfig keeps
+	// BaseBranch trusted-only unless the repository opts into pushed settings,
+	// leaves TitleFormat on the pushed branch, and keeps Template and
+	// PublishIntent trusted-only.
 	AutoFix AutoFixRaw `yaml:"auto_fix"`
 	CI      CIRaw      `yaml:"ci"`
 	Commit  CommitRaw  `yaml:"commit"`
 	Intent  IntentRaw  `yaml:"intent"`
 	Test    TestRaw    `yaml:"test"`
 	PR      PRRaw      `yaml:"pr"`
+	// Providers carries provider-specific settings. Repo values overlay the
+	// global ones field by field. Every field is opt-in and defaults false, and
+	// none of them gates or weakens a pipeline step, so unlike the trusted-only
+	// fields below they are read from the pushed branch.
+	Providers ProvidersRaw `yaml:"providers"`
 	// Document carries the repository's documentation placement policy. It
 	// steers the document step's gate prompt, so it is honored ONLY from the
 	// trusted default-branch copy of .no-mistakes.yaml (see
@@ -188,6 +281,18 @@ type RepoConfig struct {
 	// pushed branch must not be able to inject or weaken the guidance that
 	// reviews it.
 	Review ReviewRaw `yaml:"review"`
+	// Gates are repository-declared extra checks that run immediately after
+	// their anchor core step. They are additive only: a gate cannot skip,
+	// reorder, or replace a core step, and a failing gate parks for an operator
+	// decision.
+	// A gate executes shell on the daemon host, so it is honored ONLY from the
+	// trusted default-branch copy of .no-mistakes.yaml (see
+	// EffectiveRepoConfig), regardless of
+	// allow_repo_commands: unlike commands.{test,lint,format}, which a
+	// maintainer can opt into reading from a pushed branch because they only
+	// re-run that branch's own suite, a gate defines what validating the branch
+	// MEANS, and a contributor must not author the check that clears them.
+	Gates []Gate `yaml:"gates"`
 	// DisableProjectSettings opts the repository out of loading project-level
 	// agent settings/instructions (AGENTS.md/CLAUDE.md and the equivalent
 	// per-harness project settings) into gate agents. It exists for
@@ -236,6 +341,13 @@ type PRRaw struct {
 	// repository explicitly opts into pushed-branch settings with
 	// allow_repo_commands.
 	BaseBranch string `yaml:"base_branch"`
+	// Template and PublishIntent are repository-only publication policy. Both
+	// remain trusted-only even when allow_repo_commands is enabled.
+	Template      string `yaml:"template"`
+	PublishIntent *bool  `yaml:"publish_intent"`
+	// TitleFormat controls PR title rendering when set. It is a non-executing
+	// repository convention and is therefore read from the pushed branch.
+	TitleFormat *string `yaml:"title_format"`
 }
 
 // PathInstruction is one glob-scoped block of review guidance. Path follows the
@@ -348,20 +460,23 @@ func RenderedInstructions(instructions string) string {
 
 func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	type repoConfigRaw struct {
-		Agent                  agentList   `yaml:"agent"`
-		Commands               Commands    `yaml:"commands"`
-		IgnorePatterns         []string    `yaml:"ignore_patterns"`
-		AllowRepoCommands      bool        `yaml:"allow_repo_commands"`
-		AutoFix                AutoFixRaw  `yaml:"auto_fix"`
-		CI                     CIRaw       `yaml:"ci"`
-		Commit                 CommitRaw   `yaml:"commit"`
-		Intent                 IntentRaw   `yaml:"intent"`
-		Test                   TestRaw     `yaml:"test"`
-		PR                     PRRaw       `yaml:"pr"`
-		Document               DocumentRaw `yaml:"document"`
-		Review                 ReviewRaw   `yaml:"review"`
-		DisableProjectSettings bool        `yaml:"disable_project_settings"`
-		NoCI                   bool        `yaml:"no_ci"`
+		Agent                  agentList    `yaml:"agent"`
+		Commands               Commands     `yaml:"commands"`
+		IgnorePatterns         []string     `yaml:"ignore_patterns"`
+		ProtectedPaths         []string     `yaml:"protected_paths"`
+		AllowRepoCommands      bool         `yaml:"allow_repo_commands"`
+		AutoFix                AutoFixRaw   `yaml:"auto_fix"`
+		CI                     CIRaw        `yaml:"ci"`
+		Commit                 CommitRaw    `yaml:"commit"`
+		Intent                 IntentRaw    `yaml:"intent"`
+		Test                   TestRaw      `yaml:"test"`
+		PR                     PRRaw        `yaml:"pr"`
+		Document               DocumentRaw  `yaml:"document"`
+		Review                 ReviewRaw    `yaml:"review"`
+		Gates                  []Gate       `yaml:"gates"`
+		DisableProjectSettings bool         `yaml:"disable_project_settings"`
+		NoCI                   bool         `yaml:"no_ci"`
+		Providers              ProvidersRaw `yaml:"providers"`
 	}
 	var raw repoConfigRaw
 	if err := value.Decode(&raw); err != nil {
@@ -371,6 +486,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.Agents = copyAgents(raw.Agent)
 	c.Commands = raw.Commands
 	c.IgnorePatterns = raw.IgnorePatterns
+	c.ProtectedPaths = raw.ProtectedPaths
 	c.AllowRepoCommands = raw.AllowRepoCommands
 	c.AutoFix = raw.AutoFix
 	c.CI = raw.CI
@@ -380,16 +496,19 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.PR = raw.PR
 	c.Document = raw.Document
 	c.Review = raw.Review
+	c.Gates = raw.Gates
 	c.DisableProjectSettings = raw.DisableProjectSettings
 	c.NoCI = raw.NoCI
+	c.Providers = raw.Providers
 	return nil
 }
 
 // Commands holds optional per-repo command overrides.
 type Commands struct {
-	Lint   string `yaml:"lint"`
-	Test   string `yaml:"test"`
-	Format string `yaml:"format"`
+	Prepare string `yaml:"prepare"`
+	Lint    string `yaml:"lint"`
+	Test    string `yaml:"test"`
+	Format  string `yaml:"format"`
 }
 
 // AutoFixRaw is the YAML representation of auto-fix config.
@@ -408,6 +527,10 @@ type AutoFixRaw struct {
 // Pointer fields distinguish "not set" (nil) from "set to 0" (disabled).
 type CIRaw struct {
 	RerunTransient *int `yaml:"rerun_transient"`
+	// RevalidateRepairs is a pointer so an explicit `false` in a repository's
+	// config can override a global `true`, which a plain bool could not
+	// express (it would be indistinguishable from "not set").
+	RevalidateRepairs *bool `yaml:"revalidate_repairs"`
 }
 
 // CI holds the resolved CI-step settings.
@@ -418,6 +541,33 @@ type CI struct {
 	// an approval gate. 0 disables reruns and restores the behavior of
 	// escalating every failure on sight.
 	RerunTransient int
+	// RevalidateRepairs selects what happens after the CI step's fix agent
+	// produces a real repair commit.
+	//
+	// One rule decides delivery on every CI-fix path, automatic and manual, CI
+	// failure and merge conflict alike: a repair is published without
+	// revalidating only when its continuity with the reviewed, published head
+	// can be PROVEN - the repaired head is the run's review-approved commit or
+	// a descendant of it - and revalidates from Review when it cannot.
+	//
+	// false (default): a provable repair is published through the same guarded
+	// force-push path the Push step uses - review-approved-head continuity, the
+	// force-with-lease anchor, remote verification, the gate mirror, and the
+	// push binding all still apply, and none of it is recorded until all of it
+	// succeeds - and the CI monitor keeps watching the same run for the new
+	// head. The run's review approval stays valid because the repair descends
+	// from the approved head. A repair whose continuity cannot be proven takes
+	// the revalidating path below instead; a merge-conflict repair always does,
+	// because a rebase makes its head a non-descendant and resolving a conflict
+	// changes the commit's patch-id, so no content-based guard can tell a
+	// resolved rebase from one that dropped the work.
+	//
+	// true: the repair is kept local, the run's review approval is revoked,
+	// and the pipeline restarts at Review so the repaired head re-passes
+	// Review, Test, Document, and Lint before Push republishes it. Safer, and
+	// materially more expensive in wall-clock time and tokens - which is why
+	// it is opt-in (see VISION.md).
+	RevalidateRepairs bool
 }
 
 // AutoFix holds resolved per-step auto-fix attempt limits.
@@ -444,21 +594,34 @@ type Config struct {
 	ACPRegistryOverrides  map[string]string
 	AgentPathOverride     map[string]string
 	AgentArgsOverride     map[string][]string
+	AgentConfig           map[string]agentcfg.Profile
+	ReviewAgents          map[string]ReviewAgent
 	CITimeout             time.Duration
 	StepQuietWarning      time.Duration
+	AgentTimeout          time.Duration
+	ReviewAgentTimeout    time.Duration
+	TestAgentTimeout      time.Duration
+	GateReconcileInterval time.Duration
+	GateReconcileTimeout  time.Duration
 	LogLevel              string
 	SessionReuse          bool
 	Eval                  Eval
 	Commands              Commands
-	IgnorePatterns        []string
-	AutoFix               AutoFix
-	CI                    CI
-	Commit                Commit
-	Intent                Intent
-	Test                  Test
-	Document              Document
-	Review                Review
-	PR                    PR
+	// Gates are the repository's extra checks, already trusted-only by the
+	// time they reach here (EffectiveRepoConfig sourced them from the trusted
+	// default-branch copy).
+	Gates          []Gate
+	IgnorePatterns []string
+	ProtectedPaths []string
+	AutoFix        AutoFix
+	CI             CI
+	Commit         Commit
+	Intent         Intent
+	Test           Test
+	Document       Document
+	Review         Review
+	PR             PR
+	ForgeProfiles  ForgeProfiles
 	// DisableProjectSettings is the resolved, trusted-only opt-out (see the
 	// RepoConfig field). When true, gate agents are launched with their
 	// project-level settings/instructions suppressed; the daemon fails the run
@@ -468,11 +631,87 @@ type Config struct {
 	// intentionally has no CI (see the RepoConfig field). When true and the
 	// forge reports zero checks, the CI monitor treats that as all-checks-passed.
 	NoCI bool
+	// Providers holds the resolved provider-specific settings.
+	Providers Providers
+}
+
+// ProvidersRaw is the YAML representation of provider-specific settings,
+// keyed by provider name so new providers can be added without reshaping
+// existing config.
+type ProvidersRaw struct {
+	GitHub      GitHubProviderRaw      `yaml:"github"`
+	GitLab      GitLabProviderRaw      `yaml:"gitlab"`
+	Bitbucket   BitbucketProviderRaw   `yaml:"bitbucket"`
+	AzureDevOps AzureDevOpsProviderRaw `yaml:"azuredevops"`
+}
+
+// GitHubProviderRaw is the YAML representation of GitHub provider settings.
+// Pointer fields distinguish "not set" (nil) from an explicit false.
+type GitHubProviderRaw struct {
+	DraftPullRequests *bool `yaml:"draft_pull_requests"`
+}
+
+// GitLabProviderRaw is the YAML representation of GitLab provider settings.
+// Pointer fields distinguish "not set" (nil) from an explicit false.
+type GitLabProviderRaw struct {
+	DraftPullRequests *bool `yaml:"draft_pull_requests"`
+}
+
+// BitbucketProviderRaw is the YAML representation of Bitbucket provider settings.
+// Pointer fields distinguish "not set" (nil) from an explicit false.
+type BitbucketProviderRaw struct {
+	DraftPullRequests *bool `yaml:"draft_pull_requests"`
+}
+
+// AzureDevOpsProviderRaw is the YAML representation of Azure DevOps provider
+// settings. Pointer fields distinguish "not set" (nil) from an explicit false.
+type AzureDevOpsProviderRaw struct {
+	DraftPullRequests *bool `yaml:"draft_pull_requests"`
+}
+
+// Providers holds resolved provider-specific settings.
+type Providers struct {
+	GitHub      GitHubProvider
+	GitLab      GitLabProvider
+	Bitbucket   BitbucketProvider
+	AzureDevOps AzureDevOpsProvider
+}
+
+// GitHubProvider holds resolved GitHub provider settings.
+type GitHubProvider struct {
+	// DraftPullRequests opens created GitHub PRs as drafts
+	// (gh pr create --draft). Default false.
+	DraftPullRequests bool
+}
+
+// GitLabProvider holds resolved GitLab provider settings.
+type GitLabProvider struct {
+	// DraftPullRequests opens created GitLab MRs as drafts
+	// (glab mr create --draft). Default false.
+	DraftPullRequests bool
+}
+
+// BitbucketProvider holds resolved Bitbucket provider settings.
+type BitbucketProvider struct {
+	// DraftPullRequests opens created Bitbucket PRs as drafts
+	// ("draft": true in the create-PR request body). Default false.
+	DraftPullRequests bool
+}
+
+// AzureDevOpsProvider holds resolved Azure DevOps provider settings.
+type AzureDevOpsProvider struct {
+	// DraftPullRequests opens created Azure DevOps PRs as drafts
+	// (az repos pr create --draft true). Default false.
+	DraftPullRequests bool
 }
 
 // PR is the resolved pull-request configuration.
 type PR struct {
 	BaseBranch string
+	Template   string
+	// Nil preserves the historical default: publish the extracted intent.
+	PublishIntent *bool
+	TitleFormat   string
 }
 
 // Document is the resolved document-step config. Instructions come from the
@@ -492,12 +731,27 @@ type Review struct {
 // TestRaw is the YAML representation of test-step settings.
 type TestRaw struct {
 	Evidence EvidenceRaw `yaml:"evidence"`
+	// Instructions is the repository's live-validation runbook: how to stand
+	// the product up in an isolated environment so the test step can drive
+	// end-user scenarios against the real thing. It is injected into the test
+	// gate's prompt, so like document.instructions it is honored ONLY from the
+	// trusted default-branch copy of .no-mistakes.yaml (see
+	// EffectiveRepoConfig): a contributor's pushed branch must not be able to
+	// rewrite the runbook the agent that validates it follows.
+	Instructions string `yaml:"instructions"`
 }
 
 // EvidenceRaw is the YAML representation of test-evidence settings.
 // Pointer fields distinguish "not set" (nil) from explicit zero/false values.
 type EvidenceRaw struct {
-	StoreInRepo *bool   `yaml:"store_in_repo"`
+	StoreInRepo *bool `yaml:"store_in_repo"`
+	// AttachMedia uploads image and video evidence to GitHub user-attachments
+	// when the PR body is rendered. It defaults on so default-config PRs stop
+	// citing local disk paths for screenshots; set false to opt out. The
+	// orphan-branch store (store_in_repo) is independent: when both are on,
+	// the PR body carries both the commit-pinned link and the attachment.
+	// Like store_in_repo, this is pushed-readable.
+	AttachMedia *bool   `yaml:"attach_media"`
 	Dir         *string `yaml:"dir"`
 	// Branch selects the orphan evidence branch. It names a git ref the
 	// daemon pushes to with the maintainer's credentials, so it is honored
@@ -520,19 +774,24 @@ type EvidenceRaw struct {
 	MaxRuns   *int    `yaml:"max_runs"`
 }
 
-// Test is the resolved test-step config.
+// Test is the resolved test-step config. Instructions comes from the trusted
+// default-branch repo config only (see TestRaw).
 type Test struct {
-	Evidence Evidence
+	Evidence     Evidence
+	Instructions string
 }
 
 // Evidence is the resolved test-evidence config. When StoreInRepo is true, the
 // run publishes its evidence artifacts to the orphan Branch of the same
 // repository, under Dir, and links them from the pull request body. Evidence
 // never enters the pushed code branch, so it never reaches the default
-// branch's history. Otherwise evidence stays on local disk under LocalRoot,
-// referenced only by local path.
+// branch's history. Otherwise evidence stays on local disk under LocalRoot.
+// AttachMedia (default true) additionally uploads image and video artifacts to
+// GitHub user-attachments at PR render time so remote reviewers can open them
+// without an evidence branch. Text artifacts stay inlined or locally cited.
 type Evidence struct {
 	StoreInRepo bool
+	AttachMedia bool
 	Dir         string
 	Branch      string
 	// LocalRoot overrides the app-root default for on-disk evidence; empty
@@ -565,8 +824,9 @@ type EvalRaw struct {
 // configuration is a point-in-time snapshot that no longer exists anywhere.
 //
 // AutoCapture is the downstream half: it freezes each finished run's review
-// passes into the local corpus without anyone running a command. It has no
-// effect while CaptureProvenance is off, since there is nothing to freeze.
+// passes into the local corpus without anyone running a command and labels
+// repaired CI findings as false-negative gold. It has no effect while
+// CaptureProvenance is off, since there is nothing to freeze.
 type Eval struct {
 	CaptureProvenance bool
 	AutoCapture       bool
@@ -705,6 +965,21 @@ ci_timeout: "168h"
 # only; it never cancels work.
 step_quiet_warning: "10m"
 
+# Maximum wall-clock time for one pipeline agent invocation that does not
+# install a more specific deadline (document, lint, rebase, PR, CI-fix, and
+# auto-fix). A stalled agent fails the run instead of leaving it active.
+agent_timeout: "30m"
+
+# Absolute wall-clock limit for one Review agent invocation. Each optional
+# fixer and each fresh independent rereviewer receives a new full limit.
+# Activity is reported at expiry but does not reset this hard safety bound.
+review_agent_timeout: "30m"
+
+# Maximum wall-clock time for one Test-step agent invocation, including the
+# post-test evidence-gathering turn. A stalled test agent fails the run instead
+# of leaving it active.
+test_agent_timeout: "30m"
+
 # Maximum time a CLI client waits for an existing daemon socket to accept a
 # connection before failing instead of hanging.
 daemon_connect_timeout: "3s"
@@ -713,10 +988,17 @@ daemon_connect_timeout: "3s"
 # (ls-remote or fetch) before treating the target as offline. Global-only.
 branch_sync_remote_timeout: "60s"
 
+# How often a parked approval gate is rechecked, and the deadline for each
+# check (including gh auth status). Raise gate_reconcile_timeout on a slow or
+# contended machine so a transient auth-status delay is not cancelled mid-call.
+# Global-only.
+gate_reconcile_interval: "2m"
+gate_reconcile_timeout: "30s"
+
 # Reuse one durable fixer session per run across review-fix turns. Review turns
 # always run session-free so a rereview never resumes the session that prescribed
-# its fixes. Supported for claude, codex, and grok; other agents run cold. Set false to
-# force every agent invocation cold.
+# its fixes. Supported for claude, codex, grok, and pi; other agents run cold.
+# Set false to force every agent invocation cold.
 session_reuse: true
 
 # Log level for daemon output
@@ -729,8 +1011,30 @@ log_level: info
 #   codex: /opt/codex
 #   grok: /Users/you/.grok/bin/grok
 
+# Model and reasoning effort per agent, in one common spelling (optional, global
+# only). no-mistakes maps these down to whatever the harness actually uses:
+# --model/--effort for claude and copilot, -m plus -c model_reasoning_effort for
+# codex, --model/--reasoning-effort for grok, --model/--thinking for pi, the
+# session-message body for opencode (its model needs the provider/model form),
+# and acpx --model for cursor and acp:<target>. Effort is one of
+# minimal, low, medium, high, xhigh, max; a harness rejects any level it does not
+# implement. rovodev and antigravity expose no mechanism no-mistakes can set, so
+# agent_config is refused for them; agent_args_override remains an escape hatch
+# only if your installed CLI build accepts a suitable flag.
+# agent_config:
+#   codex:
+#     model: gpt-5.4
+#     effort: low
+#   claude:
+#     model: sonnet
+#     effort: high
+#   opencode:
+#     model: openai/gpt-5
+#
 # Extra native agent CLI flags (optional, global only)
 # Codex service_tier controls speed/priority; model_reasoning_effort controls reasoning depth.
+# A flag here always wins over the same knob in agent_config, so an existing
+# override keeps its exact behavior.
 # agent_args_override:
 #   codex:
 #     - -m
@@ -773,11 +1077,28 @@ auto_fix:
 # default branch overrides this value.
 ci:
   rerun_transient: 0
+  # Whether EVERY CI repair must re-pass the whole pipeline before it is
+  # published, or only the ones whose continuity with the reviewed head cannot
+  # be proven. Defaults to false: a repair that descends from the reviewed head
+  # is published through the same guarded force-push path the Push step uses and
+  # CI keeps monitoring, so one repair costs one agent round. A repair that
+  # cannot show that ancestry revalidates from Review anyway - a merge-conflict
+  # repair always does, because rebasing rewrites the head. Set true to restart
+  # validation at Review for every repair - safer, and it pays for another full
+  # pipeline pass in wall clock and tokens every time CI is repaired. A
+  # repository that sets ci.revalidate_repairs on its own default branch
+  # overrides this value.
+  revalidate_repairs: false
 
-# Auto-fix commit subject template. Available variables: {{.Step}} and {{.Summary}}.
-# Repo config may override this value.
+# Auto-fix commit subject template. Available variables: {{.Step}}, {{.Summary}}, and {{.Branch}}.
+# {{.Branch}} is the normalized branch name, or the only capture group from
+# branch_pattern when configured. A branch pattern with no match fails safely.
+# Repo config may override these values.
 # commit:
+#   branch_pattern: '([A-Z]+-[0-9]+)'
 #   fix_message: "no-mistakes({{.Step}}): {{.Summary}}"
+# To use the captured identifier in the subject, replace fix_message with:
+#   fix_message: "{{.Branch}}: {{.Summary}}"
 
 # User-intent extraction. When you push a branch, no-mistakes can read recent
 # transcripts from your local agent (Claude Code, Codex, OpenCode, Rovo Dev, Pi,
@@ -792,11 +1113,14 @@ intent:
 
 # Test-step evidence artifacts (screenshots, recordings, logs the test step
 # gathers to demonstrate the change works). By default they are kept on local
-# disk under <NM_HOME>/evidence and referenced by local path. Opt in to
-# store_in_repo to publish them to an orphan evidence branch in the same
-# repository and link them from the PR body. The evidence branch shares no
-# history with your code branches, so artifacts never enter the pushed branch or
-# the default branch.
+# disk under <NM_HOME>/evidence. attach_media (default true) uploads image and
+# video artifacts to GitHub user-attachments when the PR is rendered so remote
+# reviewers can open them; text artifacts stay inlined. Opt in to
+# store_in_repo to also publish the full directory to an orphan evidence branch
+# in the same repository and link it from the PR body. The evidence branch
+# shares no history with your code branches, so artifacts never enter the
+# pushed branch or the default branch. When both are on, the PR body carries
+# both the attachment and the commit-pinned link.
 #
 # no-mistakes reaps its own evidence rather than leaving that to an OS temp
 # directory timer: retention ages run directories out (default 14 days) and
@@ -808,6 +1132,7 @@ intent:
 # test:
 #   evidence:
 #     store_in_repo: true
+#     attach_media: true
 #     dir: .no-mistakes/evidence
 #     branch: no-mistakes/evidence
 #     local_root: /var/lib/no-mistakes/evidence
@@ -815,14 +1140,16 @@ intent:
 #     max_runs: 50
 
 # Local review evaluation corpus, used by "no-mistakes eval" to compare
-# agent+model candidates against review passes your own pipeline already made.
+# agent candidates, pinned to an explicit model and reasoning effort, against
+# review passes your own pipeline already made.
 # capture_provenance records, on every review round, the exact commits and
 # configuration a replay needs; it cannot be added afterwards, so a round
 # recorded without it is never replayable. auto_capture freezes each finished
 # run's review passes into the corpus so it fills without anyone remembering to
-# collect it. Cases of the same repository share one local object pool, so a
-# case costs its own records plus the objects its commits introduced - not a
-# copy of the repository. max_cases bounds the corpus: the oldest cases are
+# collect it, including labeling repaired ci-check and ci-review-bot findings as
+# Review false negatives. Cases of the same repository share one local object
+# pool, so a case costs its own records plus the objects its commits introduced
+# - not a copy of the repository. max_cases bounds the corpus: the oldest cases are
 # dropped first, and a case that already has recorded replays is never dropped.
 # Set max_cases to 0 to keep every case. diversified_size caps the official
 # gold-only eval set (default 32); 0 means one gold case per stratum. Unlabeled
@@ -833,20 +1160,31 @@ eval:
   auto_capture: true
   max_cases: 200
   diversified_size: 32
+
+# Provider-specific settings. Opt in to opening created PRs/MRs as drafts.
+# providers:
+#   github:
+#     draft_pull_requests: true
+#   gitlab:
+#     draft_pull_requests: true
+#   bitbucket:
+#     draft_pull_requests: true
+#   azuredevops:
+#     draft_pull_requests: true
 `
 
 // defaultBinary maps agent names to their default binary names.
 var defaultBinary = map[types.AgentName]string{
-	types.AgentClaude:   "claude",
-	types.AgentCodex:    "codex",
-	types.AgentGrok:     "grok",
-	types.AgentRovoDev:  "acli",
-	types.AgentOpenCode: "opencode",
-	types.AgentPi:       "pi",
-	types.AgentCopilot:  "copilot",
+	types.AgentClaude:      "claude",
+	types.AgentCodex:       "codex",
+	types.AgentGrok:        "grok",
+	types.AgentRovoDev:     "acli",
+	types.AgentOpenCode:    "opencode",
+	types.AgentPi:          "pi",
+	types.AgentCopilot:     "copilot",
+	types.AgentAntigravity: "agy",
 }
 
-// nativeAgentProbeOrder is the priority order for auto-detecting native agents.
 var nativeAgentProbeOrder = []types.AgentName{
 	types.AgentClaude,
 	types.AgentCodex,
@@ -855,6 +1193,7 @@ var nativeAgentProbeOrder = []types.AgentName{
 	types.AgentRovoDev,
 	types.AgentPi,
 	types.AgentCopilot,
+	types.AgentAntigravity,
 }
 
 func isACPAgent(name types.AgentName) bool {
@@ -1040,7 +1379,7 @@ func (c *Config) resolveConfiguredAgent(ctx context.Context, name types.AgentNam
 		return resolved, err == nil, "auto", err
 	}
 	if _, ok := defaultBinary[name]; !ok && !isACPAgent(name) {
-		return "", false, string(name), fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, grok, rovodev, opencode, pi, copilot, cursor, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
+		return "", false, string(name), fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, grok, rovodev, opencode, pi, copilot, cursor, antigravity, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
 	}
 	if isACPAgent(name) {
 		available, bins, err := c.acpAvailable(name, lookPath)
@@ -1192,22 +1531,92 @@ func (c *Config) AgentArgsFor(name types.AgentName) []string {
 	return c.AgentArgsOverride[string(name)]
 }
 
+// AgentProfile returns the harness-neutral model/effort selection for the
+// configured agent, as declared in agent_config. The zero Profile means the
+// harness keeps its own defaults.
+func (c *Config) AgentProfile() agentcfg.Profile {
+	return c.AgentProfileFor(c.Agent)
+}
+
+func (c *Config) AgentProfileFor(name types.AgentName) agentcfg.Profile {
+	if c.AgentConfig == nil {
+		return agentcfg.Profile{}
+	}
+	return c.AgentConfig[string(name)]
+}
+
+// agentProfileRaw is the on-disk YAML shape of one agent_config entry. Effort
+// is a string here so an invalid level is reported as a config error naming the
+// valid vocabulary rather than decoding into a value no harness accepts.
+type agentProfileRaw struct {
+	Model  string `yaml:"model"`
+	Effort string `yaml:"effort"`
+}
+
+// parseAgentConfig validates the agent_config map and resolves it to
+// harness-neutral profiles. Every knob is checked against what the named
+// harness can actually express, so an unmappable request fails at load rather
+// than being silently dropped at run time.
+func parseAgentConfig(raw map[string]agentProfileRaw) (map[string]agentcfg.Profile, error) {
+	profiles := make(map[string]agentcfg.Profile, len(raw))
+	for name, entry := range raw {
+		agentName := types.AgentName(name)
+		if !agentcfg.Known(agentName) {
+			return nil, fmt.Errorf("invalid agent name in agent_config: %q (valid: %s, cursor, acp:<target>)", name, strings.Join(agentNamesText(agentcfg.Agents()), ", "))
+		}
+		effort, err := agentcfg.ParseEffort(entry.Effort)
+		if err != nil {
+			return nil, fmt.Errorf("invalid agent_config.%s: %w", name, err)
+		}
+		profile := agentcfg.Profile{Model: strings.TrimSpace(entry.Model), Effort: effort}
+		if err := agentcfg.Validate(agentName, profile); err != nil {
+			return nil, fmt.Errorf("invalid agent_config.%s: %w", name, err)
+		}
+		if profile.IsZero() {
+			continue
+		}
+		profiles[name] = profile
+	}
+	if len(profiles) == 0 {
+		return nil, nil
+	}
+	return profiles, nil
+}
+
+func agentNamesText(names []types.AgentName) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, string(name))
+	}
+	return out
+}
+
 // agentArgsOverrideAgents lists native agent names accepted as keys in
 // agent_args_override.
 var agentArgsOverrideAgents = map[string]bool{
-	string(types.AgentClaude):   true,
-	string(types.AgentCodex):    true,
-	string(types.AgentGrok):     true,
-	string(types.AgentRovoDev):  true,
-	string(types.AgentOpenCode): true,
-	string(types.AgentPi):       true,
-	string(types.AgentCopilot):  true,
+	string(types.AgentClaude):      true,
+	string(types.AgentCodex):       true,
+	string(types.AgentGrok):        true,
+	string(types.AgentRovoDev):     true,
+	string(types.AgentOpenCode):    true,
+	string(types.AgentPi):          true,
+	string(types.AgentCopilot):     true,
+	string(types.AgentAntigravity): true,
 }
 
 // reservedAgentArgs lists flags that no-mistakes manages internally and that
 // users cannot override through agent_args_override. A flag is matched by its
 // bare form (e.g. "--color") as well as the "--color=value" form.
 var reservedAgentArgs = map[string]map[string]bool{
+	string(types.AgentAntigravity): {
+		"--dangerously-skip-permissions": true,
+		"--print":                        true,
+		"--json-schema":                  true,
+		"--output-format":                true,
+		"--conversation":                 true,
+		"-c":                             true,
+		"--continue":                     true,
+	},
 	string(types.AgentClaude): {
 		"-p":              true,
 		"--print":         true,
@@ -1274,6 +1683,13 @@ var reservedAgentArgs = map[string]map[string]bool{
 	string(types.AgentPi): {
 		"--mode":       true,
 		"--no-session": true,
+		"-c":           true,
+		"--continue":   true,
+		"-r":           true,
+		"--resume":     true,
+		"--session":    true,
+		"--session-id": true,
+		"--fork":       true,
 	},
 	string(types.AgentCopilot): {
 		"-p":              true,
@@ -1289,7 +1705,7 @@ var reservedAgentArgs = map[string]map[string]bool{
 func validateAgentArgsOverride(override map[string][]string) error {
 	for name, args := range override {
 		if !agentArgsOverrideAgents[name] {
-			return fmt.Errorf("invalid agent name in agent_args_override: %q (valid: claude, codex, grok, rovodev, opencode, pi, copilot)", name)
+			return fmt.Errorf("invalid agent name in agent_args_override: %q (valid: claude, codex, grok, rovodev, opencode, pi, copilot, antigravity)", name)
 		}
 		reserved := reservedAgentArgs[name]
 		for i, arg := range args {
@@ -1394,8 +1810,13 @@ func DefaultGlobalConfig() *GlobalConfig {
 		ForgejoAXIPath:          "forgejo-axi",
 		CITimeout:               DefaultCITimeout,
 		StepQuietWarning:        DefaultStepQuietWarning,
+		AgentTimeout:            DefaultAgentTimeout,
+		ReviewAgentTimeout:      DefaultReviewAgentTimeout,
+		TestAgentTimeout:        DefaultTestAgentTimeout,
 		DaemonConnectTimeout:    DefaultDaemonConnectTimeout,
 		BranchSyncRemoteTimeout: DefaultBranchSyncRemoteTimeout,
+		GateReconcileInterval:   DefaultGateReconcileInterval,
+		GateReconcileTimeout:    DefaultGateReconcileTimeout,
 		LogLevel:                "info",
 		SessionReuse:            true,
 		Eval:                    evalDefaults(),
@@ -1591,6 +2012,17 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		}
 		cfg.AgentArgsOverride = raw.AgentArgsOverride
 	}
+	if raw.AgentConfig != nil {
+		profiles, err := parseAgentConfig(raw.AgentConfig)
+		if err != nil {
+			return nil, err
+		}
+		cfg.AgentConfig = profiles
+	}
+	if err := validateReviewAgents(raw.ReviewAgents); err != nil {
+		return nil, err
+	}
+	cfg.ReviewAgents = raw.ReviewAgents
 	if raw.WorktreeRoots != nil {
 		if err := ValidateWorktreeRoots(raw.WorktreeRoots); err != nil {
 			return nil, err
@@ -1617,6 +2049,27 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 			cfg.StepQuietWarning = d
 		}
 	}
+	if raw.AgentTimeout != "" {
+		d, err := parsePositiveDuration("agent_timeout", raw.AgentTimeout)
+		if err != nil {
+			return nil, err
+		}
+		cfg.AgentTimeout = d
+	}
+	if raw.ReviewAgentTimeout != "" {
+		d, err := parsePositiveDuration("review_agent_timeout", raw.ReviewAgentTimeout)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ReviewAgentTimeout = d
+	}
+	if raw.TestAgentTimeout != "" {
+		d, err := parsePositiveDuration("test_agent_timeout", raw.TestAgentTimeout)
+		if err != nil {
+			return nil, err
+		}
+		cfg.TestAgentTimeout = d
+	}
 	if raw.DaemonConnectTimeout != "" {
 		d, err := parsePositiveDuration("daemon_connect_timeout", raw.DaemonConnectTimeout)
 		if err != nil {
@@ -1631,11 +2084,32 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 		}
 		cfg.BranchSyncRemoteTimeout = d
 	}
+	if raw.GateReconcileInterval != "" {
+		d, err := parsePositiveDuration("gate_reconcile_interval", raw.GateReconcileInterval)
+		if err != nil {
+			return nil, err
+		}
+		cfg.GateReconcileInterval = d
+	}
+	if raw.GateReconcileTimeout != "" {
+		d, err := parsePositiveDuration("gate_reconcile_timeout", raw.GateReconcileTimeout)
+		if err != nil {
+			return nil, err
+		}
+		cfg.GateReconcileTimeout = d
+	}
 	if raw.LogLevel != "" {
 		cfg.LogLevel = raw.LogLevel
 	}
 	if raw.SessionReuse != nil {
 		cfg.SessionReuse = *raw.SessionReuse
+	}
+	if raw.ForgeProfiles != nil {
+		profiles, err := normalizeForgeProfiles(raw.ForgeProfiles)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ForgeProfiles = profiles
 	}
 	if raw.AutoFix.CI == nil {
 		raw.AutoFix.CI = raw.AutoFix.Babysit
@@ -1645,9 +2119,63 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	cfg.Commit = raw.Commit
 	cfg.Intent = raw.Intent
 	cfg.Test = raw.Test
+	cfg.Providers = raw.Providers
 	applyEvalOverrides(&cfg.Eval, &raw.Eval)
 
 	return cfg, nil
+}
+
+func normalizeForgeProfiles(raw ForgeProfiles) (ForgeProfiles, error) {
+	profiles := make(ForgeProfiles, len(raw))
+	for host, profile := range raw {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host == "" {
+			return nil, fmt.Errorf("invalid forge_profiles: host must not be empty")
+		}
+		if _, exists := profiles[host]; exists {
+			return nil, fmt.Errorf("invalid forge_profiles: duplicate host %q after case normalization", host)
+		}
+		ghDir := strings.TrimSpace(profile.GHConfigDir)
+		glabDir := strings.TrimSpace(profile.GLabConfigDir)
+		if (ghDir == "") == (glabDir == "") {
+			return nil, fmt.Errorf("invalid forge_profiles.%s: exactly one of gh_config_dir or glab_config_dir is required", host)
+		}
+		profile.GHConfigDir = ghDir
+		profile.GLabConfigDir = glabDir
+		profile.ExpectedLogin = strings.TrimSpace(profile.ExpectedLogin)
+		if ghDir != "" {
+			normalized, err := normalizeForgeProfilePath(ghDir)
+			if err != nil {
+				return nil, fmt.Errorf("invalid forge_profiles.%s.gh_config_dir: %w", host, err)
+			}
+			profile.GHConfigDir = normalized
+		} else {
+			normalized, err := normalizeForgeProfilePath(glabDir)
+			if err != nil {
+				return nil, fmt.Errorf("invalid forge_profiles.%s.glab_config_dir: %w", host, err)
+			}
+			profile.GLabConfigDir = normalized
+		}
+		profiles[host] = profile
+	}
+	return profiles, nil
+}
+
+func normalizeForgeProfilePath(value string) (string, error) {
+	if strings.HasPrefix(value, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		if home == "" {
+			return "", fmt.Errorf("resolve home directory: empty path")
+		}
+		return filepath.Clean(filepath.Join(home, filepath.FromSlash(strings.TrimPrefix(value, "~/")))), nil
+	}
+	if !filepath.IsAbs(value) {
+		return "", fmt.Errorf("path must be absolute or start with ~/")
+	}
+	return filepath.Clean(value), nil
 }
 
 // parseCITimeout interprets the ci_timeout config value. The keyword
@@ -1716,7 +2244,20 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	if err := validateReviewRaw(cfg.Review); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
+	for i, pattern := range cfg.ProtectedPaths {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			return nil, fmt.Errorf("protected_paths[%d] must not be empty", i)
+		}
+		if err := validatePathInstructionGlob(pattern); err != nil {
+			return nil, fmt.Errorf("protected_paths[%d] %q is not a valid glob: %w", i, pattern, err)
+		}
+		cfg.ProtectedPaths[i] = pattern
+	}
 	if err := validateTestRaw(cfg.Test); err != nil {
+		return nil, fmt.Errorf("parse repo config: %w", err)
+	}
+	if err := validateGates(cfg.Gates); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
 	cfg.PR.BaseBranch = strings.TrimSpace(cfg.PR.BaseBranch)
@@ -1736,11 +2277,18 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 // back to the repository's forge default branch" and is intentionally not
 // normalized to any particular name here.
 func validatePRRaw(pr PRRaw) error {
-	if pr.BaseBranch == "" {
-		return nil
+	if pr.BaseBranch != "" {
+		if _, err := evidence.NormalizeBranch(pr.BaseBranch); err != nil {
+			return fmt.Errorf("pr.base_branch: %w", err)
+		}
 	}
-	if _, err := evidence.NormalizeBranch(pr.BaseBranch); err != nil {
-		return fmt.Errorf("pr.base_branch: %w", err)
+	if err := ValidatePRTemplatePath(pr.Template); err != nil {
+		return err
+	}
+	if pr.TitleFormat != nil {
+		if err := validatePRTitleFormat(*pr.TitleFormat); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1815,13 +2363,16 @@ func validatePathInstructionGlob(pattern string) error {
 // trusted-only for the same reason: a pushed branch must not weaken the
 // documentation rules that gate itself. Review (the path-scoped guidance
 // injected into the review gate prompt) is trusted-only for the same reason: a
-// pushed branch must not steer the reviewer that gates it. DisableProjectSettings
+// pushed branch must not steer the reviewer that gates it. Gates (extra
+// repository-declared shell checks) are trusted-only for the same reason.
+// DisableProjectSettings
 // is also trusted-only so a pushed branch cannot enable or defeat the gate-agent
 // project-instruction boundary. NoCI is trusted-only so a pushed branch cannot
 // self-declare no-CI and bypass its own checks, and CI (the transient-rerun
 // budget) is trusted-only because every rerun it authorizes is another
 // provider-side workflow run billed to the repository. These gate-control
-// fields ignore allowRepoCommands. PR is the explicit exception: the
+// fields ignore allowRepoCommands, as do pr.template and pr.publish_intent.
+// PR.BaseBranch is the explicit exception: the
 // allowRepoCommands opt-in also permits a pushed PR target because it controls
 // where a maintainer-authorized PR lands, not code execution.
 // When allowRepoCommands is
@@ -1834,11 +2385,13 @@ func validatePathInstructionGlob(pattern string) error {
 // branch - this blocks the supply-chain vector for repos that ship
 // .no-mistakes.yaml only on feature branches.
 //
-// Non-executing fields (ignore patterns, auto-fix, commit, intent, test) are
-// always taken from the pushed copy, matching prior behavior, since they cannot
-// run arbitrary shell, select a process, or spend the maintainer's CI minutes.
-// The single exception inside test is evidence.branch, which names a git ref
-// the daemon pushes to and is therefore trusted-only.
+// Non-executing fields (ignore patterns, auto-fix, commit, intent, test,
+// PR title format, and providers) are always taken from the pushed copy, matching prior behavior,
+// since they cannot run arbitrary shell, select a process, or spend the
+// maintainer's CI minutes.
+// The exceptions inside test are evidence.branch, which names a git ref the
+// daemon pushes to, and instructions, which steers the gate that validates the
+// pushed branch. Both are trusted-only.
 func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *RepoConfig {
 	if pushed == nil {
 		pushed = &RepoConfig{}
@@ -1846,6 +2399,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 	effective := *pushed
 	if trusted != nil {
 		effective.Document = trusted.Document
+		effective.ProtectedPaths = append([]string(nil), trusted.ProtectedPaths...)
 		// review.path_instructions steers the gate agent that reviews the pushed
 		// branch, so it is trusted-only exactly like document.instructions and
 		// regardless of allow_repo_commands: a contributor must not be able to
@@ -1853,6 +2407,13 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// must not silently drop the maintainer's review rules when the pushed
 		// branch happens to carry no review block.
 		effective.Review = trusted.Review
+		// gates define what validating the pushed branch means - they execute
+		// shell on the daemon host - so they are
+		// trusted-only for exactly the reason review.path_instructions is, and
+		// likewise regardless of allow_repo_commands: that opt-in covers a
+		// branch re-running its own suite, never a branch authoring the extra
+		// check that clears it.
+		effective.Gates = copyGates(trusted.Gates)
 		// disable_project_settings is a security boundary: honor it ONLY from the
 		// trusted default-branch copy so a pushed branch cannot turn the opt-out
 		// off (and re-enable its own AGENTS.md) or on. A nil trusted copy here
@@ -1863,34 +2424,56 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// default-branch copy so a pushed branch cannot self-declare no-CI and
 		// bypass checks that the default branch still expects.
 		effective.NoCI = trusted.NoCI
-		// ci.rerun_transient spends the maintainer's resources rather than the
-		// contributor's: every rerun is another provider-side workflow run
-		// billed to the repository. It is trusted-only for that reason, so a
-		// pushed branch cannot raise its own rerun budget to the cap.
+		// The whole ci block is trusted-only. ci.rerun_transient spends the
+		// maintainer's resources rather than the contributor's: every rerun is
+		// another provider-side workflow run billed to the repository, so a
+		// pushed branch must not be able to raise its own rerun budget to the
+		// cap. ci.revalidate_repairs is a validation boundary in the same
+		// sense: it decides whether a CI repair commit must re-pass Review
+		// before it is published, so a pushed branch must not be able to turn
+		// the maintainer's revalidation requirement off for its own repairs.
 		effective.CI = trusted.CI
 		// test.evidence.branch names the git ref evidence commits are pushed
 		// to with the maintainer's credentials. It is trusted-only so a pushed
 		// branch cannot aim them at another branch of the repository; the rest
-		// of test.evidence stays pushed-readable because it only picks where
-		// artifacts are collected. The publisher independently refuses any
-		// branch without its marker file, so this is defense in depth.
+		// of test.evidence (store_in_repo, attach_media, dir) stays
+		// pushed-readable because it only picks how artifacts are published.
+		// The publisher independently refuses any branch without its marker
+		// file, and the upload client refuses Actions/App installation tokens,
+		// so this is defense in depth.
 		effective.Test.Evidence.Branch = trusted.Test.Evidence.Branch
+		// test.instructions is the runbook injected into the test gate's own
+		// prompt, so it is trusted-only for exactly the reasons
+		// document.instructions and review.path_instructions are: a contributor
+		// must not be able to rewrite or weaken the guidance that steers the
+		// gate validating their own branch.
+		effective.Test.Instructions = trusted.Test.Instructions
 		// pr.base_branch controls where the contributor's PR lands, so it is
 		// trusted-only unless the repository explicitly opts into pushed
-		// settings alongside commands and agent selection.
+		// settings alongside commands and agent selection. TitleFormat is a
+		// non-executing convention and remains sourced from the pushed copy.
+		// pr.template and pr.publish_intent control public narrative policy, so
+		// they remain trusted-only regardless of the commands opt-in.
 		if !allowRepoCommands {
-			effective.PR = trusted.PR
+			effective.PR.BaseBranch = trusted.PR.BaseBranch
 		}
+		effective.PR.Template = trusted.PR.Template
+		effective.PR.PublishIntent = trusted.PR.PublishIntent
 	} else {
 		effective.Document = DocumentRaw{}
+		effective.ProtectedPaths = nil
 		effective.Review = ReviewRaw{}
+		effective.Gates = nil
 		effective.DisableProjectSettings = false
 		effective.NoCI = false
 		effective.CI = CIRaw{}
 		effective.Test.Evidence.Branch = nil
+		effective.Test.Instructions = ""
 		if !allowRepoCommands {
-			effective.PR = PRRaw{}
+			effective.PR.BaseBranch = ""
 		}
+		effective.PR.Template = ""
+		effective.PR.PublishIntent = nil
 	}
 	if allowRepoCommands {
 		return &effective
@@ -1957,13 +2540,15 @@ func applyIntentOverrides(dst *Intent, src *IntentRaw) {
 	}
 }
 
-// testDefaults returns the default test-step settings. Evidence publication is
-// opt-in (off by default); when enabled it lands under .no-mistakes/evidence on
-// the default orphan evidence branch.
+// testDefaults returns the default test-step settings. Orphan-branch evidence
+// publication is opt-in (off by default). GitHub image/video attachments at PR
+// render time are on by default so remote reviewers can open screenshots
+// without that branch.
 func testDefaults() Test {
 	return Test{
 		Evidence: Evidence{
 			StoreInRepo: false,
+			AttachMedia: true,
 			Dir:         ".no-mistakes/evidence",
 			Branch:      evidence.DefaultBranch,
 			LocalRoot:   "",
@@ -1983,6 +2568,9 @@ func testDefaults() Test {
 func applyTestOverrides(dst *Test, src *TestRaw) {
 	if src.Evidence.StoreInRepo != nil {
 		dst.Evidence.StoreInRepo = *src.Evidence.StoreInRepo
+	}
+	if src.Evidence.AttachMedia != nil {
+		dst.Evidence.AttachMedia = *src.Evidence.AttachMedia
 	}
 	if src.Evidence.Dir != nil && strings.TrimSpace(*src.Evidence.Dir) != "" {
 		dst.Evidence.Dir = strings.TrimSpace(*src.Evidence.Dir)
@@ -2111,6 +2699,22 @@ func validateTestRaw(test TestRaw) error {
 	return nil
 }
 
+// applyProvidersOverrides applies non-nil raw values onto resolved defaults.
+func applyProvidersOverrides(dst *Providers, src *ProvidersRaw) {
+	if src.GitHub.DraftPullRequests != nil {
+		dst.GitHub.DraftPullRequests = *src.GitHub.DraftPullRequests
+	}
+	if src.GitLab.DraftPullRequests != nil {
+		dst.GitLab.DraftPullRequests = *src.GitLab.DraftPullRequests
+	}
+	if src.Bitbucket.DraftPullRequests != nil {
+		dst.Bitbucket.DraftPullRequests = *src.Bitbucket.DraftPullRequests
+	}
+	if src.AzureDevOps.DraftPullRequests != nil {
+		dst.AzureDevOps.DraftPullRequests = *src.AzureDevOps.DraftPullRequests
+	}
+}
+
 // autoFixDefaults returns the default auto-fix configuration.
 func autoFixDefaults() AutoFix {
 	return AutoFix{
@@ -2128,8 +2732,14 @@ func autoFixDefaults() AutoFix {
 // safe baseline is to escalate rather than risk restarting a job a maintainer
 // or a concurrency rule deliberately stopped. Repositories that know their
 // cancellations are provider-side opt in via ci.rerun_transient.
+// Post-repair revalidation is off for the reason recorded on
+// DefaultCIRevalidateRepairs: it is the pipeline's most expensive single
+// behavior, so it is opted into rather than paid for by default.
 func ciDefaults() CI {
-	return CI{RerunTransient: DefaultCIRerunTransient}
+	return CI{
+		RerunTransient:    DefaultCIRerunTransient,
+		RevalidateRepairs: DefaultCIRevalidateRepairs,
+	}
 }
 
 // applyCIOverrides applies non-nil raw values onto resolved defaults, clamping
@@ -2137,10 +2747,16 @@ func ciDefaults() CI {
 // inverting the bound, and anything above MaxCIRerunTransient is capped so a
 // typo cannot keep a run polling one commit indefinitely.
 func applyCIOverrides(dst *CI, src *CIRaw) {
-	if src.RerunTransient == nil {
-		return
+	if src.RerunTransient != nil {
+		dst.RerunTransient = min(max(*src.RerunTransient, 0), MaxCIRerunTransient)
 	}
-	dst.RerunTransient = min(max(*src.RerunTransient, 0), MaxCIRerunTransient)
+	// Applied independently of the rerun budget so a config that sets only one
+	// of the two keys does not silently discard the other, and so an explicit
+	// `revalidate_repairs: false` in the later (repository) source overrides an
+	// earlier `true` rather than reading as "unset".
+	if src.RevalidateRepairs != nil {
+		dst.RevalidateRepairs = *src.RevalidateRepairs
+	}
 }
 
 // applyAutoFixOverrides applies non-nil raw values onto resolved defaults.
@@ -2213,32 +2829,65 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	// evidence on this machine, and how long it keeps it, is never a
 	// repository's decision (see EvidenceRaw.LocalRoot).
 	applyEvidenceStorageOverrides(&test.Evidence, &global.Test.Evidence)
+	// The runbook describes ONE repository's product, so it is resolved from
+	// the repository only - never from global config, which has no repository
+	// to describe. repo here is the EffectiveRepoConfig result, so this value
+	// is already trusted-only.
+	test.Instructions = strings.TrimSpace(repo.Test.Instructions)
 
 	commit := Commit{FixMessage: DefaultFixMessageTemplate}
 	if global.Commit.FixMessage != nil {
 		commit.FixMessage = *global.Commit.FixMessage
 	}
+	if global.Commit.BranchPattern != nil {
+		commit.BranchPattern = *global.Commit.BranchPattern
+	}
 	if repo.Commit.FixMessage != nil {
 		commit.FixMessage = *repo.Commit.FixMessage
 	}
+	if repo.Commit.BranchPattern != nil {
+		commit.BranchPattern = *repo.Commit.BranchPattern
+	}
+
+	providers := Providers{}
+	applyProvidersOverrides(&providers, &global.Providers)
+	applyProvidersOverrides(&providers, &repo.Providers)
+
+	pr := PR{
+		BaseBranch:    strings.TrimSpace(repo.PR.BaseBranch),
+		Template:      repo.PR.Template,
+		PublishIntent: repo.PR.PublishIntent,
+	}
+	if repo.PR.TitleFormat != nil {
+		pr.TitleFormat = *repo.PR.TitleFormat
+	}
 
 	cfg := &Config{
-		Agent:                global.Agent,
-		Agents:               copyAgents(global.Agents),
-		ACPXPath:             global.ACPXPath,
-		ForgejoAXIPath:       global.ForgejoAXIPath,
-		ACPRegistryOverrides: global.ACPRegistryOverrides,
-		AgentPathOverride:    global.AgentPathOverride,
-		AgentArgsOverride:    global.AgentArgsOverride,
-		CITimeout:            global.CITimeout,
-		StepQuietWarning:     global.StepQuietWarning,
-		LogLevel:             global.LogLevel,
-		SessionReuse:         global.SessionReuse,
+		Agent:                 global.Agent,
+		Agents:                copyAgents(global.Agents),
+		ACPXPath:              global.ACPXPath,
+		ForgejoAXIPath:        global.ForgejoAXIPath,
+		ACPRegistryOverrides:  global.ACPRegistryOverrides,
+		AgentPathOverride:     global.AgentPathOverride,
+		AgentArgsOverride:     global.AgentArgsOverride,
+		AgentConfig:           global.AgentConfig,
+		ReviewAgents:          global.ReviewAgents,
+		CITimeout:             global.CITimeout,
+		StepQuietWarning:      global.StepQuietWarning,
+		AgentTimeout:          global.AgentTimeout,
+		ReviewAgentTimeout:    global.ReviewAgentTimeout,
+		TestAgentTimeout:      global.TestAgentTimeout,
+		GateReconcileInterval: global.GateReconcileInterval,
+		GateReconcileTimeout:  global.GateReconcileTimeout,
+		LogLevel:              global.LogLevel,
+		SessionReuse:          global.SessionReuse,
 		// Eval is global-only by design (see GlobalConfig.Eval), so it is
 		// copied straight through with no repository override step.
 		Eval:           global.Eval,
 		Commands:       repo.Commands,
+		Gates:          copyGates(repo.Gates),
 		IgnorePatterns: repo.IgnorePatterns,
+		ProtectedPaths: repo.ProtectedPaths,
 		AutoFix:        af,
 		CI:             ci,
 		Commit:         commit,
@@ -2246,7 +2895,9 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Test:           test,
 		Document:       Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
 		Review:         Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions)},
-		PR:             PR{BaseBranch: strings.TrimSpace(repo.PR.BaseBranch)},
+		PR:             pr,
+		ForgeProfiles:  global.ForgeProfiles,
+		Providers:      providers,
 		// repo is the EffectiveRepoConfig result, so this value is already
 		// trusted-only (EffectiveRepoConfig sourced it from the trusted copy).
 		DisableProjectSettings: repo.DisableProjectSettings,

@@ -58,6 +58,28 @@ func (m *sessionMockAgent) snapshot() []agent.RunOpts {
 	return append([]agent.RunOpts(nil), m.calls...)
 }
 
+type sessionFallbackTimeoutAgent struct {
+	calls int
+}
+
+func (a *sessionFallbackTimeoutAgent) Name() string { return "session-timeout" }
+
+func (a *sessionFallbackTimeoutAgent) SupportsSessionResume() bool { return true }
+
+func (a *sessionFallbackTimeoutAgent) Close() error { return nil }
+
+func (a *sessionFallbackTimeoutAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+	a.calls++
+	if opts.Session != nil && opts.Session.ID != "" {
+		opts.OnLifecycle(agent.LifecycleEvent{Agent: a.Name(), Phase: agent.LifecyclePhaseStart, PID: 7171})
+		opts.OnLifecycle(agent.LifecycleEvent{Agent: a.Name(), Phase: agent.LifecyclePhaseActivity})
+		return nil, fmt.Errorf("resume failed")
+	}
+	opts.OnLifecycle(agent.LifecycleEvent{Agent: a.Name(), Phase: agent.LifecyclePhaseStart, PID: 7272})
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
 // reviewSessionHarness wires a real executor around real steps with a
 // session-capable mock agent and real git worktree.
 func reviewSessionHarness(t *testing.T, mock *sessionMockAgent, steps []pipeline.Step) (*pipeline.Executor, *db.DB, *db.Run, *db.Repo, string) {
@@ -129,11 +151,11 @@ func TestReviewLoop_IndependentReviewTurnsOneFixerSession(t *testing.T) {
 			reviewRound++
 			if reviewRound <= 2 {
 				return &agent.Result{Output: []byte(fmt.Sprintf(
-					`{"findings":[{"id":"f-%d","severity":"error","description":"bug %d","action":"auto-fix"}],"summary":"issues","risk_level":"medium","risk_rationale":"bugs"}`,
+					`{"findings":[{"id":"f-%d","severity":"error","description":"bug %d","action":"auto-fix"}],"summary":"issues","risk_level":"medium","risk_rationale":"bugs","risk_scope":"source-or-external"}`,
 					reviewRound, reviewRound,
 				))}
 			}
-			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
+			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`)}
 		case "review-fix":
 			return &agent.Result{Output: []byte(`{"summary":"fix the bug"}`)}
 		default:
@@ -217,10 +239,10 @@ func TestReviewLoop_RereviewNeverResumesTheSessionThatPrescribedItsFixes(t *test
 			reviewRound++
 			if reviewRound == 1 {
 				return &agent.Result{Output: []byte(
-					`{"findings":[{"id":"f-1","severity":"error","description":"prescribed design","action":"auto-fix"}],"summary":"1 issue","risk_level":"medium","risk_rationale":"bug"}`,
+					`{"findings":[{"id":"f-1","severity":"error","description":"prescribed design","action":"auto-fix"}],"summary":"1 issue","risk_level":"medium","risk_rationale":"bug","risk_scope":"source-or-external"}`,
 				)}
 			}
-			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
+			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`)}
 		case "review-fix":
 			return &agent.Result{Output: []byte(`{"summary":"implement the prescription"}`)}
 		default:
@@ -256,10 +278,10 @@ func TestReviewLoop_ParkRespondFixKeepsRoleSessions(t *testing.T) {
 			reviewRound++
 			if reviewRound == 1 {
 				return &agent.Result{Output: []byte(
-					`{"findings":[{"id":"f-1","severity":"error","description":"needs decision","action":"ask-user"}],"summary":"1 issue","risk_level":"high","risk_rationale":"gate"}`,
+					`{"findings":[{"id":"f-1","severity":"error","description":"needs decision","action":"ask-user"}],"summary":"1 issue","risk_level":"high","risk_rationale":"gate","risk_scope":"source-or-external"}`,
 				)}
 			}
-			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
+			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`)}
 		default:
 			return &agent.Result{Output: []byte(`{"summary":"apply decision"}`)}
 		}
@@ -302,6 +324,37 @@ func TestReviewLoop_ParkRespondFixKeepsRoleSessions(t *testing.T) {
 	}
 }
 
+func TestReviewFixerSession_FreshFallbackTimeoutExcludesResumeActivity(t *testing.T) {
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &sessionFallbackTimeoutAgent{}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Config.ReviewAgentTimeout = 500 * time.Millisecond
+	sctx.Config.SessionReuse = true
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"f-1","severity":"error","description":"fix this","action":"auto-fix"}]}`
+	if err := sctx.DB.UpsertRunAgentSession(sctx.Run.ID, string(pipeline.SessionRoleFixer), ag.Name(), "stale-session"); err != nil {
+		t.Fatalf("store fixer session: %v", err)
+	}
+	sctx.Sessions = pipeline.NewRunSessions(sctx.DB, sctx.Run.ID, ag, true)
+
+	_, err := (&ReviewStep{}).Execute(sctx)
+	if err == nil {
+		t.Fatal("expected the fresh fixer session to time out")
+	}
+	if ag.calls != 2 {
+		t.Fatalf("agent calls = %d, want failed resume and fresh fallback", ag.calls)
+	}
+	if !strings.Contains(err.Error(), "produced no output at all") {
+		t.Fatalf("error = %q, want fresh fallback silence", err)
+	}
+	if strings.Contains(err.Error(), "last produced output") {
+		t.Fatalf("error = %q, dead resume activity must not describe the fresh fallback", err)
+	}
+	if !strings.Contains(err.Error(), "pid=7272") {
+		t.Fatalf("error = %q, want silence attributed to the fresh fixer subprocess", err)
+	}
+}
+
 // TestReviewLoop_OtherStepsStaySessionIsolated proves the reviewer/fixer
 // sessions are never lent to other pipeline steps: agent-driven document and
 // lint work runs with no session at all.
@@ -310,7 +363,7 @@ func TestReviewLoop_OtherStepsStaySessionIsolated(t *testing.T) {
 	mock.respond = func(opts agent.RunOpts) *agent.Result {
 		switch opts.Purpose {
 		case "review":
-			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean"}`)}
+			return &agent.Result{Output: []byte(`{"findings":[],"summary":"clean","risk_level":"low","risk_rationale":"clean","risk_scope":"source-or-external"}`)}
 		default:
 			return &agent.Result{Output: []byte(`{"findings":[],"summary":"nothing to do"}`)}
 		}

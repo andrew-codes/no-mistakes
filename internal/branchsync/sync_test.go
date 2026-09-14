@@ -211,13 +211,11 @@ func TestInspectCachedPrePushAndPushInProgressAreNonSyncable(t *testing.T) {
 	if err := f.db.UpdateRunStatus(active.ID, types.RunFailed); err != nil {
 		t.Fatal(err)
 	}
-	// Once the owning run is terminal the same state stops being a dead end:
-	// it stays non-syncable but must offer the guarded custody recovery.
 	state = f.service.InspectCached(f.ctx)
-	if state.State != StatePipelineOwned || state.Safety != "blocked_pipeline_owned_recoverable" {
+	if state.State != StatePipelineOwned || state.Safety != "blocked_recover_manual_reconciliation" {
 		t.Fatalf("terminal unpublished pipeline head = %#v", state)
 	}
-	if state.NextAction == nil || state.NextAction.Code != "recover_custody" {
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" || state.NextAction.Command != "no-mistakes axi status" {
 		t.Fatalf("terminal unpublished pipeline head next action = %#v", state.NextAction)
 	}
 }
@@ -543,6 +541,9 @@ func TestApplyReportsHonestFinalStateWhenPostMergeHookMutatesWorktree(t *testing
 	t.Parallel()
 
 	f := newSyncFixture(t)
+	// Pin hooks to the repo's own dir: an ambient global core.hooksPath
+	// would silently hijack the hook installed below.
+	mustRun(t, f.local, "config", "core.hooksPath", ".git/hooks")
 	hooks := filepath.Join(f.local, ".git", "hooks")
 	hook := filepath.Join(hooks, "post-merge")
 	mustWrite(t, hook, "#!/bin/sh\nprintf hook > hook-output.txt\nexit 1\n")
@@ -977,7 +978,9 @@ func TestRefreshSlowButSuccessfulLsRemoteAloneExceedsItsOwnBudgetReportsOffline(
 func TestRefreshRaisedRemoteTimeoutAcceptsTheSameLegitimateSlowLsRemote(t *testing.T) {
 	f := newSyncFixture(t)
 
-	f.service.RemoteTimeout = 500 * time.Millisecond
+	// Leave enough room for the real local fetch on a loaded Windows runner;
+	// this test varies ls-remote latency, not filesystem or process startup.
+	f.service.RemoteTimeout = 10 * time.Second
 	f.service.lsRemote = func(ctx context.Context, dir, remote, ref string) (string, error) {
 		select {
 		case <-time.After(200 * time.Millisecond):

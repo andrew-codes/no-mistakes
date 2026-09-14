@@ -158,7 +158,9 @@ func (pr bitbucketPullRequest) toPullRequest() *PullRequest {
 	}
 }
 
-// FindOpenPRBySourceBranch looks up the open PR from branch to destBranch, if any.
+// FindOpenPRBySourceBranch looks up the open PR from branch to destBranch, if
+// any. It fails closed on a malformed entry (non-positive id) rather than
+// returning a garbage PR reference a caller could mistake for a real one.
 func (c *Client) FindOpenPRBySourceBranch(ctx context.Context, repo RepoRef, branch, destBranch string) (*PullRequest, error) {
 	args := append([]string{"bitbucket", "pull-requests", "query", "--scope", "repo", "--source", branch, "--state", "OPEN"}, repoArgs(repo)...)
 	if strings.TrimSpace(destBranch) != "" {
@@ -179,17 +181,24 @@ func (c *Client) FindOpenPRBySourceBranch(ctx context.Context, repo RepoRef, bra
 	if err := json.Unmarshal(items[0], &pr); err != nil {
 		return nil, fmt.Errorf("decode Bitbucket pull request: %w", err)
 	}
+	if pr.ID <= 0 {
+		return nil, fmt.Errorf("decode Bitbucket pull request: missing positive id")
+	}
 	return pr.toPullRequest(), nil
 }
 
-// CreatePR creates a new pull request from sourceBranch to destBranch.
-func (c *Client) CreatePR(ctx context.Context, repo RepoRef, sourceBranch, destBranch, title, body string) (*PullRequest, error) {
+// CreatePR creates a new pull request from sourceBranch to destBranch. When
+// draft is true, it is opened as a draft.
+func (c *Client) CreatePR(ctx context.Context, repo RepoRef, sourceBranch, destBranch, title, body string, draft bool) (*PullRequest, error) {
 	args := append([]string{"bitbucket", "pull-requests", "create",
 		"--title", title,
 		"--source", sourceBranch,
 		"--dest", destBranch,
 		"--description", body,
 	}, repoArgs(repo)...)
+	if draft {
+		args = append(args, "--draft")
+	}
 	data, err := c.run(ctx, args...)
 	if err != nil {
 		return nil, err

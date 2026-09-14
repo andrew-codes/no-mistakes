@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/andrew-codes/no-mistakes/internal/agent"
+	"github.com/andrew-codes/no-mistakes/internal/agentcfg"
 	"github.com/andrew-codes/no-mistakes/internal/config"
 	"github.com/andrew-codes/no-mistakes/internal/db"
 	"github.com/andrew-codes/no-mistakes/internal/e2edaemon"
@@ -56,8 +57,9 @@ const (
 
 // Replay runs exactly the captured review pass. It does not start a daemon or
 // use the production NM_HOME: every case is restored into a fresh temp gate and
-// worktree. Push, PR, CI, and all fix loops are intentionally absent from the
-// MVP subject under test.
+// worktree. Candidates inherit the caller's HOME so harness sign-in matches
+// an ordinary pipeline agent spawn. Push, PR, CI, and all fix loops are
+// intentionally absent from the MVP subject under test.
 func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []Evaluation, error) {
 	if store == nil {
 		return Session{}, nil, fmt.Errorf("eval replay requires a store")
@@ -65,7 +67,7 @@ func Replay(ctx context.Context, store *Store, opts ReplayOptions) (Session, []E
 	if opts.Repeats <= 0 {
 		return Session{}, nil, fmt.Errorf("repeats must be at least 1")
 	}
-	if _, err := candidateModelArgs(opts.Candidate); err != nil {
+	if err := opts.Candidate.Validate(); err != nil {
 		return Session{}, nil, err
 	}
 	cases, session, err := store.prepareReplay(ctx, opts)
@@ -229,12 +231,6 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		evaluation.CompletedAt = time.Now().Unix()
 		return evaluation
 	}
-	isolatedHome := filepath.Join(root, "home")
-	if err := os.MkdirAll(isolatedHome, 0o755); err != nil {
-		evaluation.Error = safeurl.RedactText(fmt.Sprintf("create isolated eval home: %v", err))
-		evaluation.CompletedAt = time.Now().Unix()
-		return evaluation
-	}
 	ownership, err := e2edaemon.Acquire(isolatedPaths.Root(), "", 2*time.Minute)
 	if err != nil {
 		evaluation.Error = safeurl.RedactText(fmt.Sprintf("acquire isolated eval ownership: %v", err))
@@ -258,15 +254,15 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 	cfg.Agent = candidate.Agent
 	cfg.Agents = []types.AgentName{candidate.Agent}
 
-	modelArgs, err := candidateModelArgs(candidate)
-	if err != nil {
-		evaluation.Error = safeurl.RedactText(err.Error())
-		evaluation.CompletedAt = time.Now().Unix()
-		return evaluation
-	}
-	baseAgent, err := agent.NewWithOptions(candidate.Agent, cfg.AgentPathFor(candidate.Agent), modelArgs, agent.Options{
+	// The candidate's tuning goes through the same harness-neutral Profile the
+	// pipeline uses, so eval and a real run reach each harness's model and
+	// effort mechanism by exactly one code path. Raw args stay empty: capture
+	// strips agent_args_override and agent_config from the pinned config so a
+	// replay cannot inherit the capturing machine's own pins.
+	baseAgent, err := agent.NewWithOptions(candidate.Agent, cfg.AgentPathFor(candidate.Agent), nil, agent.Options{
 		ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 		DisableProjectSettings: cfg.DisableProjectSettings,
+		Profile:                candidate.Profile(),
 	})
 	if err != nil {
 		evaluation.Error = safeurl.RedactText(fmt.Sprintf("create candidate agent: %v", err))
@@ -316,15 +312,21 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		SkipFixExecution:      fixing,
 		ReviewStartingHeadSHA: startingHeadSHA,
 		PreviousFindings:      previousFindings,
-		Env:                   []string{"NM_HOME=" + isolatedPaths.Root(), "HOME=" + isolatedHome},
-		Log:                   func(string) {},
-		LogChunk:              func(string) {},
-		LogFile:               func(string) {},
-		UserIntent:            c.Intent,
-		IntentSource:          c.IntentSource,
+		// Keep NM_HOME on the nested sandbox so replay cannot see or mutate
+		// production pipeline/eval state. Do not rewrite HOME: candidates use
+		// the same harness sign-in and user settings as an ordinary pipeline
+		// agent spawn. That is not a security sandbox; a candidate may still
+		// read and write ordinary HOME-relative agent files.
+		Env:          []string{"NM_HOME=" + isolatedPaths.Root()},
+		Log:          func(string) {},
+		LogChunk:     func(string) {},
+		LogFile:      func(string) {},
+		UserIntent:   c.Intent,
+		IntentSource: c.IntentSource,
 	})
-	// Candidate wall time is the actual review invocation, matching the local
-	// agent-invocation metric rather than charging case restoration setup.
+	// Candidate wall time is the actual review invocations, every rerun
+	// included, matching the local agent-invocation metric rather than
+	// charging case restoration setup.
 	evaluation.DurationMS = observed.durationMS
 	if evaluation.DurationMS == 0 && observed.result == nil {
 		evaluation.DurationMS = time.Since(started).Milliseconds()
@@ -334,16 +336,16 @@ func replayOne(ctx context.Context, store *Store, c Case, session Session, candi
 		evaluation.Model = observed.result.Model
 		if evaluation.Model == "" {
 			evaluation.Model = candidate.Model
-		} else if evaluation.Model != candidate.Model {
+		} else if !agentcfg.ServedMatchesRequested(candidate.Model, evaluation.Model, observed.result.ModelProvider) {
 			evaluation.Error = safeurl.RedactText(fmt.Sprintf("candidate served model %q, requested %q", evaluation.Model, candidate.Model))
 			return evaluation
 		}
-		if observed.result.UsageReported {
+		if !observed.usageMissing {
 			evaluation.TokensReported = true
-			evaluation.InputTokens = int64(observed.result.Usage.InputTokens)
-			evaluation.OutputTokens = int64(observed.result.Usage.OutputTokens)
-			evaluation.CacheReadTokens = int64(observed.result.Usage.CacheReadTokens)
-			evaluation.FreshInputTokens = int64(agent.FreshInputTokens(observed.result.Usage.InputTokens, observed.result.Usage.CacheReadTokens))
+			evaluation.InputTokens = int64(observed.usage.InputTokens)
+			evaluation.OutputTokens = int64(observed.usage.OutputTokens)
+			evaluation.CacheReadTokens = int64(observed.usage.CacheReadTokens)
+			evaluation.FreshInputTokens = int64(observed.freshInputTokens)
 		}
 	}
 	if err != nil {
@@ -479,23 +481,20 @@ func replayConfig(c Case) (*config.Config, error) {
 	return config.Merge(global, repo), nil
 }
 
-func candidateModelArgs(candidate Candidate) ([]string, error) {
-	if _, ok := types.ACPTargetFor(candidate.Agent); ok {
-		return nil, fmt.Errorf("candidate agent %q cannot enforce an explicit model", candidate.Agent)
-	}
-	if candidate.Agent == types.AgentCodex {
-		return []string{"-m", candidate.Model}, nil
-	}
-	return []string{"--model", candidate.Model}, nil
-}
-
 type observedAgent struct {
-	inner        agent.Agent
-	ownership    *e2edaemon.Ownership
-	result       *agent.Result
-	durationMS   int64
-	ownershipErr error
-	mu           sync.Mutex
+	inner      agent.Agent
+	ownership  *e2edaemon.Ownership
+	result     *agent.Result
+	durationMS int64
+	// A review can rerun, so usage sums every attempt, fresh input per attempt
+	// as the captured baseline does. usageMissing marks an attempt with no
+	// reported usage, which makes the sum incomplete rather than a smaller
+	// cost.
+	usage            agent.TokenUsage
+	freshInputTokens int
+	usageMissing     bool
+	ownershipErr     error
+	mu               sync.Mutex
 }
 
 func (a *observedAgent) Name() string { return a.inner.Name() }
@@ -516,10 +515,25 @@ func (a *observedAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Res
 			previousLifecycle(event)
 		}
 	}
+	// The adapter retries below this seam and hands back only its last
+	// attempt, so count each attempt as the recorder does. Without this a turn
+	// that burned four attempts would be charged for one and read as cheaper.
+	attempts := 0
+	previousAttempt := opts.OnAttempt
+	opts.OnAttempt = func(attempt agent.Attempt) {
+		if previousAttempt != nil {
+			previousAttempt(attempt)
+		}
+		attempts++
+		a.observeUsage(attempt.Result)
+	}
 	started := time.Now()
 	result, err := a.inner.Run(ctx, opts)
 	a.durationMS += time.Since(started).Milliseconds()
 	a.result = result
+	if attempts == 0 {
+		a.observeUsage(result)
+	}
 	a.mu.Lock()
 	ownershipErr := a.ownershipErr
 	a.mu.Unlock()
@@ -527,6 +541,17 @@ func (a *observedAgent) Run(ctx context.Context, opts agent.RunOpts) (*agent.Res
 		return result, ownershipErr
 	}
 	return result, err
+}
+
+func (a *observedAgent) observeUsage(result *agent.Result) {
+	if result == nil || !result.UsageReported {
+		a.usageMissing = true
+		return
+	}
+	a.usage.InputTokens += result.Usage.InputTokens
+	a.usage.OutputTokens += result.Usage.OutputTokens
+	a.usage.CacheReadTokens += result.Usage.CacheReadTokens
+	a.freshInputTokens += agent.FreshInputTokens(result.Usage.InputTokens, result.Usage.CacheReadTokens)
 }
 
 func findingCount(raw string) int {

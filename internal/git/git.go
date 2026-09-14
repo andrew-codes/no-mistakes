@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/andrew-codes/no-mistakes/internal/safeurl"
+	"github.com/andrew-codes/no-mistakes/internal/shellenv"
 	"github.com/andrew-codes/no-mistakes/internal/winproc"
 )
 
@@ -46,6 +48,15 @@ func RunRaw(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	return runInDirWithEnvRaw(ctx, dir, nil, args...)
 }
 
+// RunWithInput executes a git command with exact standard input and returns
+// trimmed stdout. It carries the same bare-repository handling as Run.
+func RunWithInput(ctx context.Context, dir, input string, args ...string) (string, error) {
+	if isBareGitDir(dir) {
+		return runInDirWithEnvAndInput(ctx, dir, nil, input, append([]string{"--git-dir=" + dir}, args...)...)
+	}
+	return runInDirWithEnvAndInput(ctx, dir, nil, input, args...)
+}
+
 // RunBare executes Git against exactly bareDir. Unlike Run, it never falls
 // back to cwd-based repository discovery when bareDir is malformed. Gate
 // recovery uses this after structural validation so an invalid directory under
@@ -75,24 +86,70 @@ func runInDir(ctx context.Context, dir string, args ...string) (string, error) {
 }
 
 func runInDirWithEnv(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
-	out, err := runInDirWithEnvRaw(ctx, dir, extraEnv, args...)
+	return runInDirWithEnvAndInput(ctx, dir, extraEnv, "", args...)
+}
+
+func runInDirWithEnvAndInput(ctx context.Context, dir string, extraEnv []string, input string, args ...string) (string, error) {
+	out, err := runInDirWithEnvAndInputRaw(ctx, dir, extraEnv, input, args...)
 	return strings.TrimSpace(string(out)), err
 }
 
 func runInDirWithEnvRaw(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
+	return runInDirWithEnvAndInputRaw(ctx, dir, extraEnv, "", args...)
+}
+
+func runInDirWithEnvAndInputRaw(ctx context.Context, dir string, extraEnv []string, input string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(NonInteractiveEnv(dir), extraEnv...)
+	cmd.Env = append(nonInteractiveEnvForContext(ctx, dir), extraEnv...)
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	}
 	winproc.Harden(cmd)
-	out, err := cmd.Output()
+	// OutputShellCommand captures stdout only, so unlike cmd.Output it never
+	// fills ExitError.Stderr. Capture stderr explicitly or the git error text
+	// below silently becomes empty.
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	shellenv.ConfigureShellCommand(cmd)
+	out, err := shellenv.OutputShellCommand(cmd)
 	if err != nil {
-		stderr := ""
-		if ee, ok := err.(*exec.ExitError); ok {
-			stderr = strings.TrimSpace(string(ee.Stderr))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = fmt.Errorf("%w (%v)", ctxErr, err)
 		}
-		return nil, fmt.Errorf("git %s: %w: %s", safeurl.RedactText(strings.Join(args, " ")), err, safeurl.RedactText(stderr))
+		return nil, fmt.Errorf("git %s: %w: %s", safeurl.RedactText(strings.Join(args, " ")), err, safeurl.RedactText(strings.TrimSpace(stderr.String())))
 	}
 	return out, nil
+}
+
+// StablePatchID returns Git's stable patch identity for one file between two
+// commits. The file path is part of the diff, so the same-shaped edit to a
+// different file cannot prove content preservation.
+//
+// The pathspec is explicitly literal: a wildcard or leading colon in a real
+// file name would otherwise be read as a glob or as pathspec magic and fold a
+// sibling file's diff into this file's identity.
+func StablePatchID(ctx context.Context, dir, from, to, path string) (string, error) {
+	diff, err := RunRaw(ctx, dir, "diff", "--no-ext-diff", "--binary", from, to, "--", ":(literal)"+path)
+	if err != nil {
+		return "", err
+	}
+	if len(diff) == 0 {
+		return "", nil
+	}
+	args := []string{"patch-id", "--stable"}
+	if isBareGitDir(dir) {
+		args = append([]string{"--git-dir=" + dir}, args...)
+	}
+	out, err := runInDirWithEnvAndInputRaw(ctx, dir, nil, string(diff), args...)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("git patch-id --stable returned no identity")
+	}
+	return fields[0], nil
 }
 
 // ValidateBareRepository verifies both the filesystem shape and Git's own bare
@@ -144,6 +201,7 @@ func isBareGitDir(dir string) bool {
 // InitBare creates a new bare git repository at the given path.
 func InitBare(ctx context.Context, path string) error {
 	cmd := exec.CommandContext(ctx, "git", "init", "--bare", path)
+	cmd.Env = nonInteractiveEnvForContext(ctx, "")
 	winproc.Harden(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -468,6 +526,29 @@ func FetchRemoteBranchToPrivateRef(ctx context.Context, dir, remote, branch, loc
 	return err
 }
 
+// FetchRemoteRef imports the object named by one exact remote ref without
+// touching FETCH_HEAD or any caller-owned ref. The temporary ref is private to
+// this operation, allowing the caller to publish the verified object with its
+// own create-only or compare-and-swap policy.
+func FetchRemoteRef(ctx context.Context, dir, remote, remoteRef, expectedCommit string) error {
+	temporaryRef := fmt.Sprintf("refs/no-mistakes/fetch/%d-%d", os.Getpid(), time.Now().UnixNano())
+	defer func() {
+		_, _ = Run(context.WithoutCancel(ctx), dir, "update-ref", "--no-deref", "-d", temporaryRef)
+	}()
+	refspec := fmt.Sprintf("+%s:%s", remoteRef, temporaryRef)
+	if _, err := Run(ctx, dir, "fetch", "--no-tags", "--no-write-fetch-head", remote, refspec); err != nil {
+		return err
+	}
+	fetched, err := Run(ctx, dir, "rev-parse", "--verify", temporaryRef+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("fetched ref %s is not a commit: %w", remoteRef, err)
+	}
+	if fetched != strings.TrimSpace(expectedCommit) {
+		return fmt.Errorf("fetched ref %s moved to %s, expected %s", remoteRef, fetched, expectedCommit)
+	}
+	return nil
+}
+
 // Push pushes HEAD to a remote ref. If forceWithLease is true, it uses an
 // explicit expected remote SHA for safe force-push.
 func Push(ctx context.Context, dir, remote, ref, expectedSHA string, forceWithLease bool) error {
@@ -478,6 +559,12 @@ func Push(ctx context.Context, dir, remote, ref, expectedSHA string, forceWithLe
 // a concurrent worktree HEAD move cannot change the source selected by git.
 func PushCommit(ctx context.Context, dir, remote, commitSHA, ref, expectedSHA string, forceWithLease bool) error {
 	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, nil)
+}
+
+// PushCommitWithOptions pushes an immutable commit with hook-visible options.
+// It keeps proof launch identity attached to the commit sampled before pushing.
+func PushCommitWithOptions(ctx context.Context, dir, remote, commitSHA, ref, expectedSHA string, forceWithLease bool, pushOptions []string) error {
+	return pushSourceWithOptions(ctx, dir, remote, commitSHA, ref, expectedSHA, forceWithLease, pushOptions)
 }
 
 // PushWithOptions pushes HEAD to a remote with per-push options.
@@ -529,6 +616,26 @@ func HasUncommittedChanges(ctx context.Context, dir string) (bool, error) {
 		return false, err
 	}
 	return out != "", nil
+}
+
+// UntrackedFiles returns each untracked path in git's order. Ignored files
+// are not included.
+func UntrackedFiles(ctx context.Context, dir string) ([]string, error) {
+	out, err := RunRaw(ctx, dir, "status", "--porcelain", "-z", "--untracked-files=all")
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, entry := range strings.Split(string(out), "\x00") {
+		if len(entry) < 3 {
+			continue
+		}
+		// Porcelain format: XY <path>\0 where XY is a 2-char status code + space.
+		if entry[:2] == "??" {
+			files = append(files, entry[3:])
+		}
+	}
+	return files, nil
 }
 
 // CreateBranch creates a new branch with the given name and switches to it.
@@ -632,12 +739,55 @@ func ResolveRef(ctx context.Context, dir, ref string) (string, error) {
 	return out, nil
 }
 
+func DirectRefTarget(ctx context.Context, dir, ref string) (string, bool, error) {
+	target, err := Run(ctx, dir, "symbolic-ref", "--quiet", "--no-recurse", ref)
+	if err == nil {
+		return "", false, fmt.Errorf("ref %s is symbolic (target %s)", ref, target)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+		return "", false, err
+	}
+	out, err := Run(ctx, dir, "for-each-ref", "--format=%(refname) %(objectname) %(symref)", ref)
+	if err != nil {
+		return "", false, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != ref {
+			continue
+		}
+		if len(fields) > 2 {
+			return "", false, fmt.Errorf("ref %s is symbolic (target %s)", ref, fields[2])
+		}
+		if len(fields) != 2 {
+			return "", false, fmt.Errorf("ref %s has no direct object target", ref)
+		}
+		return fields[1], true, nil
+	}
+	return "", false, nil
+}
+
+func ExactRefTarget(ctx context.Context, dir, ref string) (string, bool, error) {
+	out, err := Run(ctx, dir, "for-each-ref", "--format=%(refname) %(objectname)", ref)
+	if err != nil {
+		return "", false, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		name, target, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if ok && name == ref {
+			return strings.TrimSpace(target), true, nil
+		}
+	}
+	return "", false, nil
+}
+
 // RefExists reports whether the given ref resolves to a commit. It uses
 // `git rev-parse --verify --quiet` so a missing ref is a clean (nil, false)
 // result rather than a loud error.
 func RefExists(ctx context.Context, dir, ref string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}")
-	cmd.Env = NonInteractiveEnv(dir)
+	cmd.Env = nonInteractiveEnvForContext(ctx, dir)
 	winproc.Harden(cmd)
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError

@@ -3,12 +3,45 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/andrew-codes/no-mistakes/internal/runenv"
 )
+
+func TestCodexAgentRunAppliesForgeEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	capture := filepath.Join(dir, "env.txt")
+	bin := writeFakeCodex(t, dir, `#!/bin/sh
+printf 'config:%s token:%s\n' "$GH_CONFIG_DIR" "${GH_TOKEN:+set}" > "$CAPTURE_FILE"
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+`, "@echo off\r\nset TOKENSTATE=\r\nif defined GH_TOKEN set TOKENSTATE=set\r\necho config:%GH_CONFIG_DIR% token:%TOKENSTATE%>\"%CAPTURE_FILE%\"\r\necho {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\r\necho {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\r\n")
+	t.Setenv("GH_TOKEN", "ambient-must-not-leak")
+
+	ca := &codexAgent{bin: bin, subprocessContext: newSubprocessContext(runenv.Overlay{
+		Set: map[string]string{
+			"CAPTURE_FILE":  capture,
+			"GH_CONFIG_DIR": "/profiles/personal",
+		},
+		Unset: []string{"GH_TOKEN"},
+	})}
+	if _, err := ca.Run(context.Background(), RunOpts{Prompt: "test", CWD: dir}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "config:/profiles/personal token:" {
+		t.Fatalf("agent environment = %q", got)
+	}
+}
 
 func TestCodexAgent_BuildArgs(t *testing.T) {
 	ca := &codexAgent{bin: "codex"}
@@ -249,6 +282,78 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens
 	}
 }
 
+// TestCodexAgent_RunCancelsSilentHang pins the 0%-CPU stall the Test step's
+// evidence agent hits: Codex has consumed the prompt, emits no JSONL, and
+// waits. A deadline on the Run context must cancel that wait instead of
+// blocking forever on stdout.
+func TestCodexAgent_RunCancelsSilentHang(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCodex(t, dir, `#!/bin/sh
+cat >/dev/null
+sleep 100
+	`, strings.Join([]string{
+		"@echo off",
+		"more > nul",
+		"ping -n 101 127.0.0.1 > nul",
+	}, "\r\n"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := (&codexAgent{bin: bin}).Run(ctx, RunOpts{Prompt: "gather evidence", CWD: dir})
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("expected silent hang to fail")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("Run error = %v, want context deadline", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("silent hang took %s, want cancellation well under 5s", elapsed)
+	}
+}
+
+func TestCodexAgent_ProgressWithoutTerminalCompletionIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	progress := `{"findings":[],"risk_level":"low"}`
+	bin := writeFakeCodex(t, dir, `#!/bin/sh
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"{\"findings\":[],\"risk_level\":\"low\"}"}}'
+sleep 100
+	`, strings.Join([]string{
+		"@echo off",
+		"echo {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"findings\\\":[],\\\"risk_level\\\":\\\"low\\\"}\"}}",
+		"ping -n 101 127.0.0.1 > nul",
+	}, "\r\n"))
+
+	// The turn is ended by the streamed progress arriving, not by a wall
+	// clock: the fake emits one line and then hangs forever, so a fixed
+	// millisecond budget was really a race between process spawn and the
+	// deadline, and it lost on a loaded machine. Cancelling from the chunk
+	// callback makes the same scenario deterministic - progress streamed,
+	// never a terminal completion - at any load. The outer budget only stops
+	// the test hanging if the chunk never arrives at all.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var chunks []string
+	result, err := (&codexAgent{bin: bin}).Run(ctx, RunOpts{
+		Prompt: "review",
+		CWD:    dir,
+		OnChunk: func(text string) {
+			chunks = append(chunks, text)
+			cancel()
+		},
+	})
+	if err == nil {
+		t.Fatal("expected progress-only turn to fail without native completion")
+	}
+	if result != nil {
+		t.Fatalf("progress-only result = %+v, want nil", result)
+	}
+	if len(chunks) != 1 || chunks[0] != progress {
+		t.Fatalf("streamed progress = %q, want %q", chunks, progress)
+	}
+}
+
 func TestCodexAgent_RunIncludesJSONLErrorOnExitFailure(t *testing.T) {
 	dir := t.TempDir()
 	bin := writeFakeCodex(t, dir, `#!/bin/sh
@@ -273,6 +378,47 @@ exit 1
 	}
 	if !strings.Contains(err.Error(), "schema rejected by codex") {
 		t.Fatalf("expected JSONL error in message, got %v", err)
+	}
+}
+
+// TestCodexAgent_FailedExitCarriesCumulativeUsageMarker proves a turn that
+// reported usage and then exited non-zero still returns codex's own session
+// facts. codex counts usage cumulatively across a resumed thread, so a result
+// missing SessionUsageCumulative is recorded as a per-round delta and charges
+// every earlier round of the thread a second time.
+func TestCodexAgent_FailedExitCarriesCumulativeUsageMarker(t *testing.T) {
+	dir := t.TempDir()
+	bin := writeFakeCodex(t, dir, `#!/bin/sh
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-1"}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":2500,"output_tokens":250,"cached_input_tokens":1800}}'
+exit 1
+`, strings.Join([]string{
+		"@echo off",
+		"echo {\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}",
+		"echo {\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":2500,\"output_tokens\":250,\"cached_input_tokens\":1800}}",
+		"exit /b 1",
+	}, "\r\n"))
+
+	ca := &codexAgent{bin: bin}
+	res, err := ca.Run(context.Background(), RunOpts{
+		Prompt:  "review",
+		CWD:     t.TempDir(),
+		Session: &SessionRef{ID: "thread-1"},
+	})
+	if err == nil {
+		t.Fatal("expected codex failure")
+	}
+	if res == nil {
+		t.Fatal("failed codex turn that reported usage must return its usage")
+	}
+	if !res.UsageReported || res.Usage.InputTokens != 2500 {
+		t.Fatalf("usage = %+v, want reported input 2500", res.Usage)
+	}
+	if !res.SessionUsageCumulative {
+		t.Fatal("failed codex turn must mark its usage cumulative")
+	}
+	if !res.Resumed {
+		t.Fatal("failed codex turn must report the resume it was asked for")
 	}
 }
 

@@ -10,12 +10,15 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/andrew-codes/no-mistakes/internal/agent"
 	"github.com/andrew-codes/no-mistakes/internal/config"
 	"github.com/andrew-codes/no-mistakes/internal/db"
+	"github.com/andrew-codes/no-mistakes/internal/forgecontext"
 	"github.com/andrew-codes/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/runenv"
 	"github.com/andrew-codes/no-mistakes/internal/scm"
 	"github.com/andrew-codes/no-mistakes/internal/types"
 )
@@ -28,9 +31,9 @@ func TestPRStep_GhNotAvailable(t *testing.T) {
 		t.Skip("gh is available, skipping unavailable test")
 	}
 
-	dir := t.TempDir()
+	dir, baseSHA, headSHA := setupGitRepo(t)
 	ag := &mockAgent{name: "test"}
-	sctx := newTestContextWithDBRecords(t, ag, dir, "abc", "def", config.Commands{})
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 
 	step := &PRStep{}
 	outcome, err := step.Execute(sctx)
@@ -94,6 +97,101 @@ func TestPRStep_UpdatesExistingPR(t *testing.T) {
 	}
 	if run.PRURL == nil || *run.PRURL != "https://github.com/test/repo/pull/42" {
 		t.Errorf("PR URL = %v, want https://github.com/test/repo/pull/42", run.PRURL)
+	}
+}
+
+func TestPRStep_MalformedPRListFailsClosed(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	env, logFile := fakeGH(t, "")
+	env = append(env, "FAKE_CLI_PR_LIST_JSON=[{")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+
+	_, err := (&PRStep{}).Execute(sctx)
+	if err == nil {
+		t.Fatal("Execute() error = nil, want malformed PR-list error")
+	}
+	if !strings.Contains(err.Error(), "parse gh pr list JSON") {
+		t.Fatalf("Execute() error = %v, want GitHub parse context", err)
+	}
+
+	logData, readErr := os.ReadFile(logFile)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	ghLog := string(logData)
+	if !strings.Contains(ghLog, "pr list --head feature ") || !strings.Contains(ghLog, "--state open --json number,url,baseRefName") {
+		t.Fatalf("expected production PR lookup command, got:\n%s", ghLog)
+	}
+	if strings.Contains(ghLog, "pr create") || strings.Contains(ghLog, "pr edit") {
+		t.Fatalf("malformed lookup must stop before PR mutation, got:\n%s", ghLog)
+	}
+
+	run, readErr := sctx.DB.GetRun(sctx.Run.ID)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if run.PRURL != nil {
+		t.Fatalf("PR URL = %q, want nil after malformed lookup", *run.PRURL)
+	}
+	t.Logf("gh transcript:\n%sobserved pipeline error: %v\nstored PR URL: <nil>", ghLog, err)
+}
+
+func TestPRStep_UsesResolvedForgeProviderForSelfHostedRemote(t *testing.T) {
+	t.Parallel()
+	const credentialSentinel = "credential-must-not-enter-pr-artifacts"
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	env, logFile := fakeGH(t, "https://code.example.test/test/repo/pull/42")
+
+	ag := &mockAgent{name: "test"}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = append(env, "GH_TOKEN="+credentialSentinel)
+	sctx.Repo.UpstreamURL = "git@work-code:test/repo.git"
+	sctx.ForgeContext = &forgecontext.Context{
+		Provider: scm.ProviderGitHub,
+		Host:     "code.example.test",
+		Environment: runenv.Overlay{
+			Set:   map[string]string{"GH_CONFIG_DIR": "/profiles/work"},
+			Unset: []string{"GH_TOKEN"},
+		},
+	}
+
+	step := &PRStep{}
+	outcome, err := step.Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.Skipped {
+		t.Fatal("expected configured forge provider to handle an otherwise unknown remote host")
+	}
+
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "pr edit") {
+		t.Fatalf("expected gh to update the existing PR, got:\n%s", logData)
+	}
+	if !strings.Contains(string(logData), "auth status --hostname code.example.test") {
+		t.Fatalf("expected gh auth to use the frozen profile host, got:\n%s", logData)
+	}
+	if strings.Contains(string(logData), credentialSentinel) {
+		t.Fatalf("credential sentinel leaked into provider arguments or PR content:\n%s", logData)
+	}
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := json.Marshal(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), credentialSentinel) {
+		t.Fatalf("credential sentinel leaked into run record: %s", persisted)
 	}
 }
 
@@ -229,7 +327,7 @@ func TestPRStep_ZeroBaseSHA(t *testing.T) {
 	}
 }
 
-func TestPRStep_CreatesNewPR(t *testing.T) {
+func TestPRStep_CreatesConfiguredDraftPR(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 
@@ -240,6 +338,7 @@ func TestPRStep_CreatesNewPR(t *testing.T) {
 	ag := &mockAgent{name: "test"}
 	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = env
+	sctx.Config.Providers.GitHub.DraftPullRequests = true
 	reviewStep, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
 	if err != nil {
 		t.Fatal(err)
@@ -272,6 +371,9 @@ func TestPRStep_CreatesNewPR(t *testing.T) {
 	if !strings.Contains(ghLog, "pr create --head feature --base main") {
 		t.Fatalf("expected unset PR base to fall back to repository default branch, got:\n%s", ghLog)
 	}
+	if !strings.Contains(ghLog, "pr create --head feature --base main --repo test/repo --draft") {
+		t.Fatalf("expected configured GitHub PR creation to use --draft, got:\n%s", ghLog)
+	}
 	if !strings.Contains(ghLog, "--title chore: update pull request --body") {
 		t.Fatalf("expected fallback PR title to make no scope claim, got:\n%s", ghLog)
 	}
@@ -291,7 +393,13 @@ func TestPRStep_CreatesNewPR(t *testing.T) {
 		t.Fatal(err)
 	}
 	if run.PRURL == nil || *run.PRURL != "https://github.com/test/repo/pull/99" {
-		t.Errorf("PR URL = %v, want https://github.com/test/repo/pull/99", run.PRURL)
+		t.Fatalf("PR URL = %v, want https://github.com/test/repo/pull/99", run.PRURL)
+	}
+	for _, line := range strings.Split(ghLog, "\n") {
+		if strings.HasPrefix(line, "pr create ") {
+			t.Logf("provider command: gh %s\npersisted PR URL: %s", line, *run.PRURL)
+			break
+		}
 	}
 }
 
@@ -398,6 +506,10 @@ func TestPRStep_SkipsWhenBranchMatchesConfiguredBaseBranch(t *testing.T) {
 func TestPRStep_GitHubForkCreatesParentPRWithForkHead(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
+	profileDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(profileDir, "hosts.yml"), []byte("github.com:\n    user: fork-user\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	env, logFile := fakeGH(t, "")
 	ag := &mockAgent{
@@ -413,6 +525,13 @@ func TestPRStep_GitHubForkCreatesParentPRWithForkHead(t *testing.T) {
 	sctx.Repo.ForkURL = "https://github.com/fork-owner/no-mistakes.git"
 	sctx.Config.PR.BaseBranch = "develop"
 	sctx.Run.Branch = "refs/heads/feature"
+	forgeCtx, err := forgecontext.Resolve(context.Background(), config.ForgeProfiles{
+		"github.com": {GHConfigDir: profileDir},
+	}, sctx.Repo.UpstreamURL, sctx.Repo.ForkURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sctx.ForgeContext = forgeCtx
 
 	step := &PRStep{}
 	if _, err := step.Execute(sctx); err != nil {
@@ -438,6 +557,9 @@ func TestPRStep_GitHubForkCreatesParentPRWithForkHead(t *testing.T) {
 	}
 	if strings.Contains(ghLog, "pr create --head feature --") {
 		t.Fatalf("expected PR create to avoid bare fork head, got:\n%s", ghLog)
+	}
+	if forgeCtx == nil || forgeCtx.ConfigDir != profileDir {
+		t.Fatalf("fork PR used forge context %#v, want %s", forgeCtx, profileDir)
 	}
 }
 
@@ -625,6 +747,42 @@ func TestPRStep_BitbucketUsesProcessEnvWhenStepEnvIsNil(t *testing.T) {
 	}
 }
 
+func TestPRStep_UsesConfiguredTitleFormat(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	env, logFile := fakeGH(t, "")
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			if strings.Contains(opts.Prompt, "{{.Branch}}: {{.Title}}") {
+				t.Error("prompt exposed configured title format as agent instructions")
+			}
+			if !strings.Contains(opts.Prompt, "only the bare concise title text") {
+				t.Error("prompt did not request the bare title component")
+			}
+			payload := json.RawMessage(`{"title":"add widget","body":"## What Changed\n\n- add widget support"}`)
+			return &agent.Result{Output: payload}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Run.Branch = "refs/heads/feature/PROJ-123-add-widget"
+	sctx.Config.Commit.BranchPattern = `([A-Z]+-[0-9]+)`
+	sctx.Config.PR.TitleFormat = "{{.Branch}}: {{.Title}}"
+
+	if _, err := (&PRStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "--title PROJ-123: add widget") {
+		t.Fatalf("expected configured PR title, got:\n%s", logData)
+	}
+}
+
 func TestPRStep_UsesAgentGeneratedTitleAndBody(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
@@ -738,7 +896,7 @@ func TestPRStep_AppendsTestingSectionFromTestStep(t *testing.T) {
 	}
 	ghLog := string(logData)
 
-	wantOrder := "## Risk Assessment\n\n⚠️ Medium: touches critical error handling\n\n## Testing\n\n- 🔧 **Test** - 1 issue found → auto-fixed ✅\n\n## Pipeline"
+	wantOrder := "## Risk Assessment\n\n⚠️ Medium: touches critical error handling\n\n## Testing\n\n- 🔧 **Test** - 1 issue found → fix attempted; result not reported ✅\n\n## Pipeline"
 	if !strings.Contains(ghLog, wantOrder) {
 		t.Fatalf("expected testing section between risk assessment and pipeline, got:\n%s", ghLog)
 	}
@@ -906,7 +1064,7 @@ func TestAssemblePRBody_RetainsAttestationWhenCoreExceedsAzureCap(t *testing.T) 
 		{StepName: types.StepReview, Status: types.StepStatusCompleted},
 		{StepName: types.StepTest, Status: types.StepStatusFailed},
 	}
-	attestation := buildPipelineAttestation(steps, testPipelineHeadSHA)
+	attestation := buildPipelineAttestation(steps, nil, testPipelineHeadSHA)
 	pipelineMD := pipelineMarkdownForTest(strings.Repeat("review detail 😀 ", 1000))
 	pipelineMD = strings.Replace(pipelineMD, noMistakesPRSignature+"\n\n", noMistakesPRSignature+"\n\n"+attestation+"\n\n", 1)
 
@@ -1040,7 +1198,7 @@ func TestAppendGeneratedSections_RetainsPipelineAttestationWhenTruncated(t *test
 		{StepName: types.StepReview, Status: types.StepStatusCompleted},
 		{StepName: types.StepTest, Status: types.StepStatusSkipped},
 	}
-	attestation := buildPipelineAttestation(steps, testPipelineHeadSHA)
+	attestation := buildPipelineAttestation(steps, nil, testPipelineHeadSHA)
 	pipelineMD := pipelineMarkdownForTest(strings.Repeat("review round - "+strings.Repeat("x", 1000), 100))
 	pipelineMD = strings.Replace(pipelineMD, noMistakesPRSignature+"\n\n", noMistakesPRSignature+"\n\n"+attestation+"\n\n", 1)
 
@@ -1057,7 +1215,7 @@ func TestAppendGeneratedSections_RetainsAttestationWhenEssentialSectionsOverflow
 		{StepName: types.StepReview, Status: types.StepStatusCompleted},
 		{StepName: types.StepTest, Status: types.StepStatusFailed},
 	}
-	attestation := buildPipelineAttestation(steps, testPipelineHeadSHA)
+	attestation := buildPipelineAttestation(steps, nil, testPipelineHeadSHA)
 	pipelineMD := pipelineMarkdownForTest("review round 001")
 	pipelineMD = strings.Replace(pipelineMD, noMistakesPRSignature+"\n\n", noMistakesPRSignature+"\n\n"+attestation+"\n\n", 1)
 
@@ -1546,7 +1704,7 @@ func TestFallbackPRContentCapsBodyAfterPrependedIntent(t *testing.T) {
 		rounds = append(rounds, fmt.Sprintf("review round %03d - %s", i, strings.Repeat("x", 700)))
 	}
 
-	content := fallbackPRContent(
+	content, err := fallbackPRContent(
 		sctx,
 		"A\tinternal/pipeline/steps/pr.go",
 		"✅ Low: generated PR body length guard only",
@@ -1554,6 +1712,9 @@ func TestFallbackPRContentCapsBodyAfterPrependedIntent(t *testing.T) {
 		pipelineMarkdownForTest(rounds...),
 		0,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	assertGitHubBodyLimitForTest(t, content.Body)
 	for _, want := range []string{
@@ -1581,12 +1742,6 @@ func TestFallbackPRContentCapsBodyAfterPrependedIntent(t *testing.T) {
 	}
 }
 
-// twgCreateDescriptionForTest recovers the real (unmasked) --description
-// value the pipeline passed to the fake twg binary for the most recent
-// `bitbucket pull-requests create` invocation in logFile. fakeTwg matches
-// invocations by a masked argv key (see twgArgsKey/twgMaskedFlags), but the
-// dispatcher still writes the real, unmasked argv to the invocation log, so
-// content assertions read it from there instead of an HTTP request body.
 var twgCreateDescriptionRE = regexp.MustCompile(`(?s)bitbucket pull-requests create.*?--description (.*?) --workspace`)
 
 func twgCreateDescriptionForTest(t *testing.T, logFile string) string {
@@ -2182,5 +2337,277 @@ func TestPRStep_PromptGuidesScopeToRealModule(t *testing.T) {
 	}
 	if !strings.Contains(capturedPrompt, "fewer than 10 distinct") {
 		t.Errorf("expected PR prompt to convey typical module count heuristic, got:\n%s", capturedPrompt)
+	}
+}
+
+func TestPRStep_HangingAgentFallsBackAfterTimeout(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{
+		name: "hanging-pr-agent",
+		runFn: func(ctx context.Context, _ agent.RunOpts) (*agent.Result, error) {
+			<-ctx.Done()
+			return &agent.Result{Output: json.RawMessage(`{"title":"feat: late title","body":"## What Changed\n\n- late"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Config.AgentTimeout = 20 * time.Millisecond
+
+	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0)
+	if err != nil {
+		t.Fatalf("buildPRContent: %v", err)
+	}
+	if content.Title != "chore: update pull request" {
+		t.Fatalf("title = %q, want fallback after timeout", content.Title)
+	}
+	if strings.Contains(content.Body, "late") {
+		t.Fatalf("used late agent body after timeout: %s", content.Body)
+	}
+}
+
+func TestPRStep_LateSuccessAfterTimeoutDoesNotUseAgentTitle(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{
+		name: "late-pr-agent",
+		runFn: func(ctx context.Context, _ agent.RunOpts) (*agent.Result, error) {
+			<-ctx.Done()
+			return &agent.Result{Output: json.RawMessage(`{"title":"feat: should not ship","body":"## What Changed\n\n- should not ship"}`)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Config.AgentTimeout = 20 * time.Millisecond
+
+	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0)
+	if err != nil {
+		t.Fatalf("buildPRContent: %v", err)
+	}
+	if content.Title == "feat: should not ship" {
+		t.Fatal("late successful PR title was used after the deadline")
+	}
+}
+
+// TestPRStep_EmbeddedAttestationDoesNotShadowTheRealOne guards the compliance
+// check against the PR body's own evidence.
+//
+// require-no-mistakes reads the FIRST attestation comment in the body and binds
+// its head_sha to the PR head. A step agent that captures a generated PR body
+// as evidence embeds that body's attestation comment verbatim, carrying the
+// evidence run's head_sha; because the Testing section precedes the Pipeline
+// section, the embedded copy wins and the check fails a PR the pipeline did
+// produce. Seen live on kunchenguid/no-mistakes#831, whose test evidence
+// embedded three.
+func TestPRStep_EmbeddedAttestationDoesNotShadowTheRealOne(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			payload := json.RawMessage(`{"title":"fix(pipeline): keep the attestation authoritative","body":"## What Changed\n\n- guard the compliance marker"}`)
+			return &agent.Result{Output: payload}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	foreignSHA := strings.Repeat("f", 40)
+	embedded := pipelineAttestationCommentPrefix +
+		`{"head_sha":"` + foreignSHA + `","steps":[{"step":"review","status":"completed"}]}` +
+		pipelineAttestationCommentClosingToken
+	findings := `{"findings":[],"summary":"clean","testing_summary":"Captured the generated PR body as evidence.",` +
+		`"artifacts":[{"kind":"command-output","label":"generated PR body","content":"## Pipeline\n\n` +
+		strings.ReplaceAll(embedded, `"`, `\"`) + `"}]}`
+	insertCompletedStep(t, sctx, types.StepTest, findings, "")
+
+	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if n := strings.Count(content.Body, pipelineAttestationCommentPrefix); n != 1 {
+		t.Fatalf("expected exactly one parseable attestation marker, got %d:\n%s", n, content.Body)
+	}
+	// Mirror verify.py: first marker wins.
+	start := strings.Index(content.Body, pipelineAttestationCommentPrefix)
+	start += len(pipelineAttestationCommentPrefix)
+	end := strings.Index(content.Body[start:], pipelineAttestationCommentClosingToken)
+	if end < 0 {
+		t.Fatalf("attestation comment is not closed:\n%s", content.Body)
+	}
+	var attestation pipelineAttestation
+	if err := json.Unmarshal([]byte(content.Body[start:start+end]), &attestation); err != nil {
+		t.Fatalf("first attestation does not parse: %v", err)
+	}
+	if attestation.HeadSHA != sctx.Run.HeadSHA {
+		t.Fatalf("first attestation binds %q, want the run head %q", attestation.HeadSHA, sctx.Run.HeadSHA)
+	}
+	if strings.Contains(content.Body, foreignSHA+`","steps"`) && !strings.Contains(content.Body, escapedPipelineAttestationCommentPrefix) {
+		t.Fatalf("embedded attestation was neither neutralized nor removed:\n%s", content.Body)
+	}
+	// The evidence itself must survive; only the marker is altered.
+	if !strings.Contains(content.Body, foreignSHA) {
+		t.Fatalf("embedded evidence payload was dropped instead of neutralized:\n%s", content.Body)
+	}
+}
+
+// assertFirstAttestationBindsHead mirrors verify.py's parse: the FIRST
+// attestation comment in the body must be the pipeline-authored one carrying
+// the run head, and it must be the only parseable marker in the body.
+func assertFirstAttestationBindsHead(t *testing.T, body, headSHA string) {
+	t.Helper()
+	if n := strings.Count(body, pipelineAttestationCommentPrefix); n != 1 {
+		t.Fatalf("expected exactly one parseable attestation marker, got %d:\n%s", n, body)
+	}
+	start := strings.Index(body, pipelineAttestationCommentPrefix)
+	start += len(pipelineAttestationCommentPrefix)
+	end := strings.Index(body[start:], pipelineAttestationCommentClosingToken)
+	if end < 0 {
+		t.Fatalf("attestation comment is not closed:\n%s", body)
+	}
+	var attestation pipelineAttestation
+	if err := json.Unmarshal([]byte(body[start:start+end]), &attestation); err != nil {
+		t.Fatalf("first attestation does not parse: %v", err)
+	}
+	if attestation.HeadSHA != headSHA {
+		t.Fatalf("first attestation binds %q, want the run head %q", attestation.HeadSHA, headSHA)
+	}
+}
+
+// TestPRStep_AgentBodyAttestationDoesNotShadowTheRealOne extends the guard to
+// the PR-drafting agent's own prose. stripGeneratedSections drops an embedded
+// marker only when the agent wraps it in a "## Pipeline" section; one pasted
+// into the What Changed narrative survives verbatim, precedes the real
+// Pipeline section, and would win the compliance check's first-marker parse.
+func TestPRStep_AgentBodyAttestationDoesNotShadowTheRealOne(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	foreignSHA := strings.Repeat("e", 40)
+	embedded := pipelineAttestationCommentPrefix +
+		`{"head_sha":"` + foreignSHA + `","steps":[{"step":"review","status":"completed"}]}` +
+		pipelineAttestationCommentClosingToken
+	ag := &mockAgent{
+		name: "pr",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			payload, err := json.Marshal(prContent{
+				Title: "fix(pipeline): keep the attestation authoritative",
+				Body:  "## What Changed\n\n- reuses an earlier PR body verbatim:\n\n" + embedded,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &agent.Result{Output: json.RawMessage(payload)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	insertCompletedStep(t, sctx, types.StepTest, findingsJSON(t, types.Findings{TestingSummary: "Ran the focused suite."}), "")
+
+	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertFirstAttestationBindsHead(t, content.Body, sctx.Run.HeadSHA)
+	if !strings.Contains(content.Body, escapedPipelineAttestationCommentPrefix) || !strings.Contains(content.Body, foreignSHA) {
+		t.Fatalf("agent-authored attestation was neither neutralized nor kept readable:\n%s", content.Body)
+	}
+}
+
+// TestFallbackPRBodyAttestationDoesNotShadowTheRealOne covers the fallback
+// body, whose What Changed section embeds the final diff verbatim.
+func TestFallbackPRBodyAttestationDoesNotShadowTheRealOne(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	insertCompletedStep(t, sctx, types.StepTest, findingsJSON(t, types.Findings{TestingSummary: "Ran the focused suite."}), "")
+
+	foreignSHA := strings.Repeat("d", 40)
+	embedded := pipelineAttestationCommentPrefix +
+		`{"head_sha":"` + foreignSHA + `","steps":[{"step":"review","status":"completed"}]}` +
+		pipelineAttestationCommentClosingToken
+
+	pipelineMD, riskLine, testingMD := (&PRStep{}).buildPipelineSection(sctx, scm.ProviderGitHub)
+	content, err := fallbackPRContent(sctx, "A\t"+embedded, riskLine, testingMD, pipelineMD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertFirstAttestationBindsHead(t, content.Body, sctx.Run.HeadSHA)
+	if !strings.Contains(content.Body, escapedPipelineAttestationCommentPrefix) || !strings.Contains(content.Body, foreignSHA) {
+		t.Fatalf("fallback-embedded attestation was neither neutralized nor kept readable:\n%s", content.Body)
+	}
+}
+
+// TestPRStep_ForeignAttestationsInEveryComponentDoNotShadowTheRealOne is the
+// choke-point regression for the compliance marker.
+//
+// The earlier guards each cover one component. This plants a foreign marker in
+// every agent-derived component at once - agent body, extracted intent, review
+// finding, risk rationale, testing summary, tested detail, and artifact content
+// - because the first attempt at this fix neutralized the marker inside
+// escapePipelineFoldMarkers, which runs per render path: it covered the
+// artifact fence and tested details, missed another path, and PR #831 still
+// published three live foreign markers ahead of the real one.
+//
+// Fencing is not a defense. verify.py scans the raw body, so a marker inside a
+// ```text block counts exactly the same as one in prose.
+func TestPRStep_ForeignAttestationsInEveryComponentDoNotShadowTheRealOne(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	foreign := func(sha string) string {
+		return pipelineAttestationCommentPrefix +
+			`{"head_sha":"` + strings.Repeat(sha, 40) + `","steps":[{"step":"review","status":"completed"}]}` +
+			pipelineAttestationCommentClosingToken
+	}
+	planted := []string{"a", "b", "c", "d", "e", "f", "0"}
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			payload, err := json.Marshal(prContent{
+				Title: "fix(pipeline): keep the attestation authoritative",
+				Body:  "## What Changed\n\n- captured a prior PR body\n\n" + foreign("a"),
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &agent.Result{Output: json.RawMessage(payload)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.UserIntent = "Capture the generated PR body as evidence. " + foreign("b")
+
+	insertCompletedStep(t, sctx, types.StepReview, findingsJSON(t, types.Findings{
+		Items: []types.Finding{{
+			Severity:    types.FindingSeverityWarning,
+			Description: "prior body embedded " + foreign("c"),
+		}},
+		RiskLevel:     "low",
+		RiskRationale: "prior body embedded " + foreign("d"),
+	}), "")
+
+	insertCompletedStep(t, sctx, types.StepTest, findingsJSON(t, types.Findings{
+		TestingSummary: "Captured the published body: " + foreign("e"),
+		Tested:         []string{"diff prior-body.txt " + foreign("f")},
+		Artifacts: []types.TestArtifact{{
+			Kind:    "command-output",
+			Label:   "published PR body",
+			Content: "## Pipeline\n\n" + foreign("0"),
+		}},
+	}), "")
+
+	content, err := (&PRStep{}).buildPRContent(sctx, "feature", "main", baseSHA, scm.ProviderGitHub, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertFirstAttestationBindsHead(t, content.Body, sctx.Run.HeadSHA)
+
+	// Neutralized, not dropped: the evidence has to stay readable.
+	for _, sha := range planted {
+		if !strings.Contains(content.Body, strings.Repeat(sha, 40)) {
+			t.Errorf("planted payload %q... was dropped instead of neutralized:\n%s", strings.Repeat(sha, 8), content.Body)
+		}
 	}
 }

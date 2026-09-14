@@ -47,12 +47,13 @@ make install
 ## Prerequisites
 
 - **git** - required
-- **One supported agent runner** - `claude`, `codex`, `grok`, `acli` (Rovo Dev), `opencode`, `pi`, or `copilot`, or a configured Cursor/ACP runner such as `agent: cursor`; see [Global Config](/no-mistakes/reference/global-config/) for ACP requirements
+- **One supported agent runner** - `claude`, `codex`, `grok`, `acli` (Rovo Dev), `opencode`, `pi`, `copilot`, or `agy` (Antigravity), or a configured Cursor/ACP runner such as `agent: cursor`; see [Global Config](/no-mistakes/reference/global-config/) for ACP requirements
 - **Optional, for PRs and CI:**
   - `gh` CLI (GitHub)
   - `glab` CLI (GitLab)
   - `twg` CLI, installed and authenticated (Bitbucket Cloud)
   - `az` CLI with the `azure-devops` extension (Azure DevOps)
+  - `tea` CLI (Gitea)
 
 Run `no-mistakes doctor` to check native agents, ACP aliases such as `cursor`, provider tools, and whether the configured global runner can start a validation gate.
 Every validation gate requires a runnable pipeline agent and otherwise fails before its first pipeline step.
@@ -72,6 +73,7 @@ This downloads the latest release from GitHub, verifies the SHA-256 checksum, at
 `no-mistakes update` installs the latest stable release.
 Use `no-mistakes update --beta` to opt into prereleases and install the latest beta when one is newer than the current stable release.
 Use `no-mistakes update -y` to answer yes to the daemon-executable-mismatch prompt described below.
+Version discovery uses the GitHub release-asset CDN rather than the rate-limited REST API; see [`no-mistakes update`](/no-mistakes/reference/cli/#no-mistakes-update).
 
 Because `update` installs the latest official release binary, it installs a binary with the default self-hosted telemetry host and website ID. Disable telemetry with `NO_MISTAKES_TELEMETRY=0`, or override the host and website ID with `NO_MISTAKES_UMAMI_HOST` and `NO_MISTAKES_UMAMI_WEBSITE_ID`.
 

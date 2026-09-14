@@ -46,8 +46,10 @@ func TestSubscribeReceivesEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for step to reach awaiting_approval.
-	deadline := time.Now().Add(5 * time.Second)
+	// Wait for step to reach awaiting_approval. Reaching the gate spawns git
+	// and agent processes, which is slow on the process-spawn-bound Windows
+	// runner, so use the same Windows-aware budget as waitForDaemonReady.
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		steps, _ := d.GetStepsByRun(pushResult.RunID)
 		for _, s := range steps {
@@ -78,27 +80,68 @@ subscribeNow:
 		t.Fatal(err)
 	}
 
-	// Collect events until channel closes.
-	var events []ipc.Event
-	timeout := time.After(5 * time.Second)
+	// Collect events until channel closes. The stream closes only when the
+	// run ends, and completing the run after the approval is process-spawn-
+	// bound on Windows (worktree teardown and friends), so a fixed five-second
+	// window races the executor. Derive the close deadline from observed
+	// terminal state instead: poll get_run until the run is terminal, then
+	// require the stream to close promptly.
+	events := make(chan ipc.Event, 64)
+	go func() {
+		defer close(events)
+		for event := range ch {
+			events <- event
+		}
+	}()
+
+	var collected []ipc.Event
+	terminalDeadline := time.Now().Add(60 * time.Second)
+	for {
+		var result ipc.GetRunResult
+		callErr := client.Call(ipc.MethodGetRun, &ipc.GetRunParams{RunID: pushResult.RunID}, &result)
+		if callErr == nil && result.Run != nil &&
+			(result.Run.Status == types.RunCompleted || result.Run.Status == types.RunFailed || result.Run.Status == types.RunCancelled) {
+			break
+		}
+		for {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					t.Fatal("subscriber channel closed before the run reached a terminal state")
+				}
+				collected = append(collected, event)
+			default:
+				goto poll
+			}
+		}
+	poll:
+		if time.Now().After(terminalDeadline) {
+			t.Fatal("run never reached a terminal state")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	closeDeadline := time.Now().Add(30 * time.Second)
 	for {
 		select {
-		case event, ok := <-ch:
+		case event, ok := <-events:
 			if !ok {
 				goto verifyEvents
 			}
-			events = append(events, event)
-		case <-timeout:
-			t.Fatal("subscriber channel never closed")
+			collected = append(collected, event)
+		case <-time.After(100 * time.Millisecond):
+			if time.Now().After(closeDeadline) {
+				t.Fatal("subscriber channel never closed")
+			}
 		}
 	}
 
 verifyEvents:
-	if len(events) == 0 {
+	if len(collected) == 0 {
 		t.Fatal("received no events")
 	}
 	hasRunCompleted := false
-	for _, e := range events {
+	for _, e := range collected {
 		if e.Type == ipc.EventRunCompleted {
 			hasRunCompleted = true
 		}
@@ -212,20 +255,29 @@ func TestSubscribeToCompletedRunYieldsOneGapThenCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for the run to complete by polling get_run.
-	deadline := time.After(10 * time.Second)
-	for {
-		var result ipc.GetRunResult
-		if err := client.Call(ipc.MethodGetRun, &ipc.GetRunParams{RunID: pushResult.RunID}, &result); err != nil {
-			t.Fatal(err)
-		}
-		if result.Run != nil && (result.Run.Status == types.RunCompleted || result.Run.Status == types.RunFailed || result.Run.Status == types.RunCancelled) {
-			break
-		}
+	// Wait until the run is completed *for subscription purposes*, which is
+	// what this test's precondition needs. get_run cannot answer that: the
+	// executor writes the terminal status, and only afterwards does the run
+	// goroutine finish its post-run housekeeping and close the run's
+	// subscribers. Subscribing inside that window still registers a live
+	// mailbox, so the stream stays open until housekeeping ends - on Windows,
+	// longer than the close budget below.
+	//
+	// A subscription's own close is the daemon's signal for exactly this, so
+	// drain one to the end first. Both orderings are safe: if the run is
+	// already done, this subscription yields its gap and closes immediately.
+	warmup, cancelWarmup, err := ipc.Subscribe(p.Socket(), &ipc.SubscribeParams{RunID: pushResult.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancelWarmup()
+	deadline := time.After(60 * time.Second)
+	for draining := true; draining; {
 		select {
+		case _, ok := <-warmup:
+			draining = ok
 		case <-deadline:
 			t.Fatal("run did not complete in time")
-		case <-time.After(100 * time.Millisecond):
 		}
 	}
 
@@ -595,7 +647,13 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 				t.Fatal(err)
 			}
 			mockClaude := writeMockClaude(t, t.TempDir())
-			if err := os.WriteFile(p.ConfigFile(), []byte("agent: claude\nagent_path_override:\n  claude: "+mockClaude+"\n"), 0o644); err != nil {
+			profileDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(profileDir, "hosts.yml"), []byte("github.com:\n    user: recovery-user\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			globalConfig := "agent: claude\nagent_path_override:\n  claude: " + mockClaude +
+				"\nforge_profiles:\n  github.com:\n    gh_config_dir: " + profileDir + "\n"
+			if err := os.WriteFile(p.ConfigFile(), []byte(globalConfig), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			d, err := db.Open(p.DB())
@@ -643,6 +701,7 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 
 			ghDir, ghLog := writeMockGHState(t, t.TempDir(), state)
 			t.Setenv("PATH", ghDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("GH_TOKEN", "ambient-must-not-leak")
 			errCh := make(chan error, 1)
 			go func() {
 				errCh <- RunWithOptions(p, d, func() []pipeline.Step { return []pipeline.Step{&steps.CIStep{}} })
@@ -681,6 +740,9 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 			}
 			if !strings.Contains(string(logData), "pr view 42") {
 				t.Fatalf("startup reconciliation did not read current PR state: %s", logData)
+			}
+			if !strings.Contains(string(logData), "env:"+profileDir+" token:") {
+				t.Fatalf("startup reconciliation did not use the recovered forge environment: %s", logData)
 			}
 		})
 	}

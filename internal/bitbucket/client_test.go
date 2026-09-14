@@ -206,6 +206,33 @@ func TestClient_FindOpenPRBySourceBranch_NoResultsReturnsNil(t *testing.T) {
 	}
 }
 
+func TestClient_FindOpenPRBySourceBranch_RejectsInvalidEntry(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fquery\x1f--scope\x1frepo\x1f--source\x1ffeature\x1f--state\x1fOPEN\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
+
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{name: "missing id", data: `[{}]`},
+		{name: "zero id", data: `[{"id":0,"links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/0"}}}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, _ := newFakeTwgClient(t, map[string]fakeTwgResponse{
+				key: {Stdout: envelope(t, tc.data)},
+			})
+
+			pr, err := client.FindOpenPRBySourceBranch(context.Background(), repo, "feature", "")
+			if err == nil {
+				t.Fatal("expected error for a malformed pull request entry")
+			}
+			if pr != nil {
+				t.Fatalf("pr = %#v, want nil", pr)
+			}
+		})
+	}
+}
+
 func TestClient_CreatePR(t *testing.T) {
 	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
 	key := "bitbucket\x1fpull-requests\x1fcreate\x1f--title\x1ffeat: thing\x1f--source\x1ffeature\x1f--dest\x1fmain\x1f--description\x1fbody text\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--output\x1fjson"
@@ -213,7 +240,26 @@ func TestClient_CreatePR(t *testing.T) {
 		key: {Stdout: envelope(t, `{"id":99,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/99"}}}`)},
 	})
 
-	pr, err := client.CreatePR(context.Background(), repo, "feature", "main", "feat: thing", "body text")
+	pr, err := client.CreatePR(context.Background(), repo, "feature", "main", "feat: thing", "body text", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pr == nil || pr.ID != 99 {
+		t.Fatalf("pr = %#v, want id 99", pr)
+	}
+	if got := readFakeTwgLog(t, logFile); len(got) != 1 {
+		t.Fatalf("invocations = %v, want exactly 1", got)
+	}
+}
+
+func TestClient_CreatePR_PassesDraftFlagWhenRequested(t *testing.T) {
+	repo := RepoRef{Workspace: "test", RepoSlug: "repo"}
+	key := "bitbucket\x1fpull-requests\x1fcreate\x1f--title\x1ffeat: thing\x1f--source\x1ffeature\x1f--dest\x1fmain\x1f--description\x1fbody text\x1f--workspace\x1ftest\x1f--repo\x1frepo\x1f--draft\x1f--output\x1fjson"
+	client, logFile := newFakeTwgClient(t, map[string]fakeTwgResponse{
+		key: {Stdout: envelope(t, `{"id":99,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/test/repo/pull-requests/99"}}}`)},
+	})
+
+	pr, err := client.CreatePR(context.Background(), repo, "feature", "main", "feat: thing", "body text", true)
 	if err != nil {
 		t.Fatal(err)
 	}

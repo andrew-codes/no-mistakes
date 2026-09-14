@@ -17,8 +17,9 @@ import (
 type rovodevAgent struct {
 	bin       string
 	extraArgs []string
-	mu        sync.Mutex
-	server    *managedServer
+	subprocessContext
+	mu     sync.Mutex
+	server *managedServer
 }
 
 func (a *rovodevAgent) Name() string { return "rovodev" }
@@ -77,7 +78,7 @@ func (a *rovodevAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, erro
 	if err != nil {
 		// Best-effort cancel on error
 		a.cancelSession(baseURL, sessionID)
-		return nil, err
+		return resultFromUsage(usage), err
 	}
 
 	return finalizeTextResult("rovodev", text, opts.JSONSchema, usage)
@@ -94,7 +95,7 @@ func (a *rovodevAgent) ensureServer(ctx context.Context, cwd string, env []strin
 		return "", fmt.Errorf("rovodev port: %w", err)
 	}
 	args := buildRovodevServeArgs(a.extraArgs, port)
-	srv, err := startServerWithPort(ctx, "rovodev", a.bin, args, cwd, "/healthcheck", port, env)
+	srv, err := startServerWithPort(ctx, "rovodev", a.bin, args, cwd, "/healthcheck", port, a.overlay(), env)
 	if err != nil {
 		return "", fmt.Errorf("rovodev server: %w", err)
 	}

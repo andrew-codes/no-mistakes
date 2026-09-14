@@ -27,6 +27,7 @@ const (
 	ProviderBitbucket   Provider = "bitbucket"
 	ProviderAzureDevOps Provider = "azuredevops"
 	ProviderForgejo     Provider = "forgejo"
+	ProviderGitea       Provider = "gitea"
 	ProviderUnknown     Provider = "unknown"
 )
 
@@ -50,6 +51,31 @@ func DetectProviderContext(ctx context.Context, remoteURL string) Provider {
 // stray Forgejo setting cannot reroute GitHub, GitLab, Bitbucket, or Azure.
 func DetectProviderWithForgejoBaseURL(remoteURL, forgejoBaseURL string) Provider {
 	return DetectProviderContextWithForgejoBaseURL(context.Background(), remoteURL, forgejoBaseURL)
+}
+
+// DetectProviderStaticContext identifies providers from the remote URL and
+// SSH HostName resolution without consulting ambient gh, glab, or forgejo
+// configuration. It is used when a caller already selected an explicit
+// provider profile.
+func DetectProviderStaticContext(ctx context.Context, url string) Provider {
+	if provider := detectStaticProvider(url); provider != ProviderUnknown {
+		return provider
+	}
+	host := resolveHost(ctx, url, lookupSSHHostname)
+	if host == "" || strings.EqualFold(host, ExtractHost(url)) {
+		return ProviderUnknown
+	}
+	return detectStaticProvider(host)
+}
+
+// detectStaticProvider recognizes providers purely from URL/host text, with no
+// ambient CLI configuration consulted.
+func detectStaticProvider(url string) Provider {
+	lower := strings.ToLower(url)
+	if strings.Contains(lower, "codeberg.org") || strings.Contains(lower, "forgejo") {
+		return ProviderForgejo
+	}
+	return detectLegacyProviderHost(lower)
 }
 
 // DetectProviderContextWithForgejoBaseURL is DetectProviderWithForgejoBaseURL
@@ -76,6 +102,13 @@ func detectProviderWithForgejoBaseURL(ctx context.Context, remoteURL, forgejoBas
 	}
 	if ghKnowsHost(host) {
 		return ProviderGitHub
+	}
+	// Fallback for Gitea, which is nearly always self-hosted at an arbitrary
+	// hostname with no distinguishing substring at all: consult the tea CLI's
+	// own login config. If the remote's host is one tea is configured to talk
+	// to, treat it as Gitea.
+	if teaKnowsHost(host) {
+		return ProviderGitea
 	}
 	if strings.EqualFold(host, originalHost) {
 		if forgejoBaseMatchesRemote(forgejoBaseURL, remoteURL) {
@@ -114,6 +147,8 @@ func detectLegacyProviderHost(host string) Provider {
 	case strings.Contains(host, "bitbucket.org"):
 		return ProviderBitbucket
 	case strings.Contains(host, "dev.azure.com") || strings.Contains(host, "visualstudio.com"):
+		// Covers dev.azure.com, ssh.dev.azure.com, {org}.visualstudio.com, and
+		// the legacy vs-ssh.visualstudio.com SSH host.
 		return ProviderAzureDevOps
 	default:
 		return ProviderUnknown
@@ -417,6 +452,71 @@ func ghConfigPath() string {
 	return filepath.Join(home, ".config", "gh", "hosts.yml")
 }
 
+// teaKnowsHost reports whether host appears as a login's url (or ssh_host) in
+// tea's own config.yml. Any read/parse error is treated as "not configured" so
+// detection fails closed to ProviderUnknown.
+func teaKnowsHost(host string) bool {
+	_, ok := teaLoginForHost(host)
+	return ok
+}
+
+// ResolveGiteaLogin returns the name of the tea login configured for host, or
+// "" when tea has no login matching it. The gitea Host implementation needs
+// the login name itself (not just a yes/no match): unlike gh/glab, tea infers
+// "which instance" from the working directory's git remote, which the
+// daemon's detached bare-gate repo does not have, so every tea invocation
+// must carry --login <name> explicitly.
+func ResolveGiteaLogin(host string) string {
+	name, _ := teaLoginForHost(host)
+	return name
+}
+
+func teaLoginForHost(host string) (string, bool) {
+	path := teaConfigPath()
+	if path == "" {
+		return "", false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var cfg struct {
+		Logins []struct {
+			Name    string `yaml:"name"`
+			URL     string `yaml:"url"`
+			SSHHost string `yaml:"ssh_host"`
+		} `yaml:"logins"`
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return "", false
+	}
+	host = strings.ToLower(host)
+	for _, login := range cfg.Logins {
+		if url := strings.ToLower(strings.TrimSpace(login.URL)); url != "" && ExtractHost(url) == host {
+			return login.Name, true
+		}
+		if sshHost := strings.ToLower(strings.TrimSpace(stripPort(login.SSHHost))); sshHost != "" && sshHost == host {
+			return login.Name, true
+		}
+	}
+	return "", false
+}
+
+// teaConfigPath resolves tea's config file location. tea has no CLI-specific
+// override env var (unlike glab's GLAB_CONFIG_DIR or gh's GH_CONFIG_DIR); it
+// persists to $XDG_CONFIG_HOME/tea, falling back to ~/.config/tea. It returns
+// "" when no home/config directory can be determined.
+func teaConfigPath() string {
+	if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		return filepath.Join(dir, "tea", "config.yml")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "tea", "config.yml")
+}
+
 func (p Provider) CLIName() string {
 	switch p {
 	case ProviderGitHub:
@@ -429,6 +529,8 @@ func (p Provider) CLIName() string {
 		return "az"
 	case ProviderForgejo:
 		return "forgejo-axi"
+	case ProviderGitea:
+		return "tea"
 	default:
 		return ""
 	}
@@ -450,6 +552,8 @@ func (p Provider) AuthCheckCommand() []string {
 		return []string{"az", "account", "show"}
 	case ProviderForgejo:
 		return []string{"forgejo-axi", "status", "--json"}
+	case ProviderGitea:
+		return []string{"tea", "whoami"}
 	default:
 		return nil
 	}

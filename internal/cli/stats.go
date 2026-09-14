@@ -79,11 +79,11 @@ func renderAgentPerfReport(w io.Writer, database *db.DB, runID string) error {
 	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "PURPOSE\tCOUNT\tAVG\tTOTAL\tCOLD\tSTARTED\tRESUMED\tFALLBACK\tERRORS\tIN TOK\tOUT TOK\tCACHE READ TOK\tCACHE WRITE TOK\tFRESH IN TOK\tREASON TOK")
 	for _, a := range aggregates {
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
-			a.Purpose, a.Count,
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			invocationPurposeLabel(a.Purpose), a.Count,
 			formatMS(a.AvgDurationMS), formatMS(a.TotalDurationMS),
 			a.Cold, a.Started, a.Resumed, a.Fallback, a.Errors,
-			a.InputTokens, a.OutputTokens, a.CacheReadTokens, optInt64(a.CacheCreationTokens),
+			optInt64(a.InputTokens), optInt64(a.OutputTokens), optInt64(a.CacheReadTokens), optInt64(a.CacheCreationTokens),
 			optInt64(a.FreshInputTokens), optInt64(a.ReasoningTokens),
 		)
 	}
@@ -100,7 +100,7 @@ func renderAgentPerfReport(w io.Writer, database *db.DB, runID string) error {
 	for _, a := range aggregates {
 		metricsCov := fmt.Sprintf("%d/%d", a.MetricsRows, a.Count)
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			a.Purpose, metricsCov, optMS(a.SubprocessWaitMS),
+			invocationPurposeLabel(a.Purpose), metricsCov, optMS(a.SubprocessWaitMS),
 			optInt64(a.ModelRoundtrips), optInt64(a.ToolCalls),
 			optInt64(a.ToolWaitCalls), optInt64(a.ToolTestLintCalls), optInt64(a.ToolEditCalls), optInt64(a.ToolReadCalls), optInt64(a.ToolGitCalls), optInt64(a.ToolOtherCalls),
 		)
@@ -138,7 +138,7 @@ func renderRunAgentPerf(w io.Writer, database *db.DB, runID string) error {
 			exit += "/" + inv.FailureCategory
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			inv.StepName, inv.Round, inv.Purpose, inv.Agent, orUnknown(inv.Model),
+			invocationStepLabel(inv), inv.Round, invocationPurposeLabel(inv.Purpose), inv.Agent, orUnknown(inv.Model),
 			inv.SessionMode, inv.SessionKey,
 			formatMS(inv.DurationMS), formatModelTime(inv), optMS(inv.SubprocessWaitMS),
 			optInt(inv.ModelRoundtrips), formatToolHistogram(inv), optInt(inv.FindingCount),
@@ -149,20 +149,35 @@ func renderRunAgentPerf(w io.Writer, database *db.DB, runID string) error {
 		return err
 	}
 
-	// Table 2: per-round token deltas next to the raw (cumulative for resumed
-	// sessions) counters, so a cumulative counter cannot be misread as per-round.
+	// Table 2: per-round token deltas next to the raw counters (cumulative
+	// across a resumed session for codex; per-invocation for pi), so a
+	// cumulative counter cannot be misread as per-round.
 	fmt.Fprintln(w)
 	tw = tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "STEP\tROUND\tPURPOSE\tSESSION\tΔ IN (round)\tΔ OUT\tΔ CACHE RD\tIN (raw)\tOUT (raw)\tCACHE RD (raw)\tCACHE WR\tFRESH IN\tREASON")
 	for _, inv := range invocations {
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n",
-			inv.StepName, inv.Round, inv.Purpose, inv.SessionMode,
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			invocationStepLabel(inv), inv.Round, invocationPurposeLabel(inv.Purpose), inv.SessionMode,
 			optInt(inv.DeltaInputTokens), optInt(inv.DeltaOutputTokens), optInt(inv.DeltaCacheReadTokens),
-			inv.InputTokens, inv.OutputTokens, inv.CacheReadTokens,
+			optInt(inv.InputTokens), optInt(inv.OutputTokens), optInt(inv.CacheReadTokens),
 			optInt(inv.CacheCreationTokens), optInt(inv.FreshInputTokens), optInt(inv.ReasoningTokens),
 		)
 	}
 	return tw.Flush()
+}
+
+func invocationPurposeLabel(purpose string) string {
+	if purpose == "housekeeping" {
+		return "housekeeping (document+lint)"
+	}
+	return purpose
+}
+
+func invocationStepLabel(inv db.AgentInvocation) string {
+	if inv.Purpose == "housekeeping" {
+		return "document+lint"
+	}
+	return inv.StepName
 }
 
 func formatMS(ms int64) string {

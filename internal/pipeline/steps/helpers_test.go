@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -17,8 +16,11 @@ import (
 	"github.com/andrew-codes/no-mistakes/internal/config"
 	"github.com/andrew-codes/no-mistakes/internal/db"
 	"github.com/andrew-codes/no-mistakes/internal/pipeline"
+	"github.com/andrew-codes/no-mistakes/internal/pipeline/steps/internal/stepstest"
 	"github.com/andrew-codes/no-mistakes/internal/types"
 )
+
+var testGitExecutable, _ = exec.LookPath("git")
 
 type mockAgent struct {
 	name  string
@@ -137,6 +139,21 @@ func setupGitRepo(t *testing.T) (string, string, string) {
 func newTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA string, cmds config.Commands) *pipeline.StepContext {
 	t.Helper()
 
+	// Most step tests do not exercise remote transport. Give repositories that
+	// lack an explicitly configured origin a local one so incidental upstream
+	// refreshes stay hermetic. Without this, CI monitor tests fetch the
+	// placeholder github.com/test/repo URL; under process-saturated macOS CI the
+	// fetch can consume their entire idle timeout before the fake provider is
+	// queried.
+	if gitDir, err := os.Stat(filepath.Join(workDir, ".git")); err == nil && gitDir.IsDir() && testGitExecutable != "" {
+		if cmd := exec.Command(testGitExecutable, "-C", workDir, "remote", "get-url", "origin"); cmd.Run() != nil {
+			cmd = exec.Command(testGitExecutable, "-C", workDir, "remote", "add", "origin", workDir)
+			if output, addErr := cmd.CombinedOutput(); addErr != nil {
+				t.Fatalf("add hermetic test origin: %v: %s", addErr, output)
+			}
+		}
+	}
+
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	database, err := db.Open(dbPath)
 	if err != nil {
@@ -156,7 +173,7 @@ func newTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA stri
 		Agent:       ag,
 		Config:      &config.Config{Agent: types.AgentClaude, Commands: cmds},
 		DB:          database,
-		Log:         func(s string) {},
+		Log:         func(s string) { t.Log(s) },
 		LogChunk:    func(s string) {},
 		LogFile:     func(s string) {},
 	}
@@ -167,6 +184,8 @@ func newTestContext(t *testing.T, ag agent.Agent, workDir, baseSHA, headSHA stri
 func fakeCLIEnv(binDir string, vars map[string]string) []string {
 	env := []string{
 		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"FAKE_CLI_REAL_GIT=" + testGitExecutable,
+		"FAKE_CLI_HEAD_FROM_WORKTREE=1",
 	}
 	for k, v := range vars {
 		env = append(env, k+"="+v)
@@ -194,28 +213,10 @@ func fakeCLIBinDir(t *testing.T) string {
 	return dir
 }
 
-// linkTestBinary creates a hard link (or copy) of the current test binary
-// with the given name in binDir. On Windows, .exe is appended.
+// linkTestBinary places the tiny fake-CLI helper on PATH under name.
 func linkTestBinary(t *testing.T, binDir, name string) {
 	t.Helper()
-	exe, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runtime.GOOS == "windows" {
-		name += ".exe"
-	}
-	dst := filepath.Join(binDir, name)
-	if err := os.Link(exe, dst); err != nil {
-		// Fallback to copy if hard link fails (cross-device, etc.)
-		data, readErr := os.ReadFile(exe)
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		if err := os.WriteFile(dst, data, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
+	stepstest.LinkFakeCLI(t, binDir, name)
 }
 
 // fakeGH creates a mock gh binary in a temp dir and returns env entries for StepContext.Env.
@@ -233,13 +234,6 @@ func fakeGH(t *testing.T, prViewURL string) (env []string, logFile string) {
 	return env, logFile
 }
 
-// fakeTwgResponse describes what the fake twg binary should emit for one
-// matched invocation, keyed by its exact argv (see fakeTwg).
-type fakeTwgResponse struct {
-	Stdout   string
-	ExitCode int
-}
-
 // fakeGHWithBase behaves like fakeGH but additionally records the existing
 // PR's actual base branch, so the fake `gh pr list --base X` only returns the
 // PR when X matches it - mirroring GitHub's server-side base filtering.
@@ -255,6 +249,13 @@ func fakeGHWithBase(t *testing.T, prViewURL, prBase string) (env []string, logFi
 		"FAKE_CLI_PR_BASE": prBase,
 	})
 	return env, logFile
+}
+
+// fakeTwgResponse describes what the fake twg binary should emit for one
+// matched invocation, keyed by its exact argv (see fakeTwg).
+type fakeTwgResponse struct {
+	Stdout   string
+	ExitCode int
 }
 
 // twgEnvelope wraps data in twg's standard `--output json` response shape:

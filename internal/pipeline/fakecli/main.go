@@ -1189,6 +1189,9 @@ func fakeTWGPullRequests(args []string) {
 		if payload["state"] == "" {
 			payload["state"] = "OPEN"
 		}
+		if sourceCommit := os.Getenv("FAKE_CLI_BB_SOURCE_COMMIT"); sourceCommit != "" {
+			payload["source"] = map[string]any{"commit": map[string]string{"hash": sourceCommit}}
+		}
 		if fakeCLIHasFlag(rest, "--statuses") {
 			statuses := os.Getenv("FAKE_CLI_BB_STATUSES_JSON")
 			if statuses == "" {

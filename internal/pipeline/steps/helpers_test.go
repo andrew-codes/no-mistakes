@@ -366,6 +366,14 @@ func (api *fakeBitbucketAPI) withStatuses(statusesJSON string) *fakeBitbucketAPI
 	return api
 }
 
+// withSourceCommit seeds the PR's `source.commit.hash`, which
+// FetchFailedCheckTargetLogs verifies against the requested head before
+// trusting any of the PR's hydrated statuses.
+func (api *fakeBitbucketAPI) withSourceCommit(hash string) *fakeBitbucketAPI {
+	api.env["FAKE_CLI_BB_SOURCE_COMMIT"] = hash
+	return api
+}
+
 // withPipelineLog seeds the failed-step log text `pipeline get --pipeline
 // <buildNumber>` returns. buildNumber == "" sets the default log used when no
 // build-number-specific log is configured.

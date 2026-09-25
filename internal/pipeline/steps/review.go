@@ -61,6 +61,29 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	// Best-effort: a diff-stat failure leaves the workload unknown.
 	workload := reviewWorkload(ctx, sctx.WorkDir, baseSHA, sctx.Run.HeadSHA)
 
+	// The review conversation (see
+	// docs/src/content/docs/concepts/review-conversation.md).
+	//
+	// A reviewer session may be resumed by exactly one kind of turn: the
+	// finalize turn that receives the answers to the questions that same pass
+	// asked, where no code has changed in between. Every other entry into this
+	// step drops the identity first, so a stale session can never be seated as
+	// the certifier of code written after it reviewed. The cases that would
+	// otherwise do exactly that are a fix round (its fixes implement the
+	// findings of the session that would judge them) and a restart back to
+	// review after a CI repair (RestartFrom, which re-enters the step on a new
+	// head inside the same run, and therefore the same RunSessions). Dropping
+	// it here - before any turn of this round runs - also survives a daemon
+	// restart, because Forget deletes the persisted row too.
+	// askDir gates whether the reviewer may ASK (config only); readDir gates
+	// reading a conversation that already exists (config, or files on disk).
+	askDir := reviewConversationDir(sctx)
+	convDir := reviewConversationReadDir(sctx)
+	resumingAnswers := sctx.FinalizingAnswers && !sctx.Fixing && convDir != ""
+	if !resumingAnswers {
+		sctx.Sessions.Forget(pipeline.SessionRoleReviewer)
+	}
+
 	// In fix mode, ask the agent to fix issues first.
 	//
 	// The verification-discipline rules below (apply all fixes first, then one
@@ -233,7 +256,11 @@ Previous review findings to address:
 	// net-deleted-author-lines git-diff backstop for the removal-of-required
 	// class - a fixer round that net-deletes author-added lines parks
 	// regardless of intent source. Held pending a scope decision.
-	historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + fixRoundProvenanceClause(sctx) + userIntentPromptSection(sctx) + planSection + intentConformanceReviewClause(sctx) + pipelineDeliveryPhaseClause() + testguidance.Rule + testguidance.ReviewerAction
+	asked, err := loadReviewConversation(sctx, convDir)
+	if err != nil {
+		return nil, err
+	}
+	historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + settledQuestionsPromptSection(sctx) + supersededReviewHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + fixRoundProvenanceClause(sctx) + userIntentPromptSection(sctx) + planSection + intentConformanceReviewClause(sctx) + pipelineDeliveryPhaseClause() + testguidance.Rule + testguidance.ReviewerAction
 
 	if len(decisions) > 0 {
 		historySection += decisionSection + recordedDecisionReviewRule
@@ -359,7 +386,7 @@ Risk assessment (after listing all findings):
 - Set risk_level to "medium" if the change has room to improve but is safe to merge first with concerns addressed as follow-ups.
 - Set risk_level to "high" if the change should not be merged without explicit human approval - it is fundamental, risky, ambiguous, or has strong negative signals.
 - Provide a one-sentence risk_rationale explaining why you chose that risk level.
-- Set risk_scope to "source-or-external" when the assessment reflects source risk or enforceable external state, and to "pipeline-owned-delivery" only when it is based solely on a deferred outcome this run owns.%s%s%s`,
+- Set risk_scope to "source-or-external" when the assessment reflects source risk or enforceable external state, and to "pipeline-owned-delivery" only when it is based solely on a deferred outcome this run owns.%s%s%s%s`,
 		branch,
 		baseSHA,
 		sctx.Run.HeadSHA,
@@ -369,38 +396,81 @@ Risk assessment (after listing all findings):
 		historySection,
 		pathInstructions,
 		agent.MemoryFilesRule,
+		// LAST, so the on-prompt is the off-prompt plus this section and
+		// nothing else - the append-only property
+		// TestReviewStep_ConversationOffIsTodaysReview pins. It used to sit at
+		// the end of historySection, which upstream's later MemoryFilesRule
+		// then followed, inserting the protocol mid-prompt instead.
+		reviewQuestionProtocolSection(askDir, asked),
 	)
 
-	// Every review turn - the initial review and every post-fix rereview -
-	// deliberately runs session-free. Round N's fixes implement round N-1's
-	// review findings, so resuming any prior review turn's session would seat
-	// the prescriber of those fixes as their certifier: the rereview then
-	// verifies that its own prescription was implemented instead of judging
-	// whether the pipeline-authored code is correct (the mechanism behind a
-	// real shipped defect where one fix round wrote both wrong code and the
-	// test blessing it, and the resumed reviewer session passed them). The
-	// cross-round context a rereview legitimately needs travels in the
-	// explicit sanitized round-history section above; only the fixer keeps a
-	// durable session (executeFixMode), because it certifies nothing.
+	// A review PASS keeps one session; a review ROUND never inherits another
+	// round's. Round N's fixes implement round N-1's review findings, so
+	// resuming a review session across a code change would seat the prescriber
+	// of those fixes as their certifier: the rereview then verifies that its
+	// own prescription was implemented instead of judging whether the
+	// pipeline-authored code is correct (the mechanism behind a real shipped
+	// defect where one fix round wrote both wrong code and the test blessing
+	// it, and the resumed reviewer session passed them). Forget above is what
+	// enforces that, so what the reviewer role spans here is exactly one pass:
+	// the turn that asks, and the finalize turn that receives the answers. The
+	// cross-round context a rereview legitimately needs still travels only in
+	// the explicit sanitized round-history section above.
+	//
+	// The finalize turn's prompt is the WHOLE review prompt plus the answers,
+	// not a bare "here are your answers" message, because a resume can fail
+	// (dead session id, an adapter without resume support, session_reuse off).
+	// RunSessions then re-runs the same turn cold, and a self-sufficient prompt
+	// makes that a slower review rather than a meaningless one.
 	//
 	// A review whose final JSON fails validation is a formatting slip, not a
-	// verdict, so it is rerun as a fresh session-free review of the same
-	// prompt, told only the validation error, up to reviewAnalyzerMaxAttempts.
-	// Findings come only from the attempt that validates. Every other failure
-	// returns at once, and so does a rejection from a turn its deadline or a
-	// cancellation cut short.
+	// verdict, so it is rerun with the same prompt plus the validation error,
+	// up to reviewAnalyzerMaxAttempts. Findings come only from the attempt that
+	// validates. Every other failure returns at once, and so does a rejection
+	// from a turn its deadline or a cancellation cut short.
+	turnPrompt := prompt
+	sessionRole := pipeline.SessionRole("")
+	if convDir != "" && !sctx.Fixing {
+		// A fresh identity unless this is the finalize turn of the pass that
+		// asked; Forget above already dropped any stale one.
+		sessionRole = pipeline.SessionRoleReviewer
+	}
+	// The answers ride the prompt whenever a finalize turn runs, including the
+	// cold one that replays a fix round's rereview. Gating this on the session
+	// would mean answering a question a rereview asked did nothing at all and
+	// the step re-parked on the same question forever, because a fix round's
+	// rereview is deliberately session-free.
+	if sctx.FinalizingAnswers && convDir != "" {
+		// Reuses the load the prompt was built from rather than reading the two
+		// files again: no agent turn has run in between, so a second read can
+		// only return the same conversation, and loadReviewConversation logs
+		// every protocol note it finds - so re-reading also repeats each note
+		// in the operator's step log. The post-turn load further down is a
+		// different matter and stays: the turn itself may have written to the
+		// conversation.
+		if answers := reviewAnswersPromptSection(asked); answers != "" {
+			// The carried findings ride immediately after the answers, so the
+			// turn re-adjudicates what it already judged before it carries on.
+			turnPrompt = prompt + answers + carriedFindingsPromptSection(sctx.CarriedFindings)
+			how := "resuming"
+			if !resumingAnswers {
+				how = "replaying"
+			}
+			sctx.Log(fmt.Sprintf("%s the review with %d answered question(s)", how, len(asked.Answered())))
+		}
+	}
 	opts := agent.RunOpts{
-		Prompt:     prompt,
+		Prompt:     turnPrompt,
 		CWD:        sctx.WorkDir,
 		Env:        sctx.Env,
-		JSONSchema: reviewSchemaForDecisions(decisions),
+		JSONSchema: reviewSchemaForDecisions(decisions, sctx.FinalizingAnswers && convDir != ""),
 		OnChunk:    sctx.LogChunk,
 		Purpose:    "review",
 		Workload:   workload,
 	}
 	var findings Findings
 	for attempt := 1; ; attempt++ {
-		result, err := s.runReviewAgent(sctx, "agent review", "", opts)
+		result, err := s.runReviewAgent(sctx, "agent review", sessionRole, opts)
 		if err == nil {
 			findings, err = parseReviewAnalyzerOutput(result)
 			if err == nil {
@@ -413,7 +483,7 @@ Risk assessment (after listing all findings):
 			return nil, fmt.Errorf("validate review analyzer findings after %d attempts: %w", reviewAnalyzerMaxAttempts, err)
 		}
 		sctx.Log(fmt.Sprintf("review analyzer findings rejected (%s); rerunning the review (attempt %d of %d)", strings.ReplaceAll(err.Error(), "\n", "; "), attempt+1, reviewAnalyzerMaxAttempts))
-		opts.Prompt = prompt + reviewRetryNote(err)
+		opts.Prompt = turnPrompt + reviewRetryNote(err)
 	}
 
 	// Phase ownership boundary: drop findings that only claim later pipeline-
@@ -423,6 +493,32 @@ Risk assessment (after listing all findings):
 	if stripped, n := stripDeferredPipelineOwnedDeliveryFindings(findings); n > 0 {
 		sctx.Log(fmt.Sprintf("dropped %d deferred pipeline-owned delivery finding(s) (owned by later push/PR/CI steps)", n))
 		findings = stripped
+	}
+
+	// Read the conversation the turn that just ended left behind. Answers
+	// arriving mid-turn are recorded here, once, so the next COLD reviewer -
+	// in this run or a later one - reads them as settled; open questions
+	// become ask-user findings, which is what parks the step in
+	// waiting-on-answers. The step never completes on its own with a question
+	// open; a human's approval still can, and the PR body says so.
+	// Keyed on askDir, not the read dir: emitting a question finding is what
+	// PARKS the step, and a repository that has turned the conversation off
+	// must not have a fresh review inherit questions an earlier run asked.
+	// Delivering an answer to a finalize turn is the read-side case and is
+	// handled above; this is the ask-side one.
+	conv, err := loadReviewConversation(sctx, askDir)
+	if err != nil {
+		return nil, err
+	}
+	recordAnsweredQuestions(sctx, conv)
+	questionFindings := openReviewQuestionFindings(conv)
+	if len(questionFindings) > 0 {
+		if conv.QuestionsIncomplete {
+			sctx.Log("review parked: the reviewer's question history could not be read in full, so answers are refused and this gate needs a human decision")
+		} else {
+			sctx.Log(fmt.Sprintf("review is waiting on answers to %d question(s)", len(conv.Open())))
+		}
+		findings.Items = append(findings.Items, questionFindings...)
 	}
 
 	findings.Items = append(findings.Items, recordedDecisionFindings(decisions, findings.DecisionReviews)...)
@@ -441,12 +537,13 @@ Risk assessment (after listing all findings):
 	findingsJSON, _ := json.Marshal(findings)
 
 	return approvedReviewOutcome(reviewTargetSHA, &pipeline.StepOutcome{
-		NeedsApproval:   needsApproval,
-		AutoFixable:     len(findings.Items) > 0,
-		Findings:        string(findingsJSON),
-		ReviewedPaths:   findings.ReviewedPaths,
-		ReviewablePaths: reviewable,
-		FixSummary:      fixSummary,
+		NeedsApproval:     needsApproval,
+		AutoFixable:       len(findings.Items) > 0,
+		Findings:          string(findingsJSON),
+		ReviewedPaths:     findings.ReviewedPaths,
+		WithdrawnFindings: withdrawnFindings(findings),
+		ReviewablePaths:   reviewable,
+		FixSummary:        fixSummary,
 	})
 }
 
@@ -667,4 +764,25 @@ func reviewAgentError(ctx context.Context, timeout time.Duration, prefix string,
 		return fmt.Errorf("%s reached its absolute wall-clock limit after %s: %w", prefix, timeout, err)
 	}
 	return fmt.Errorf("%s: %w", prefix, err)
+}
+
+// withdrawnFindings is the answer round's retraction list. A blank id is
+// dropped: an entry that names nothing cannot retract anything, and letting it
+// through would clear on a typo. The reason travels with the id because a
+// retraction is a claim the reviewer makes, and the executor records it where
+// the finding's disappearance can be read back against it.
+//
+// Whether a round may retract at all is the executor's call, not this one's:
+// it owns the outstanding set and applies this list only on a finalize turn.
+func withdrawnFindings(findings Findings) []types.WithdrawnFinding {
+	if len(findings.WithdrawnFindings) == 0 {
+		return nil
+	}
+	withdrawn := make([]types.WithdrawnFinding, 0, len(findings.WithdrawnFindings))
+	for _, w := range findings.WithdrawnFindings {
+		if id := strings.TrimSpace(w.ID); id != "" {
+			withdrawn = append(withdrawn, types.WithdrawnFinding{ID: id, Reason: strings.TrimSpace(w.Reason)})
+		}
+	}
+	return withdrawn
 }

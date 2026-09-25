@@ -656,6 +656,7 @@ func mergeOutstandingFindingsJSON(existingRaw, additionalRaw string, reviewedPat
 		}
 		findings.ReviewedPaths = append([]string(nil), reviewedPaths...)
 		findings.DecisionReviews = currentDecisionReviews
+		findings.WithdrawnFindings = nil
 		encoded, err := types.MarshalFindingsJSON(findings)
 		if err != nil {
 			return existingRaw
@@ -672,6 +673,7 @@ func mergeOutstandingFindingsJSON(existingRaw, additionalRaw string, reviewedPat
 	}
 	merged.ReviewedPaths = append([]string(nil), reviewedPaths...)
 	merged.DecisionReviews = currentDecisionReviews
+	merged.WithdrawnFindings = nil
 	seenDecisionIDs := make(map[string]bool)
 	items := merged.Items[:0]
 	for _, item := range merged.Items {
@@ -776,4 +778,140 @@ func filterFindingsJSON(raw string, ids []string) string {
 		return raw
 	}
 	return filteredRaw
+}
+
+// dropReviewQuestionFindingsJSON removes the reviewer's own open-question
+// findings from an outstanding set.
+//
+// It is the one narrow exception to the append-only rule the rest of this file
+// enforces, and it exists because a review question is resolved by its ANSWER,
+// never by a coverage record: the conversation is its authority, which is why
+// every automatic resolver already stands aside at such a gate
+// (HasUnansweredReviewQuestion). Carrying one forward makes it immortal - the
+// finalize turn after an answer returns clean, the merge re-injects the old
+// question, the gate re-parks, and the gate resumer answers it again, for ever.
+//
+// Nothing is lost by dropping them: openReviewQuestionFindings re-emits every
+// question that is still open from the live conversation on EVERY review turn,
+// so an unanswered question comes straight back, while an answered one stays
+// gone. Keyed on the category rather than the "question-" ID prefix, like every
+// other consumer of these findings, and every other finding keeps upstream's
+// append-only guarantee untouched.
+//
+// The unreadable-question-history marker goes with them, keyed by its ID
+// because it deliberately carries no category, but for a DIFFERENT reason: it
+// has no File, so leaving it in the verification input sets hasUnanchoredFinding
+// in resolveVerifiedFindingsJSON and refuses to clear ANY selected finding while
+// the history is incomplete - which questions.ndjson being append-only makes
+// permanent. A genuinely fixed finding would then stay outstanding and the gate
+// re-park on it for ever. It is re-emitted from the live conversation on every
+// review turn exactly as the questions are, so dropping it loses nothing either.
+func dropReviewQuestionFindingsJSON(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	findings, err := types.ParseFindingsJSON(raw)
+	if err != nil {
+		return raw
+	}
+	kept := make([]types.Finding, 0, len(findings.Items))
+	for _, item := range findings.Items {
+		if item.Category == types.FindingCategoryReviewQuestion || item.ID == ReviewQuestionsUnreadableFindingID {
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if len(kept) == len(findings.Items) {
+		return raw
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	findings.Items = kept
+	encoded, err := types.MarshalFindingsJSON(findings)
+	if err != nil {
+		return raw
+	}
+	return encoded
+}
+
+// dropWithdrawnFindingsJSON removes the findings an answer round explicitly
+// retracted, by the ids it named.
+//
+// This is how a carried finding leaves the outstanding set on an ANSWER round,
+// and it replaces clearing-by-coverage there. The coverage rule stays exactly
+// as it is for fix rounds: a fix CHANGES the code, so a rereview that names the
+// file and stops reporting the defect is evidence the change worked. An answer
+// changes nothing but what the reviewer knows, so the same silence proves
+// nothing - it used to clear any carried finding whose file the finalize turn
+// happened to cover, including one the answer had no bearing on. Requiring the
+// turn to name what it retracts makes the retraction its own claim.
+// An operator-authored finding is never retractable, whatever the turn names.
+// It is not a claim the reviewer made, it is an instruction the operator gave,
+// so the reviewer has no standing to withdraw it - the same principle that
+// makes every automatic resolver stand aside at a review question. Such a
+// finding still leaves the outstanding set only on positive coverage or on the
+// operator's own approve, skip or abort.
+//
+// It returns the retractions it actually applied, so the caller can record the
+// reason each finding left by.
+func dropWithdrawnFindingsJSON(raw string, withdrawn []types.WithdrawnFinding) (string, []types.WithdrawnFinding) {
+	if raw == "" || len(withdrawn) == 0 {
+		return raw, nil
+	}
+	reasons := make(map[string]string, len(withdrawn))
+	for _, w := range withdrawn {
+		if w.ID != "" {
+			reasons[w.ID] = w.Reason
+		}
+	}
+	if len(reasons) == 0 {
+		return raw, nil
+	}
+	findings, err := types.ParseFindingsJSON(raw)
+	if err != nil {
+		return raw, nil
+	}
+	var applied []types.WithdrawnFinding
+	kept := make([]types.Finding, 0, len(findings.Items))
+	for _, item := range findings.Items {
+		if reason, named := reasons[item.ID]; named && item.Source != types.FindingSourceUser {
+			applied = append(applied, types.WithdrawnFinding{ID: item.ID, Reason: reason})
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if len(applied) == 0 {
+		return raw, nil
+	}
+	if len(kept) == 0 {
+		return "", applied
+	}
+	findings.Items = kept
+	encoded, err := types.MarshalFindingsJSON(findings)
+	if err != nil {
+		return raw, nil
+	}
+	return encoded, applied
+}
+
+// recordWithdrawnFindingsJSON stamps the retractions a round applied onto the
+// payload that round persists, so the round history says why a finding left
+// rather than only that it is gone. The carry-forward set is deliberately left
+// unstamped: these belong to the round that made them, not to every round
+// after it.
+func recordWithdrawnFindingsJSON(raw string, withdrawn []types.WithdrawnFinding) string {
+	if raw == "" || len(withdrawn) == 0 {
+		return raw
+	}
+	findings, err := types.ParseFindingsJSON(raw)
+	if err != nil {
+		return raw
+	}
+	findings.WithdrawnFindings = withdrawn
+	encoded, err := types.MarshalFindingsJSON(findings)
+	if err != nil {
+		return raw
+	}
+	return encoded
 }

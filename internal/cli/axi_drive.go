@@ -942,6 +942,31 @@ func driveRunWithReconciler(ctx context.Context, progress io.Writer, client *ipc
 				fmt.Fprintf(progress, "%s: protected-path refusal requires an explicit response; --yes leaves this gate awaiting a response\n", gate.Name)
 				return run, false, nil
 			}
+			// An open review question is resolved by an answer, so --yes has no
+			// standing consent to give. Without this it had: the question is an
+			// ask-user finding on the ordinary channel, so gateResolution
+			// selected its id like any other and sent --action fix, handing the
+			// FIXER the question text as work. It guessed an answer and edited
+			// code, the rereview re-emitted the still-open question, and the
+			// second gate was approved as already-fixed - pipeline-authored
+			// changes derived from a question no human ever saw. Same carve-out
+			// shape as the protected-path refusal above, and inert when the
+			// review conversation is off, because a review-question finding
+			// cannot exist then.
+			if pipeline.HasUnansweredReviewQuestion(gate.FindingsJSON) {
+				fmt.Fprintf(progress, "%s: an open review question needs an explicit answer (no-mistakes axi answer --question <id> --answer \"...\"); --yes leaves this gate awaiting one\n", gate.Name)
+				return run, false, nil
+			}
+			// The reviewer's question history could not be read in full, so
+			// the gate asks a human to decide it: answers are refused, and a
+			// fixer handed "decide this gate yourself" can only edit code and
+			// converge on an approve. Keyed on the finding ID rather than the
+			// review-question category, which this marker deliberately does not
+			// carry because the answer-first help would be wrong for it.
+			if pipeline.HasUnreadableReviewQuestionHistory(gate.FindingsJSON) {
+				fmt.Fprintf(progress, "%s: the reviewer's question history could not be read in full, so only a human can decide this gate; --yes leaves it awaiting a response\n", gate.Name)
+				return run, false, nil
+			}
 			if pipeline.HasUnvalidatedWorkRefusal(gate.FindingsJSON) {
 				fmt.Fprintf(progress, "%s: unvalidated work in the run worktree requires an explicit response; --yes leaves this gate awaiting a response\n", gate.Name)
 				return run, false, nil

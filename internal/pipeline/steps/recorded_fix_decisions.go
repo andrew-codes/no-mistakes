@@ -121,14 +121,26 @@ Respect pipeline phase ownership: a requirement solely about this run's later Pu
 Return decision_reviews with exactly one entry per decision_id: result satisfied, contradicted, or unverified, plus nonempty source-backed evidence. Satisfied means the tree meets the effective decision; if a later explicit human ruling supersedes it, identify that ruling and explain the resulting requirement. Contradicted names the required behavior and the contrary code or reverting commit. Unverified explains what could not be checked. Never infer satisfaction from missing changes or from the absence of ordinary findings. Contradicted and unverified decisions park for the human even when findings is empty. These assessments are part of this independent review, not a separate agent pass.
 `
 
-func reviewSchemaForDecisions(decisions []recordedFixDecision) json.RawMessage {
-	if len(decisions) == 0 {
+// withdrawals declares the retraction list, and only a finalize turn with the
+// conversation on may pass it: the property is meaningless to any other turn,
+// which is never told what a carried finding is, and declaring it anyway left
+// an opt-in feature visible in the agent contract of every repository that had
+// not turned the conversation on.
+func reviewSchemaForDecisions(decisions []recordedFixDecision, withdrawals bool) json.RawMessage {
+	if len(decisions) == 0 && !withdrawals {
 		return reviewFindingsSchema
 	}
-	// Preserve the findings-first property order of the review schema.
-	property := `"decision_reviews":{"type":"array","items":{"type":"object","properties":{"decision_id":{"type":"string"},"result":{"type":"string","enum":["satisfied","contradicted","unverified"]},"evidence":{"type":"string"}},"required":["decision_id","result","evidence"]}},`
-	schema := strings.Replace(string(reviewFindingsSchema), `"reviewed_paths":`, property+`"reviewed_paths":`, 1)
-	schema = strings.Replace(schema, `"required": ["findings",`, `"required": ["decision_reviews", "findings",`, 1)
+	schema := string(reviewFindingsSchema)
+	if withdrawals {
+		property := `"withdrawn_findings":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"reason":{"type":"string"}},"required":["id","reason"]},"description":"Answer rounds only: carried findings that no longer hold now the questions are answered. A carried finding you omit here is kept."},`
+		schema = strings.Replace(schema, `"tested":`, property+`"tested":`, 1)
+	}
+	if len(decisions) > 0 {
+		// Preserve the findings-first property order of the review schema.
+		property := `"decision_reviews":{"type":"array","items":{"type":"object","properties":{"decision_id":{"type":"string"},"result":{"type":"string","enum":["satisfied","contradicted","unverified"]},"evidence":{"type":"string"}},"required":["decision_id","result","evidence"]}},`
+		schema = strings.Replace(schema, `"reviewed_paths":`, property+`"reviewed_paths":`, 1)
+		schema = strings.Replace(schema, `"required": ["findings",`, `"required": ["decision_reviews", "findings",`, 1)
+	}
 	return json.RawMessage(schema)
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/steps"
 	"github.com/kunchenguid/no-mistakes/internal/types"
+	"github.com/kunchenguid/no-mistakes/internal/verificationplan"
 	"github.com/spf13/cobra"
 )
 
@@ -113,14 +114,15 @@ type stepView struct {
 
 // runView is a render-ready view of a pipeline run.
 type runView struct {
-	PiProfile   *agentcfg.PiProfile
-	ID          string
-	Branch      string
-	Status      string
-	HeadSHA     string
-	PRURL       string
-	CIReady     bool
-	CIReadyNoCI bool
+	PiProfile        *agentcfg.PiProfile
+	VerificationPlan *verificationplan.Snapshot
+	ID               string
+	Branch           string
+	Status           string
+	HeadSHA          string
+	PRURL            string
+	CIReady          bool
+	CIReadyNoCI      bool
 	// AwaitingAgentSince is the unix-seconds time the run parked at a gate
 	// awaiting the driving agent, or nil when the run is not parked. It powers
 	// the top-level parked signal in the run object.
@@ -146,6 +148,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 		CIOverrideReason:   r.CIOverrideReason,
 		TestOverrideReason: r.TestOverrideReason,
 		PiProfile:          r.PiProfile,
+		VerificationPlan:   r.VerificationPlan,
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
@@ -184,6 +187,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	rv := runView{
 		PiProfile:          r.PiProfile,
+		VerificationPlan:   r.VerificationPlan,
 		ID:                 r.ID,
 		Branch:             r.Branch,
 		Status:             string(r.Status),
@@ -485,6 +489,16 @@ func runObjectFieldWithKey(key string, rv runView) toon.Field {
 	fields = append(fields, toon.Field{Key: "head_sha", Value: rv.HeadSHA})
 	if rv.TestOverrideReason != "" {
 		fields = append(fields, toon.Field{Key: "test_override_reason", Value: rv.TestOverrideReason})
+	}
+	if p := rv.VerificationPlan; p != nil {
+		fields = append(fields, toon.Field{Key: "verification_plan", Value: toon.NewObject(
+			toon.Field{Key: "path", Value: p.Path},
+			toon.Field{Key: "sha256", Value: p.SHA256},
+			toon.Field{Key: "source_path", Value: p.SourcePath},
+			toon.Field{Key: "captured_at", Value: p.CapturedAt},
+		)})
+	} else {
+		fields = append(fields, toon.Field{Key: "verification_plan", Value: "none"})
 	}
 	if rv.PiProfile != nil {
 		fields = append(fields, toon.Field{Key: "pi_profile", Value: toon.NewObject(

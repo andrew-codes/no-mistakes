@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS runs (
     pr_base_branch       TEXT,
     omit_intent          INTEGER NOT NULL DEFAULT 0,
     pi_profile           TEXT,
+    verification_plan    TEXT,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
@@ -206,6 +207,8 @@ CREATE TABLE IF NOT EXISTS uncertified_pipeline_ranges (
 // were created before the referenced columns existed. Each statement must be
 // idempotent via its error being tolerated when the column already exists.
 var migrationStatements = []string{
+	`ALTER TABLE runs ADD COLUMN verification_plan TEXT`,
+	`CREATE TRIGGER IF NOT EXISTS runs_verification_plan_immutable BEFORE UPDATE OF verification_plan ON runs WHEN NEW.verification_plan IS NOT OLD.verification_plan BEGIN SELECT RAISE(ABORT, 'run verification plan is immutable'); END`,
 	`ALTER TABLE runs ADD COLUMN pi_profile TEXT`,
 	`CREATE TRIGGER IF NOT EXISTS runs_pi_profile_immutable BEFORE UPDATE OF pi_profile ON runs WHEN NEW.pi_profile IS NOT OLD.pi_profile BEGIN SELECT RAISE(ABORT, 'run Pi profile is immutable'); END`,
 	`ALTER TABLE repos ADD COLUMN fork_url TEXT`,

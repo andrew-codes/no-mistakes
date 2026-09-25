@@ -32,6 +32,10 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	if err != nil {
 		return nil, err
 	}
+	planSection, err := verificationPlanPromptSection(sctx)
+	if err != nil {
+		return nil, err
+	}
 	ctx := sctx.Ctx
 	baseSHA, err := resolveBranchBaseSHA(ctx, sctx, sctx.Run.BaseSHA, sctx.Repo.DefaultBranch)
 	if err != nil {
@@ -111,7 +115,7 @@ func (s *ReviewStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome,
 	var fixSummary string
 	if sctx.Fixing && !sctx.SkipFixExecution {
 		previousFindings := sanitizedPreviousFindingsForPrompt(sctx.PreviousFindings)
-		historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + decisionSection + testguidance.Rule
+		historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + planSection + decisionSection + testguidance.Rule
 		fixPrompt := fmt.Sprintf(
 			`Investigate previous review findings and address legitimate ones.
 
@@ -229,7 +233,7 @@ Previous review findings to address:
 	// net-deleted-author-lines git-diff backstop for the removal-of-required
 	// class - a fixer round that net-deletes author-added lines parks
 	// regardless of intent source. Held pending a scope decision.
-	historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + fixRoundProvenanceClause(sctx) + userIntentPromptSection(sctx) + intentConformanceReviewClause(sctx) + pipelineDeliveryPhaseClause() + testguidance.Rule + testguidance.ReviewerAction
+	historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + uncertifiedRoundHistoryPromptSection(sctx) + fixRoundProvenanceClause(sctx) + userIntentPromptSection(sctx) + planSection + intentConformanceReviewClause(sctx) + pipelineDeliveryPhaseClause() + testguidance.Rule + testguidance.ReviewerAction
 
 	if len(decisions) > 0 {
 		historySection += decisionSection + recordedDecisionReviewRule

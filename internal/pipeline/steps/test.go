@@ -36,6 +36,10 @@ func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	if err != nil {
 		return nil, err
 	}
+	planSection, err := verificationPlanPromptSection(sctx)
+	if err != nil {
+		return nil, err
+	}
 	ctx := sctx.Ctx
 	startHead := sctx.Run.HeadSHA
 	baseSHA, err := resolveBranchBaseSHA(ctx, sctx, sctx.Run.BaseSHA, sctx.Repo.DefaultBranch)
@@ -66,7 +70,7 @@ func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		sctx.Log("fix selection holds only the Test agent budget cut; re-running validation without a repair turn...")
 		fixSummary = NoChangesAppliedSummary
 	} else if sctx.Fixing {
-		historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + decisionSection + testguidance.Rule
+		historySection := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + planSection + decisionSection + testguidance.Rule
 		fixPrompt := fmt.Sprintf(
 			`Fix the failing tests in this repository. Reproduce the specific failure, identify the root cause, and fix either the tests or the code so that failure passes.
 
@@ -166,7 +170,7 @@ Previous test findings to address:
 	} else {
 		sctx.Log("baseline tests passed, asking agent to gather live evidence...")
 	}
-	reassessHistory := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + decisionSection + testguidance.Rule
+	reassessHistory := executionContextPromptSection(sctx.WorkDir) + roundHistoryPromptSection(sctx) + userIntentPromptSection(sctx) + planSection + decisionSection + testguidance.Rule
 	evidenceGuidance := fmt.Sprintf("- Write new evidence files into this evidence directory, never into the worktree: %s", evidenceDir)
 	if sctx.Config.Test.Evidence.StoreInRepo {
 		evidenceGuidance = fmt.Sprintf("- Write new evidence files into this evidence directory, never into the worktree; they are published to the repository's %s branch automatically and linked from the PR: %s", sctx.Config.Test.Evidence.Branch, evidenceDir)
@@ -180,6 +184,12 @@ Previous test findings to address:
 		}
 	}
 	trustedRunbook := trustedTestInstructionsSection(sctx) + budgetCutGuidanceSection(sctx)
+	fallbackGuidance := `- Never treat "do not run everything" as permission to run nothing: if no existing check drives a scenario, write or improve a focused test, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
+- If sufficient evidence is not possible, report a warning finding explaining what evidence is missing and why the user needs to decide what to do. When the blocker is a host capability or OS permission the agent's own process lacks (for example, the Screen Recording permission macOS requires to capture a native GUI application), name the specific capability or permission and how to grant it so the user can enable it and re-run, instead of retrying blindly or failing opaquely.`
+	if sctx.Run.VerificationPlan != nil {
+		fallbackGuidance = `- Never treat "do not run everything" as permission to run nothing: if no existing check drives a scenario, perform repeatable product verification and retain its artifact, or report the scenario untested with the missing capability and how to provide it.
+- Follow repository testing rules before changing permanent tests. A missing-test finding must name the observable failure, why existing checks and product evidence do not cover it, and the independent expected result.`
+	}
 	evidencePrompt := fmt.Sprintf(
 		`You are validating a code change by driving the product itself. Derive the scenarios this change must satisfy, then run each one against the real running product.
 
@@ -221,8 +231,7 @@ Evidence:
 - Only use command output as an artifact when that output directly demonstrates the end-user experience or requested behavior. Generic pass/fail, coverage, or clean-worktree output is not sufficient evidence.
 - If an existing automated test already drives a scenario end-to-end, run that test as the scenario and cite it as the evidence.
 - Do NOT run the complete repository test suite. Local Test is targeted validation of the requested intent; remote CI owns broad regression and remains mandatory before a PR is ready.
-- Never treat "do not run everything" as permission to run nothing: if no existing check drives a scenario, write or improve a focused test, perform manual verification with evidence, or report a warning finding that sufficient targeted evidence is not possible.
-- If sufficient evidence is not possible, report a warning finding explaining what evidence is missing and why the user needs to decide what to do. When the blocker is a host capability or OS permission the agent's own process lacks (for example, the Screen Recording permission macOS requires to capture a native GUI application), name the specific capability or permission and how to grant it so the user can enable it and re-run, instead of retrying blindly or failing opaquely.
+%s
 - Include a concise "testing_summary" sentence describing what you exercised and the overall result.
 - The "testing_summary" must account for the complete test step: baseline commands that already ran, scenarios driven, manual or evidence-producing checks, artifacts gathered, and the overall result.
 - Record the exact tests, manual checks, and evidence-producing steps you ran in a "tested" array. Prefer concrete commands or test selectors wrapped in backticks.
@@ -247,6 +256,7 @@ Rules:
 		configuredTestCommand,
 		trustedRunbook,
 		evidenceGuidance,
+		fallbackGuidance,
 		reassessHistory,
 		agent.MemoryFilesRule,
 	)

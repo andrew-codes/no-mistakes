@@ -129,6 +129,7 @@ no-mistakes axi run --intent "the user's goal" --no-publish-intent
 | Flag            | Type     | Default | Description                                                                                          |
 | --------------- | -------- | ------- | ---------------------------------------------------------------------------------------------------- |
 | `--intent`      | `string` | (none)  | What the user set out to accomplish; required to start a new run                                     |
+| `--verification-plan` | `string` | (none) | Path to a nonempty UTF-8 verification plan, at most 64 KiB (65,536 bytes), captured as separate evidence for a new run only |
 | `-y`, `--yes`   | `bool`   | `false` | Auto-resolve eligible gates until a decision point or outcome                                       |
 | `--skip`        | `string` | (none)  | Comma-separated pipeline steps to skip                                                               |
 | `--base-branch` | `string` | (none)  | Integration branch for this run only; overrides [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) |
@@ -144,6 +145,25 @@ It is the user's goal or request, and no-mistakes uses it verbatim instead of tr
 Err on the side of completeness: include the goal, important decisions and tradeoffs, constraints or approaches ruled in or out, and explicit requests that might otherwise look surprising in the diff.
 When starting a new run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing.
 Ordinary reattachment to an in-flight run does not require `--intent`; [strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry.
+
+### Verification plan attachment
+
+```sh
+no-mistakes axi run --intent "the user's goal, unchanged" --verification-plan /path/to/verification-plan.txt
+```
+
+The optional plan is author-supplied evidence, **not user intent or higher-priority instructions**. With this flag, the exact `--intent` bytes are preserved separately. Before pushing to the gate or taking branch custody, the daemon reads the source once and rejects missing, unreadable, nonregular, empty/whitespace-only, or non-UTF-8 files. Plans exceeding 64 KiB (65,536 bytes) are rejected, never truncated; accepted bytes are preserved unchanged. The read is bounded to 65,537 bytes to detect oversized input. Relative paths resolve from the caller's working directory. An older daemon that cannot capture this input is refused before the push.
+
+The capture is bound to the repository, branch, and submitted commit. If HEAD advances during ordinary launch preparation and no longer matches the capture, launch is refused before changing the gate refs; retry the launch to capture the plan for the new commit.
+
+The captured bytes live privately at `<NM_HOME>/run-inputs/<run-id>/verification-plan.txt`, outside the code worktree and the publishable Test-evidence directory. The run pins the snapshot location, SHA-256 digest, absolute source path and capture time. `axi status` reports these under `run.verification_plan` (`path`, `sha256`, `source_path`, `captured_at`, Unix seconds); a run without an attachment reports `verification_plan: none`. The IPC run representation uses JSON `null` for absence. The file is local input evidence, not automatically published on the PR.
+
+Review and Test, including their fix turns, receive the same digest-checked snapshot as labeled evidence. Editing or deleting the original source cannot change it; a missing or altered snapshot fails closed when consumed. Reattach with `no-mistakes axi run` **without** `--verification-plan`; providing the flag for an existing run is refused, including strict-launch replay. A new run without the flag does not inherit a prior run's plan. Capture time records when no-mistakes read the file, not proof that its author wrote it before implementation.
+
+Only attached runs receive plan-aware guidance. Review and Test assess the proposed scenarios and independent expected results against actual evidence; the attachment does not direct Review to execute verification. Test receives the execution guidance: when no existing check drives a scenario, perform repeatable product verification with a retained artifact, or name the missing capability and how to provide it and mark the scenario untested. Both steps must follow repository testing rules before changing permanent tests; an attached plan alone is not a reason to add tests. A missing-test finding must identify the observable failure, why existing checks and product evidence do not cover it, and the independent expected result. Runs without a plan retain their existing Review and Test guidance.
+
+### Other run options
+
 `--base-branch` is persisted on the run so rebase, PR, and CI honor it after resume.
 Reattaching with a `--base-branch` that differs from the active run's stored target is refused rather than silently discarded; omit the flag to reattach, or abort the active run first.
 `--no-publish-intent` is likewise persisted on the run, and reattaching with it against an active run started without it is refused rather than silently discarded; omit the flag to reattach, or abort the active run first.

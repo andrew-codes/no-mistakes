@@ -192,6 +192,7 @@ func TestCIStep_BitbucketAutoFixIncludesPipelineLogs(t *testing.T) {
 
 	api := newFakeBitbucketAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42").
 		withPRState("OPEN").
+		withSourceCommit(headSHA).
 		withStatuses(`[{"name":"test","key":"test","state":"FAILED","url":"https://bitbucket.org/test/repo/addon/pipelines/home#!/results/1"}]`).
 		withPipelineLog("1", "error log output")
 
@@ -268,6 +269,7 @@ func TestCIStep_BitbucketAutoFixAggregatesSelectedPipelineLogs(t *testing.T) {
 
 	api := newFakeBitbucketAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42").
 		withPRState("OPEN").
+		withSourceCommit(headSHA).
 		withStatuses(`[{"name":"build","state":"FAILED","url":"https://bitbucket.org/test/repo/addon/pipelines/home#!/results/1"},{"name":"test","state":"FAILED","url":"https://bitbucket.org/test/repo/addon/pipelines/home#!/results/2"}]`).
 		withPipelineLog("1", "build pipeline log").
 		withPipelineLog("2", "test pipeline log")

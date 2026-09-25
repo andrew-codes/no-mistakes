@@ -137,6 +137,19 @@ func TestFindPRReturnsErrorOnMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestFindPRReturnsErrorOnNullListing(t *testing.T) {
+	// A literal JSON `null` (e.g. a nil slice marshaled at the top level) must
+	// not be read as "no open PRs" - that reading would risk the PR step
+	// creating a duplicate PR.
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json": {stdout: "null"},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	if _, err := h.FindPR(context.Background(), "feature", ""); err == nil {
+		t.Fatal("expected error for a null listing, not a silent 'no open PRs'")
+	}
+}
+
 func TestFindPRReturnsCLIError(t *testing.T) {
 	h := New(bbTestCmdFactory(map[string]bbTestResponse{
 		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json": {stderr: "boom", code: 1},
@@ -253,19 +266,31 @@ func TestGetChecksReadsHydratedStatuses(t *testing.T) {
 func TestFetchFailedCheckTargetLogsFetchesFailedStepsPerBuild(t *testing.T) {
 	h := New(bbTestCmdFactory(map[string]bbTestResponse{
 		"twg bb pull-requests get 42 --statuses --workspace ws --repo repo -o json": {
-			stdout: `{"id":42,"_statuses":[{"name":"build","state":"FAILED","url":"https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/1"}]}`,
+			stdout: `{"id":42,"source":{"commit":{"hash":"abc123"}},"_statuses":[{"name":"build","state":"FAILED","url":"https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/1"}]}`,
 		},
 		"twg bb pipeline get --pipeline 1 --logs --failed-steps --lines 0 --workspace ws --repo repo": {
 			stdout: "error log output\n",
 		},
 	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
 
-	logs, err := h.FetchFailedCheckLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123", []string{"build"})
+	logs, err := h.FetchFailedCheckLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "abc123def456", []string{"build"})
 	if err != nil {
 		t.Fatalf("FetchFailedCheckLogs() error = %v", err)
 	}
 	if logs != "error log output" {
 		t.Fatalf("FetchFailedCheckLogs() = %q, want %q", logs, "error log output")
+	}
+}
+
+func TestFetchFailedCheckTargetLogsRefusesWhenPRSourceCommitIsStale(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests get 42 --statuses --workspace ws --repo repo -o json": {
+			stdout: `{"id":42,"source":{"commit":{"hash":"oldcommit"}},"_statuses":[{"name":"build","state":"FAILED","url":"https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/1"}]}`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	if _, err := h.FetchFailedCheckLogs(context.Background(), &scm.PR{Number: "42"}, "feature", "newcommitsha", []string{"build"}); err == nil {
+		t.Fatal("expected error when the PR's source commit does not match the requested head")
 	}
 }
 
@@ -277,6 +302,39 @@ func TestFetchFailedCheckTargetLogsReturnsEmptyForNoTargets(t *testing.T) {
 	}
 	if logs != "" {
 		t.Fatalf("FetchFailedCheckLogs() = %q, want empty", logs)
+	}
+}
+
+func TestLatestStatusesPicksNewestByTimestampNotArrayOrder(t *testing.T) {
+	// The older pass appears first in the array; only the timestamp shows
+	// it's stale. If LatestStatuses trusted array order it would keep the
+	// pass and drop the newer failure.
+	statuses := []CommitStatus{
+		{Key: "build", State: "SUCCESSFUL", UpdatedOn: "2026-01-01T00:00:00Z"},
+		{Key: "build", State: "FAILED", UpdatedOn: "2026-01-02T00:00:00Z"},
+	}
+	latest := LatestStatuses(statuses)
+	if len(latest) != 1 || latest[0].State != "FAILED" {
+		t.Fatalf("LatestStatuses() = %+v, want the newer FAILED status", latest)
+	}
+}
+
+func TestGetChecksReportsTheNewerStatusRegardlessOfHydrationOrder(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests get 42 --statuses --workspace ws --repo repo -o json": {
+			stdout: `{"id":42,"_statuses":[` +
+				`{"key":"build","state":"SUCCESSFUL","updated_on":"2026-01-01T00:00:00Z"},` +
+				`{"key":"build","state":"FAILED","updated_on":"2026-01-02T00:00:00Z"}` +
+				`]}`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	checks, err := h.GetChecks(context.Background(), &scm.PR{Number: "42"})
+	if err != nil {
+		t.Fatalf("GetChecks() error = %v", err)
+	}
+	if len(checks) != 1 || checks[0].Bucket != scm.CheckBucketFail {
+		t.Fatalf("GetChecks() = %+v, want a single failing check", checks)
 	}
 }
 

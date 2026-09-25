@@ -319,6 +319,21 @@ func TestLatestStatusesPicksNewestByTimestampNotArrayOrder(t *testing.T) {
 	}
 }
 
+func TestLatestStatusesPrefersCreatedOnOverUpdatedOnForOrdering(t *testing.T) {
+	// The older build (created first) has its updated_on touched after the
+	// newer build was created - e.g. Bitbucket re-delivering the same status.
+	// Ranking by updated_on would let the older build's SUCCESSFUL status
+	// outrank the newer build's FAILED status and report the wrong verdict.
+	statuses := []CommitStatus{
+		{Key: "build", State: "SUCCESSFUL", CreatedOn: "2026-01-01T00:00:00Z", UpdatedOn: "2026-01-03T00:00:00Z"},
+		{Key: "build", State: "FAILED", CreatedOn: "2026-01-02T00:00:00Z", UpdatedOn: "2026-01-02T00:00:00Z"},
+	}
+	latest := LatestStatuses(statuses)
+	if len(latest) != 1 || latest[0].State != "FAILED" {
+		t.Fatalf("LatestStatuses() = %+v, want the status with the newer created_on (FAILED)", latest)
+	}
+}
+
 func TestGetChecksReportsTheNewerStatusRegardlessOfHydrationOrder(t *testing.T) {
 	h := New(bbTestCmdFactory(map[string]bbTestResponse{
 		"twg bb pull-requests get 42 --statuses --workspace ws --repo repo -o json": {

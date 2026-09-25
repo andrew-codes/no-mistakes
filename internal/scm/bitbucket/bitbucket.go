@@ -495,11 +495,15 @@ func LatestStatuses(statuses []CommitStatus) []CommitStatus {
 }
 
 // statusTimestamp returns the best available time for a status (preferring
-// updated_on, falling back to created_on), or the zero time when neither
+// created_on, falling back to updated_on), or the zero time when neither
 // parses, which sorts as oldest and preserves prior best-effort ordering for
-// entries the hydration did not timestamp.
+// entries the hydration did not timestamp. created_on is preferred because it
+// establishes when a build was created and is stable for a given key: if a
+// status is later updated (e.g. transitioning from INPROGRESS to FAILED),
+// preferring updated_on would let that edit make an older build outrank a
+// newer build's status, picking the wrong CI verdict.
 func statusTimestamp(status CommitStatus) time.Time {
-	for _, raw := range []string{status.UpdatedOn, status.CreatedOn} {
+	for _, raw := range []string{status.CreatedOn, status.UpdatedOn} {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue

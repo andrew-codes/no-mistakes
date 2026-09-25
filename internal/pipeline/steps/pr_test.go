@@ -400,6 +400,285 @@ func TestPRStep_BitbucketCLIUnavailableSkipsBeforeBuildingContent(t *testing.T) 
 	}
 }
 
+func TestPRStep_ZeroBaseSHA(t *testing.T) {
+	t.Parallel()
+	// New branch scenario: baseSHA is all-zeros, commit log should still work
+	dir := t.TempDir()
+	gitCmd(t, dir, "init")
+	gitCmd(t, dir, "config", "user.name", "test")
+	gitCmd(t, dir, "config", "user.email", "test@test.com")
+	gitCmd(t, dir, "checkout", "-b", "main")
+	os.WriteFile(filepath.Join(dir, "base.txt"), []byte("base"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "base commit")
+
+	gitCmd(t, dir, "checkout", "-b", "feature")
+	os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "add feature")
+	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+
+	env, logFile := fakeGH(t, "")
+
+	ag := &mockAgent{name: "test"}
+	zeroSHA := "0000000000000000000000000000000000000000"
+	sctx := newTestContextWithDBRecords(t, ag, dir, zeroSHA, headSHA, config.Commands{})
+	sctx.Env = env
+
+	step := &PRStep{}
+	outcome, err := step.Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.NeedsApproval {
+		t.Error("pr step should never need approval")
+	}
+
+	// Verify gh pr create was called (not blocked by zero SHA)
+	logData, _ := os.ReadFile(logFile)
+	if !strings.Contains(string(logData), "pr create") {
+		t.Errorf("expected gh pr create, got:\n%s", logData)
+	}
+}
+
+func TestPRStep_CreatesConfiguredDraftPR(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+
+	// No existing PR - pr view returns exit 1
+	env, logFile := fakeGH(t, "")
+
+	findings := `{"findings":[],"summary":"clean","risk_level":"medium","risk_rationale":"touches critical error handling"}`
+	ag := &mockAgent{name: "test"}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Config.Providers.GitHub.DraftPullRequests = true
+	reviewStep, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sctx.DB.UpdateStepStatus(reviewStep.ID, types.StepStatusCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if err := sctx.DB.SetStepFindings(reviewStep.ID, findings); err != nil {
+		t.Fatal(err)
+	}
+
+	step := &PRStep{}
+	outcome, err := step.Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outcome.NeedsApproval {
+		t.Error("pr step should never need approval")
+	}
+
+	// Verify gh pr create was called
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghLog := string(logData)
+	if !strings.Contains(ghLog, "pr create") {
+		t.Errorf("expected gh pr create to be called, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "pr create --head feature --base main") {
+		t.Fatalf("expected unset PR base to fall back to repository default branch, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "pr create --head feature --base main --repo test/repo --draft") {
+		t.Fatalf("expected configured GitHub PR creation to use --draft, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "--title chore: update pull request --body") {
+		t.Fatalf("expected fallback PR title to make no scope claim, got:\n%s", ghLog)
+	}
+	if strings.Contains(ghLog, "--title feat: add feature") {
+		t.Fatalf("expected fallback PR title to exclude commit-history scope, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "## Risk Assessment\n\n⚠️ Medium: touches critical error handling") {
+		t.Fatalf("expected fallback PR body to append risk note under Risk Assessment heading, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "A\tfeature.txt") {
+		t.Fatalf("expected fallback PR body to derive scope from the final diff, got:\n%s", ghLog)
+	}
+
+	// Verify PR URL was stored
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.PRURL == nil || *run.PRURL != "https://github.com/test/repo/pull/99" {
+		t.Fatalf("PR URL = %v, want https://github.com/test/repo/pull/99", run.PRURL)
+	}
+	for _, line := range strings.Split(ghLog, "\n") {
+		if strings.HasPrefix(line, "pr create ") {
+			t.Logf("provider command: gh %s\npersisted PR URL: %s", line, *run.PRURL)
+			break
+		}
+	}
+}
+
+func TestPRStep_UsesConfiguredBaseBranch(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ensureLocalBranch(t, dir, "develop", baseSHA)
+	env, logFile := fakeGH(t, "")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Config.PR.BaseBranch = "develop"
+
+	if _, err := (&PRStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "pr list --head feature ") {
+		t.Fatalf("expected PR lookup by branch, got:\n%s", logData)
+	}
+	if strings.Contains(string(logData), "pr list --head feature --base") {
+		t.Fatalf("expected PR lookup not to filter by base branch (would miss an existing PR opened against a different base), got:\n%s", logData)
+	}
+	if !strings.Contains(string(logData), "pr create --head feature --base develop") {
+		t.Fatalf("expected configured base branch in PR creation, got:\n%s", logData)
+	}
+}
+
+// TestPRStep_ExistingPRAgainstDifferentBaseIsUpdatedNotDuplicated reproduces
+// the bug where a maintainer changes pr.base_branch after a PR already exists
+// against the old base. A base-filtered `gh pr list` would then miss that
+// still-open PR (GitHub filters server-side), so the step fell through to
+// `gh pr create` and opened a second, duplicate PR against the new base while
+// orphaning the original.
+func TestPRStep_ExistingPRAgainstDifferentBaseIsUpdatedNotDuplicated(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	env, logFile := fakeGHWithBase(t, "https://github.com/test/repo/pull/42", "develop")
+
+	ag := &mockAgent{name: "test"}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Config.PR.BaseBranch = "main"
+
+	if _, err := (&PRStep{}).Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghLog := string(logData)
+	if strings.Contains(ghLog, "pr create") {
+		t.Fatalf("expected existing PR to be updated, not duplicated with a new pr create, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "pr edit") {
+		t.Fatalf("expected gh pr edit to update the existing PR, got:\n%s", ghLog)
+	}
+
+	run, err := sctx.DB.GetRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.PRURL == nil || *run.PRURL != "https://github.com/test/repo/pull/42" {
+		t.Errorf("PR URL = %v, want the existing PR to remain https://github.com/test/repo/pull/42", run.PRURL)
+	}
+}
+
+// TestPRStep_SkipsWhenBranchMatchesConfiguredBaseBranch reproduces the
+// 0530823 bug: with pr.base_branch configured to a branch other than the
+// repo's forge default, pushing directly to that configured base branch must
+// still skip PR creation instead of attempting a self-targeting PR. Before
+// that fix, the skip check compared only against sctx.Repo.DefaultBranch, so
+// a run on "develop" (configured base) would fall through to gh pr create.
+func TestPRStep_SkipsWhenBranchMatchesConfiguredBaseBranch(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	env, logFile := fakeGH(t, "")
+
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Config.PR.BaseBranch = "develop"
+	sctx.Run.Branch = "refs/heads/develop"
+
+	outcome, err := (&PRStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Skipped {
+		t.Fatal("expected PR creation to be skipped when branch matches configured base branch")
+	}
+
+	if logData, err := os.ReadFile(logFile); err == nil {
+		t.Fatalf("expected no gh invocation when branch matches configured base branch, got log:\n%s", logData)
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestPRStep_GitHubForkCreatesParentPRWithForkHead(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ensureLocalBranch(t, dir, "develop", baseSHA)
+	profileDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(profileDir, "hosts.yml"), []byte("github.com:\n    user: fork-user\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	env, logFile := fakeGH(t, "")
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			payload := json.RawMessage(`{"title":"fix: route fork prs","body":"## Summary\n\n- open fork PR against parent"}`)
+			return &agent.Result{Output: payload}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Repo.UpstreamURL = "https://github.com/parent-owner/no-mistakes.git"
+	sctx.Repo.ForkURL = "https://github.com/fork-owner/no-mistakes.git"
+	sctx.Config.PR.BaseBranch = "develop"
+	sctx.Run.Branch = "refs/heads/feature"
+	forgeCtx, err := forgecontext.Resolve(context.Background(), config.ForgeProfiles{
+		"github.com": {GHConfigDir: profileDir},
+	}, sctx.Repo.UpstreamURL, sctx.Repo.ForkURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sctx.ForgeContext = forgeCtx
+
+	step := &PRStep{}
+	if _, err := step.Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghLog := string(logData)
+	if !strings.Contains(ghLog, "pr list --head feature --repo parent-owner/no-mistakes --state open --json number,url,baseRefName,headRefName,headRepositoryOwner") {
+		t.Fatalf("expected PR lookup to use parent repo and bare head branch, got:\n%s", ghLog)
+	}
+	if strings.Contains(ghLog, "pr list --head fork-owner:feature") {
+		t.Fatalf("PR lookup used unsupported owner-qualified --head, got:\n%s", ghLog)
+	}
+	if !strings.Contains(ghLog, "pr create --head fork-owner:feature --base develop --repo parent-owner/no-mistakes") {
+		t.Fatalf("expected PR create to target parent repo with fork owner head, got:\n%s", ghLog)
+	}
+	if strings.Contains(ghLog, "--repo fork-owner/no-mistakes") {
+		t.Fatalf("expected no self-PR against fork repo, got:\n%s", ghLog)
+	}
+	if strings.Contains(ghLog, "pr create --head feature --") {
+		t.Fatalf("expected PR create to avoid bare fork head, got:\n%s", ghLog)
+	}
+	if forgeCtx == nil || forgeCtx.ConfigDir != profileDir {
+		t.Fatalf("fork PR used forge context %#v, want %s", forgeCtx, profileDir)
+	}
+}
+
 func TestPRStep_UsesConfiguredTitleFormat(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

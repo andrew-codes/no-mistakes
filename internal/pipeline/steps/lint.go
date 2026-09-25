@@ -19,6 +19,9 @@ func (s *LintStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}
+	if outcome, err := settledRevalidationOutcome(sctx); err != nil || outcome != nil {
+		return outcome, err
+	}
 	ctx := sctx.Ctx
 	baseSHA, err := resolveBranchBaseSHA(ctx, sctx, sctx.Run.BaseSHA, sctx.Repo.DefaultBranch)
 	if err != nil {

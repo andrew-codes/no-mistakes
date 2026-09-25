@@ -29,12 +29,13 @@ What you do not get is PR automation and CI monitoring.
 
 | Step | GitHub | GitLab | Forgejo | Bitbucket Cloud | Azure DevOps | Gitea | Cursor Origin | [Provider Plugin](#custom-hosts-with-provider-plugins) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **PR** (create/update) | `gh` CLI, authenticated | `glab` CLI, authenticated | `forgejo-axi`, authenticated | `NO_MISTAKES_BITBUCKET_EMAIL` + `NO_MISTAKES_BITBUCKET_API_TOKEN` | `az` CLI + `azure-devops` extension, authenticated | `tea` CLI, authenticated | `origin` CLI, authenticated | configured plugin CLI (`status`, `pr create`/`update`) |
-| **CI** (polling, auto-fix) | `gh` CLI | `glab` CLI | `forgejo-axi` | same env vars | `az` CLI | `tea` CLI | `origin` CLI | configured plugin CLI (`status`, `pr checks`) |
-| **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
-| **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
+| **PR** (create/update) | `gh` CLI, authenticated | `glab` CLI, authenticated | `forgejo-axi`, authenticated | `twg` CLI, authenticated | `az` CLI + `azure-devops` extension, authenticated | `tea` CLI, authenticated | `origin` CLI, authenticated | configured plugin CLI (`status`, `pr create`/`update`) |
+| **CI** (polling, auto-fix) | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | `tea` CLI | `origin` CLI | configured plugin CLI (`status`, `pr checks`) |
+| **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
+| **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
 | **Failed check log fetching** | `gh` CLI | `glab` CLI | `forgejo-axi` when runtime routes are available | supported | not yet | supported | not yet | supported when plugin declares `failed_check_logs` |
 | **Review-bot findings and comments at the CI gate** | GitHub via `gh` CLI (check identity by app slug, comments from review threads) | GitLab via `glab` CLI (comments from unresolved discussion notes, matched by the bot's login; no check identity) | not supported | not supported | not supported | not supported | not supported | not supported |
+| **Review comments answered by the CI fix agent** (every unresolved human and bot comment becomes a finding; the step replies and resolves threads) | not supported | not supported | not supported | `twg` CLI | not supported | not supported | not supported | not supported |
 | **[Explicit issue closure](/no-mistakes/reference/cli/#closing-issues)** (`axi run --closes`) | `gh` CLI | `glab` CLI | not supported | not supported | not supported | not supported | not supported | not supported |
 | **[Transient-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)** (cancellations and pre-run infra failures) | `gh` CLI | not supported | not supported | not supported | not supported | not supported | not supported | not supported |
 
@@ -46,7 +47,7 @@ pushes to the configured target:
 - create or update the PR automatically
 - poll hosted CI according to the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - fetch failing job logs for the CI auto-fix loop when the provider exposes them
-- on GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, and provider plugins that declare `mergeable_state`, watch mergeability and fix merge conflicts when possible
+- on GitHub, GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, Cursor Origin, and provider plugins that declare `mergeable_state`, watch mergeability and fix merge conflicts when possible
 
 Draft PR and MR creation is configurable for supported providers. The [global](/no-mistakes/reference/global-config/#providersgithubdraft_pull_requests) and [per-repo](/no-mistakes/reference/repo-config/#providersgithubdraft_pull_requests) config references own provider support and behavior.
 
@@ -153,30 +154,31 @@ Fork PR routing is not implemented for Forgejo; a configured `fork_url` makes th
 
 ## Bitbucket Cloud
 
-Bitbucket Cloud uses the REST API directly rather than a provider CLI. Set two environment variables (and optionally a third):
+Install [`twg`](https://developer.atlassian.com/platform/teamwork-graph-cli/) and log in:
 
 ```sh
-export NO_MISTAKES_BITBUCKET_EMAIL=you@example.com
-export NO_MISTAKES_BITBUCKET_API_TOKEN=your-api-token
-
-# Optional: override the API base URL
-export NO_MISTAKES_BITBUCKET_API_BASE_URL=https://api.bitbucket.org/2.0
+twg login
 ```
 
-Get an API token from [Bitbucket account settings](https://bitbucket.org/account/settings/app-passwords/).
+`twg` owns Bitbucket Cloud authentication itself (credentials live in `~/.config/twg/auth.conf`), the same way `gh`/`glab`/`tea` own auth for their providers - no-mistakes never reads or holds a Bitbucket token directly. Verify without touching a real repository:
+
+```sh
+twg whoami
+```
 
 **What you get:**
 
 - PR creation and update
 - CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed pipeline step log fetching for the CI auto-fix step
+- Reading and changing an existing PR's destination branch (`twg bb pull-requests get`, `twg bb pull-requests update --dest`), so a per-run `--base-branch` retargets the open PR instead of failing the PR step. When no base was requested and Bitbucket does not report one, the PR step updates the PR in place and logs that it could not read the base
+- Mergeability polling and merge-conflict auto-fix, read from Bitbucket's own merge checks (`twg bb pull-requests mergeability`). A failed `git_mergeability_check` is a merge conflict. A failing, blocking `maximum_commits_behind` check means Bitbucket will not merge the branch until it is rebased onto its destination, so it takes the same rebase and revalidate repair; no-mistakes does not count commits behind itself. Checks that are `PENDING` or `UNKNOWN` keep the monitor waiting, and other merge checks (approvals, tasks, builds) are not read.
+
+- Review comments, human and bot, inline and general: each unresolved comment (read with `twg bb pull-requests comment query`) becomes a finding the CI fix agent addresses. After the fix the step replies on the comment (`twg bb pull-requests comment create --reply-to`) and resolves the thread where it changed the code; a comment the agent decides not to change gets a reply saying why and stays open. Notices such as a merge-on-green message, a review bot's summary, the pipeline's own attestation, and comments written by the authenticated `twg` user are ignored, and a thread is never answered twice. See the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
 
 **What you don't get (yet):**
 
-- PR mergeability polling
-- Merge-conflict auto-fix
-
-These are GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, and provider plugins (declaring `mergeable_state`) only right now.
+- Review-bot check findings (Bitbucket build statuses carry no app identity), explicit issue closure, and transient-check reruns, which are GitHub (and, for review-bot checks, GitLab) only right now.
 
 ## Azure DevOps
 
@@ -251,7 +253,7 @@ Verify with `tea logins list` (tea 0.x) or `tea auth status` (tea 1.0).
 
 **What you don't get (yet):**
 
-- PR mergeability polling and merge-conflict auto-fix. Gitea's PR `mergeable` field has a documented upstream reliability bug ([go-gitea/gitea#25849](https://github.com/go-gitea/gitea/issues/25849)) that can stick `false` after a conflict is actually resolved, so no-mistakes declines the capability rather than trust it - the same posture as Bitbucket Cloud.
+- PR mergeability polling and merge-conflict auto-fix. Gitea's PR `mergeable` field has a documented upstream reliability bug ([go-gitea/gitea#25849](https://github.com/go-gitea/gitea/issues/25849)) that can stick `false` after a conflict is actually resolved, so no-mistakes declines the capability rather than trust it.
 - Fork PR routing (same as all non-GitHub providers)
 - [Transient-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)
 
@@ -390,7 +392,7 @@ Everything before push (rebase, review, test, document, lint) still works regard
 no-mistakes doctor
 ```
 
-`doctor` checks `gh`, `az`, and `origin` availability. It also validates every configured forge profile, including its provider config, target host, and online authentication, and checks that every configured provider plugin's command resolves. Without profiles, confirm `glab` is installed and authenticated for GitLab. For Forgejo, run `FORGEJO_BASE_URL=<host> forgejo-axi status --json` from the daemon's environment. For Bitbucket Cloud, confirm the two env vars are set in that environment. For Azure DevOps, confirm the `azure-devops` extension is installed (`az extension show --name azure-devops`) and a PAT is available. For Gitea, confirm `tea` is installed and has a login configured for your instance (`tea logins list` on tea 0.x, `tea auth status` on tea 1.0). For Cursor Origin, confirm `origin auth status` succeeds.
+`doctor` checks `gh`, `az`, and `origin` availability. It also validates every configured forge profile, including its provider config, target host, and online authentication, and checks that every configured provider plugin's command resolves. Without profiles, confirm `glab` is installed and authenticated for GitLab. For Forgejo, run `FORGEJO_BASE_URL=<host> forgejo-axi status --json` from the daemon's environment. For Bitbucket Cloud, confirm `twg` is installed and authenticated (`twg whoami`). For Azure DevOps, confirm the `azure-devops` extension is installed (`az extension show --name azure-devops`) and a PAT is available. For Gitea, confirm `tea` is installed and has a login configured for your instance (`tea logins list` on tea 0.x, `tea auth status` on tea 1.0). For Cursor Origin, confirm `origin auth status` succeeds.
 
 :::note
 Provider CLIs and credentials inherit the daemon's startup environment. If credentials or PATH-derived tools are missing, check `~/.no-mistakes/logs/daemon.log` for a login-shell environment resolution warning, then see [Environment the daemon sees](/no-mistakes/reference/environment/#environment-the-daemon-sees) for the platform-specific resolution and restart behavior.

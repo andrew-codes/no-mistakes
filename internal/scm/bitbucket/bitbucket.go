@@ -26,8 +26,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
@@ -73,12 +75,17 @@ func parseRepoPath(path string) (RepoRef, error) {
 
 // CommitStatus mirrors one entry of Bitbucket's commit-status shape, as
 // hydrated by `twg bb pull-requests get --statuses` under the `_statuses` key.
+// CreatedOn/UpdatedOn are read so LatestStatuses can establish a verified
+// newest-first order instead of trusting the hydration's array order, which
+// is not documented as sorted.
 type CommitStatus struct {
 	Name        string `json:"name"`
 	Key         string `json:"key"`
 	State       string `json:"state"`
 	Description string `json:"description"`
 	URL         string `json:"url"`
+	CreatedOn   string `json:"created_on"`
+	UpdatedOn   string `json:"updated_on"`
 }
 
 // Host talks to Bitbucket Cloud through the twg CLI.
@@ -132,6 +139,11 @@ type bitbucketPullRequest struct {
 			Href string `json:"href"`
 		} `json:"html"`
 	} `json:"links"`
+	Source struct {
+		Commit struct {
+			Hash string `json:"hash"`
+		} `json:"commit"`
+	} `json:"source"`
 }
 
 func (pr bitbucketPullRequest) toPR(repo RepoRef) *scm.PR {
@@ -159,6 +171,15 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 		// delimiter) - it must surface as an error rather than be read as
 		// absence, which would otherwise cause the PR step to attempt a
 		// duplicate create or report a misleading creation failure.
+		return nil, fmt.Errorf("twg bb pull-requests query: invalid JSON output: %s", strings.TrimSpace(string(out)))
+	}
+	if string(trimmed) == "null" {
+		// A bare JSON `null` (e.g. a nil slice marshaled at the top level) is
+		// not the same thing as a verified empty list "[]": unmarshaling it
+		// into []bitbucketPullRequest would silently succeed with a nil
+		// slice, indistinguishable from a real "no open PRs" answer, and risk
+		// the PR step creating a duplicate. Treat it as an invalid response
+		// instead of absence.
 		return nil, fmt.Errorf("twg bb pull-requests query: invalid JSON output: %s", strings.TrimSpace(string(out)))
 	}
 	var items []bitbucketPullRequest
@@ -295,23 +316,26 @@ func (h *Host) GetPRState(ctx context.Context, pr *scm.PR) (scm.PRState, error) 
 }
 
 // pullRequestStatuses reads the PR's hydrated build/CI statuses via
-// `twg bb pull-requests get --statuses`.
-func (h *Host) pullRequestStatuses(ctx context.Context, prNumber string) ([]CommitStatus, error) {
+// `twg bb pull-requests get --statuses`, along with the PR's current source
+// commit hash so callers that fetch logs by build number can verify a status
+// actually belongs to the head they were asked about.
+func (h *Host) pullRequestStatuses(ctx context.Context, prNumber string) (bitbucketPullRequest, []CommitStatus, error) {
 	_, trimmed, err := h.getPR(ctx, prNumber, "--statuses")
 	if err != nil {
-		return nil, err
+		return bitbucketPullRequest{}, nil, err
 	}
 	var view struct {
+		bitbucketPullRequest
 		Statuses []CommitStatus `json:"_statuses"`
 	}
 	if err := json.Unmarshal(trimmed, &view); err != nil {
-		return nil, fmt.Errorf("twg bb pull-requests get --statuses: invalid JSON output: %s", strings.TrimSpace(string(trimmed)))
+		return bitbucketPullRequest{}, nil, fmt.Errorf("twg bb pull-requests get --statuses: invalid JSON output: %s", strings.TrimSpace(string(trimmed)))
 	}
-	return view.Statuses, nil
+	return view.bitbucketPullRequest, view.Statuses, nil
 }
 
 func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
-	statuses, err := h.pullRequestStatuses(ctx, pr.Number)
+	_, statuses, err := h.pullRequestStatuses(ctx, pr.Number)
 	if err != nil {
 		return nil, err
 	}
@@ -344,13 +368,23 @@ func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, hea
 	return scm.CombineFailedCheckLogs(logs)
 }
 
-func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, pr *scm.PR, _ string, _ string, targets []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
+func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, pr *scm.PR, _ string, headSHA string, targets []scm.CheckTarget) ([]scm.FailedCheckLog, error) {
 	if len(targets) == 0 {
 		return nil, nil
 	}
-	statuses, err := h.pullRequestStatuses(ctx, pr.Number)
+	view, statuses, err := h.pullRequestStatuses(ctx, pr.Number)
 	if err != nil {
 		return nil, fmt.Errorf("resolve selected Bitbucket checks: %w", err)
+	}
+	// The PR's hydrated statuses are not scoped to a commit by the caller;
+	// they reflect whatever Bitbucket currently attaches to the PR, which can
+	// still be the previous head right after a push. Fetching a pipeline's
+	// logs by build number alone would then hand the fixer evidence for a
+	// commit that is no longer the one it is fixing. Refuse rather than
+	// silently return a stale build's logs when the PR's current source
+	// commit does not match the requested head.
+	if strings.TrimSpace(headSHA) != "" && !bitbucketCommitMatchesHead(view.Source.Commit.Hash, headSHA) {
+		return nil, fmt.Errorf("resolve selected Bitbucket checks: PR %s source commit %q does not match requested head %q", pr.Number, view.Source.Commit.Hash, headSHA)
 	}
 	targetBuildNumbers := make([]map[string]struct{}, len(targets))
 	for i, target := range targets {
@@ -429,11 +463,20 @@ func normalizePRState(raw string) scm.PRState {
 	}
 }
 
-// LatestStatuses keeps only the newest status per unique key/name.
+// LatestStatuses keeps only the newest status per unique key/name. Newest is
+// established from each status's own created_on/updated_on timestamp rather
+// than assumed from the hydration's array order, which is not documented as
+// newest-first: trusting order alone risks an older pass appearing before a
+// newer failure and CI silently reporting the wrong verdict.
 func LatestStatuses(statuses []CommitStatus) []CommitStatus {
-	latest := make([]CommitStatus, 0, len(statuses))
-	seen := make(map[string]struct{}, len(statuses))
-	for _, status := range statuses {
+	ordered := make([]CommitStatus, len(statuses))
+	copy(ordered, statuses)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return statusTimestamp(ordered[i]).After(statusTimestamp(ordered[j]))
+	})
+	latest := make([]CommitStatus, 0, len(ordered))
+	seen := make(map[string]struct{}, len(ordered))
+	for _, status := range ordered {
 		id := strings.TrimSpace(status.Key)
 		if id == "" {
 			id = statusName(status)
@@ -449,6 +492,38 @@ func LatestStatuses(statuses []CommitStatus) []CommitStatus {
 		latest = append(latest, status)
 	}
 	return latest
+}
+
+// statusTimestamp returns the best available time for a status (preferring
+// updated_on, falling back to created_on), or the zero time when neither
+// parses, which sorts as oldest and preserves prior best-effort ordering for
+// entries the hydration did not timestamp.
+func statusTimestamp(status CommitStatus) time.Time {
+	for _, raw := range []string{status.UpdatedOn, status.CreatedOn} {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, raw); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// bitbucketCommitMatchesHead reports whether prCommitHash (Bitbucket's
+// source.commit.hash, which may be the full SHA or an abbreviated prefix of
+// it) identifies the same commit as headSHA.
+func bitbucketCommitMatchesHead(prCommitHash, headSHA string) bool {
+	a := strings.ToLower(strings.TrimSpace(prCommitHash))
+	b := strings.ToLower(strings.TrimSpace(headSHA))
+	if a == "" || b == "" {
+		return false
+	}
+	if len(a) <= len(b) {
+		return strings.HasPrefix(b, a)
+	}
+	return strings.HasPrefix(a, b)
 }
 
 func statusName(status CommitStatus) string {

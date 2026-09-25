@@ -92,9 +92,6 @@ Path to a replacement CA trust bundle used by forgejo-axi for HTTPS requests.
 
 This replaces rather than appends to the platform trust store. See [Provider Integration](/no-mistakes/guides/provider-integration/#forgejo) for provider setup.
 
-
-Useful for mocking in tests or pointing at a proxy.
-
 ## `AZURE_DEVOPS_EXT_PAT`
 
 Azure DevOps Personal Access Token inherited by the daemon for non-interactive `az` CLI auth.

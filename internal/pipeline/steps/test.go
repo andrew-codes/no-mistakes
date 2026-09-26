@@ -47,6 +47,15 @@ func (s *TestStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, e
 		return nil, err
 	}
 
+	// Agent-only preparation is an explicit eager opt-in, not a claim from
+	// the agent that dependencies exist. Use the same worktree receipt and
+	// restoration lifecycle as configured commands, before even a repair turn.
+	if sctx.Config.Commands.Test == "" && sctx.Config.Test.Prepare {
+		if err := ensurePrepared(sctx, s.Name()); err != nil {
+			return nil, fmt.Errorf("prepare test dependencies: %w", err)
+		}
+	}
+
 	// In fix mode, ask agent to fix test failures first.
 	//
 	// Targeted-validation rules (reproduce the specific failure, focused

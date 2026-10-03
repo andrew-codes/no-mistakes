@@ -24,9 +24,6 @@ vendor/
 *.swo
 *~
 
-# Serena MCP tool config
-.serena/
-
 # OS
 .DS_Store
 Thumbs.db

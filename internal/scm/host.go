@@ -389,6 +389,24 @@ type MergedProofHost interface {
 	GetMergedProof(ctx context.Context, pr *PR, expectedHead string) (MergedProof, error)
 }
 
+// MergedPRFinder is implemented by hosts that can list the PRs of a branch
+// that were already merged. Host.FindPR sees open PRs only, so without this a
+// forge that merges a PR the moment its build is green (before the pipeline's
+// PR or CI step runs) leaves the PR step blind to it, and it opens a second PR
+// for work that is already on the target branch.
+//
+// FindMergedPRs returns the merged PRs opened from branch, newest first. Each
+// entry carries Number, URL, BaseBranch (the target it merged into) and
+// HeadSHA (the source commit the forge recorded); a field the forge did not
+// report is left empty and the caller must treat that as "cannot compare". A
+// nil error with an empty list means a successfully decoded listing held no
+// merged PR. Declined, closed and superseded PRs are never returned, and any
+// lookup, decoding or validation failure is an error rather than an empty
+// list, so a caller can never read an indeterminate answer as absence.
+type MergedPRFinder interface {
+	FindMergedPRs(ctx context.Context, branch string) ([]*PR, error)
+}
+
 // Host is the provider-agnostic interface to a PR-hosting service.
 // Transport (CLI vs HTTP API) is an implementation detail.
 type Host interface {

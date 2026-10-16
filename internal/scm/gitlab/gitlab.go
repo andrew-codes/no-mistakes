@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/url"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -315,14 +316,48 @@ func (p mrPayload) toPR() *scm.PR {
 }
 
 func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error) {
-	args := []string{"mr", "list", "--source-branch", branch}
-	if strings.TrimSpace(base) != "" {
-		args = append(args, "--target-branch", base)
-	}
 	// `glab mr list` returns open MRs by default. Older glab accepted
 	// `--state opened`, but glab v1.5x removed it (it now exposes
 	// -c/--closed, -M/--merged, -A/--all); passing the unknown flag fails the
 	// whole command. Rely on the open-by-default behavior.
+	mrs, err := h.listMRs(ctx, branch, base)
+	if err != nil {
+		return nil, err
+	}
+	if len(mrs) == 0 {
+		return nil, nil
+	}
+	return mrs[0].toPR(), nil
+}
+
+// FindMergedPRs lists the merge requests opened from branch that GitLab
+// reports as merged, newest first, with the target branch and the source
+// commit GitLab recorded for each. Only `--merged` is requested, so a closed
+// merge request is never returned.
+func (h *Host) FindMergedPRs(ctx context.Context, branch string) ([]*scm.PR, error) {
+	mrs, err := h.listMRs(ctx, branch, "", "--merged")
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(mrs, func(i, j int) bool { return mrs[i].IID > mrs[j].IID })
+	merged := make([]*scm.PR, 0, len(mrs))
+	for _, mr := range mrs {
+		pr := mr.toPR()
+		pr.HeadSHA = mr.sourceRevision()
+		merged = append(merged, pr)
+	}
+	return merged, nil
+}
+
+// listMRs runs `glab mr list` for a source branch and returns the validated
+// entries. extraFlags select a non-default state. Any failure to decode or
+// validate the listing is an error, never an empty result.
+func (h *Host) listMRs(ctx context.Context, branch, base string, extraFlags ...string) ([]mrPayload, error) {
+	args := []string{"mr", "list", "--source-branch", branch}
+	if strings.TrimSpace(base) != "" {
+		args = append(args, "--target-branch", base)
+	}
+	args = append(args, extraFlags...)
 	args = append(args, "--output", "json")
 	cmd := h.cmd(ctx, "glab", args...)
 	out, err := cmd.CombinedOutput()
@@ -340,9 +375,6 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 	if mrs == nil {
 		return nil, errors.New("parse glab mr list JSON: expected array")
 	}
-	if len(mrs) == 0 {
-		return nil, nil
-	}
 	for i, candidate := range mrs {
 		url := strings.TrimSpace(candidate.WebURL)
 		if url == "" {
@@ -359,8 +391,7 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 			return nil, fmt.Errorf("parse glab mr list JSON: entry %d IID %d does not match URL number %d", i, candidate.IID, number)
 		}
 	}
-	pr := mrs[0].toPR()
-	return pr, nil
+	return mrs, nil
 }
 
 func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PRContent) (*scm.PR, error) {
@@ -1159,3 +1190,5 @@ func extractMRURL(raw []byte) string {
 	}
 	return ""
 }
+
+var _ scm.MergedPRFinder = (*Host)(nil)

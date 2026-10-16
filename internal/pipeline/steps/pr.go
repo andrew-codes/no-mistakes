@@ -212,6 +212,16 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		return &pipeline.StepOutcome{}, nil
 	}
 
+	// No open PR. Before opening one, make sure the branch's PR was not already
+	// merged at this head (forges can merge on green before this step runs).
+	merged, err := findCoveringMergedPR(sctx, host, branch, baseBranch)
+	if err != nil {
+		return nil, err
+	}
+	if merged != nil {
+		return adoptMergedPR(sctx, merged)
+	}
+
 	if err := claimClosingIssueRefs(sctx, host, provider); err != nil {
 		return nil, err
 	}

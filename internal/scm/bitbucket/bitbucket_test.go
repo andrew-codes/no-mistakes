@@ -657,3 +657,99 @@ func TestFindPRRejectsSummaryEnvelope(t *testing.T) {
 		t.Fatal("expected an error for a YAML summary envelope")
 	}
 }
+
+func TestFindMergedPRsReadsMergedHeadAndBase(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[
+				{"id":41,"state":"MERGED","source":{"repository":{"full_name":"ws/repo"},"branch":{"name":"feature"},"commit":{"hash":"aaa"}},"destination":{"branch":{"name":"main"}}},
+				{"id":55,"state":"MERGED","links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/55"}},"source":{"repository":{"full_name":"ws/repo"},"branch":{"name":"feature"},"commit":{"hash":"bbb"}},"destination":{"branch":{"name":"release"}}}
+			]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	prs, err := h.FindMergedPRs(context.Background(), "feature")
+	if err != nil {
+		t.Fatalf("FindMergedPRs() error = %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("FindMergedPRs() = %+v, want 2 PRs", prs)
+	}
+	// Newest first.
+	if prs[0].Number != "55" || prs[0].URL != "https://bitbucket.org/ws/repo/pull-requests/55" || prs[0].HeadSHA != "bbb" || prs[0].BaseBranch != "release" {
+		t.Fatalf("newest PR = %+v", prs[0])
+	}
+	if prs[1].Number != "41" || prs[1].HeadSHA != "aaa" || prs[1].BaseBranch != "main" {
+		t.Fatalf("older PR = %+v", prs[1])
+	}
+}
+
+func TestFindMergedPRsIgnoresOtherSourceBranches(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[{"id":9,"state":"MERGED","source":{"repository":{"full_name":"ws/repo"},"branch":{"name":"other"},"commit":{"hash":"aaa"}},"destination":{"branch":{"name":"main"}}}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	prs, err := h.FindMergedPRs(context.Background(), "feature")
+	if err != nil {
+		t.Fatalf("FindMergedPRs() error = %v", err)
+	}
+	if len(prs) != 0 {
+		t.Fatalf("FindMergedPRs() = %+v, want none", prs)
+	}
+}
+
+func TestFindMergedPRsIgnoresForkPRsWithTheSameSourceBranch(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[{"id":9,"state":"MERGED","source":{"repository":{"full_name":"someone/repo"},"branch":{"name":"feature"},"commit":{"hash":"aaa"}},"destination":{"branch":{"name":"main"}}}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	prs, err := h.FindMergedPRs(context.Background(), "feature")
+	if err != nil {
+		t.Fatalf("FindMergedPRs() error = %v", err)
+	}
+	if len(prs) != 0 {
+		t.Fatalf("FindMergedPRs() = %+v, want none for a fork-only match", prs)
+	}
+}
+
+func TestFindMergedPRsReturnsEmptyWhenNoneMerged(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {stdout: "[]"},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	prs, err := h.FindMergedPRs(context.Background(), "feature")
+	if err != nil || len(prs) != 0 {
+		t.Fatalf("FindMergedPRs() = %+v, %v; want none and no error", prs, err)
+	}
+}
+
+func TestFindMergedPRsFailsOnUnreadableOutput(t *testing.T) {
+	for name, stdout := range map[string]string{
+		"not json":  "something odd",
+		"null":      "null",
+		"envelope":  "summary: too large\nfile: /tmp/x.json",
+		"missingid": `[{"state":"MERGED"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := New(bbTestCmdFactory(map[string]bbTestResponse{
+				"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {stdout: stdout},
+			}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+			if prs, err := h.FindMergedPRs(context.Background(), "feature"); err == nil {
+				t.Fatalf("FindMergedPRs() = %+v, want an error", prs)
+			}
+		})
+	}
+}
+
+func TestFindMergedPRsReturnsCLIError(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {stderr: "boom", code: 1},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+	if _, err := h.FindMergedPRs(context.Background(), "feature"); err == nil {
+		t.Fatal("expected a CLI failure to be an error, not an empty list")
+	}
+}

@@ -226,12 +226,15 @@ If that PR later falls behind the default branch or hits a merge conflict, do no
 The monitor auto-rebases onto the base, resolves actual conflicts, revalidates from Review because rebasing cannot prove continuity with the reviewed head, and re-pushes the branch through Push; a PR that is merely behind but clean needs no command.
 On GitHub, a clean PR whose base requires up-to-date branches (`mergeStateStatus: BEHIND`) still reports `checks-passed` and waits for a human to bring it up to date, unless the repository opts into [`ci.rebase_behind`](/no-mistakes/reference/repo-config/#cirebase_behind), in which case it is rebased the same way.
 After that monitor ends, see [`no-mistakes rerun`](#no-mistakes-rerun) for the restart conditions.
-Successful outcomes (`checks-passed`, `passed`, `passed-with-override`, and `passed-with-skips`) also carry `help` instructions telling the agent to summarize the run.
+Successful outcomes (`checks-passed`, `passed`, `already-merged`, `passed-with-override`, and `passed-with-skips`) also carry `help` instructions telling the agent to summarize the run.
 `passed-with-override` is a completed run with an explicitly approved Test exception or a CI approval over still-failing checks.
 It stays a success but is distinct from a clean `passed`.
 A Test exception is an approval past a failing configured `commands.test`, a `no-go` verdict, an `inconclusive` verdict, or a [`test_agent_timeout`](/no-mistakes/reference/global-config/#test_agent_timeout) budget cut; approving a `no-surface` park records its reason but completes as `passed`.
 `run.test_override_reason` preserves the Test exception explanation in drive and status output, including at the `checks-passed` stopping point; CI overrides retain their separate reason.
 Report those exceptions rather than describing Test as clean.
+`already-merged` is a completed run whose PR is merged on the forge, either found already merged at this head before the PR step would have created one (some forges merge on green) or merged while CI was watched.
+It is a success distinct from `checks-passed` (nothing is waiting on a human merge) and from a plain `passed`; the `help` line tells the agent to report the work as delivered and links the merged PR.
+`passed-with-override` and `passed-with-skips` take precedence over it.
 `passed-with-skips` is a completed run where PR publication or CI verification automatically skipped because its provider was unavailable, or CI had no PR URL.
 It retains exit code 0: missing verification is not a failing code verdict.
 `run.automatic_skips` names each affected step and cause, and `run.head_sha` gives the full recorded head in both drive output and `axi status`.

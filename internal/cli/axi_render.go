@@ -122,6 +122,9 @@ type runView struct {
 	PRURL            string
 	CIReady          bool
 	CIReadyNoCI      bool
+	// PRState is the last recorded lifecycle state of the run's PR ("open",
+	// "merged", "closed", or "none"/empty before any observation).
+	PRState string
 	// AwaitingAgentSince is the unix-seconds time the run parked at a gate
 	// awaiting the driving agent, or nil when the run is not parked. It powers
 	// the top-level parked signal in the run object.
@@ -143,6 +146,7 @@ func runViewFromIPC(r *ipc.RunInfo) runView {
 		HeadSHA:            r.HeadSHA,
 		CIReady:            r.CIReady,
 		CIReadyNoCI:        r.CIReadyNoCI,
+		PRState:            r.PRState,
 		AwaitingAgentSince: r.AwaitingAgentSince,
 		CIOverrideReason:   r.CIOverrideReason,
 		TestOverrideReason: r.TestOverrideReason,
@@ -195,6 +199,9 @@ func runViewFromDB(r *db.Run, steps []*db.StepResult, database *db.DB) runView {
 	}
 	if r.PRURL != nil {
 		rv.PRURL = *r.PRURL
+	}
+	if r.PRState != nil {
+		rv.PRState = *r.PRState
 	}
 	for _, s := range steps {
 		sv := stepView{

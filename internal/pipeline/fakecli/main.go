@@ -210,6 +210,22 @@ func fakeRecordSuccessHandler() {
 	os.Exit(0)
 }
 
+// fakeGHListMerged answers a `gh pr list --state merged` call and exits. Open
+// and merged listings are separate, as on a real forge: the merged listing
+// holds only FAKE_CLI_MERGED_PR_LIST_JSON (default none), so a test can tell an
+// open-only lookup from a merged one. A call for any other state falls through.
+func fakeGHListMerged(args []string) {
+	if state, ok := fakeCLIFlagValue(args, "--state"); !ok || state != "merged" {
+		return
+	}
+	if merged := os.Getenv("FAKE_CLI_MERGED_PR_LIST_JSON"); merged != "" {
+		fmt.Print(merged)
+	} else {
+		fmt.Println("[]")
+	}
+	os.Exit(0)
+}
+
 func fakeGHHandler(args []string) {
 	fakeGHHandlePRContentCommands(args, strings.Join(args, " "))
 	prURL := os.Getenv("FAKE_CLI_PR_URL")
@@ -219,6 +235,7 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+		fakeGHListMerged(args)
 		if hasPRListJSON {
 			fmt.Print(prListJSON)
 			os.Exit(0)
@@ -477,6 +494,16 @@ func fakeGlabHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "mr" && args[1] == "list" {
+		// Open and merged listings are separate, as on a real forge: `--merged`
+		// reads only FAKE_CLI_MERGED_MR_LIST_JSON (default none).
+		if fakeCLIHasFlag(args, "--merged") {
+			if merged := os.Getenv("FAKE_CLI_MERGED_MR_LIST_JSON"); merged != "" {
+				fmt.Print(merged)
+			} else {
+				fmt.Println("[]")
+			}
+			os.Exit(0)
+		}
 		if mrViewJSON == "" {
 			fmt.Println("[]")
 			os.Exit(0)
@@ -712,6 +739,7 @@ func fakeCIGHHandler(args []string) {
 	}
 	fakeGHHandlePRContentCommands(args, joined)
 	if strings.Contains(joined, "pr list") {
+		fakeGHListMerged(args)
 		if prListJSON := os.Getenv("FAKE_CLI_PR_LIST_JSON"); prListJSON != "" {
 			fmt.Print(prListJSON)
 		} else {
@@ -1279,6 +1307,25 @@ type bbFakeState struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Puts        int    `json:"puts"`
+	// Source, Dest and SourceCommit describe the primary PR for `query`
+	// filtering and output. Empty Source/Dest match any filter, so a state file
+	// that never set them behaves as before.
+	Source       string `json:"source,omitempty"`
+	Dest         string `json:"dest,omitempty"`
+	SourceCommit string `json:"source_commit,omitempty"`
+	// Others are further PRs `query` lists (a merged or declined sibling, for
+	// example). `get`, `create` and `update` only ever act on the primary PR.
+	Others []bbFakePR `json:"others,omitempty"`
+}
+
+// bbFakePR is one extra PR the fake `twg bb pull-requests query` can list.
+type bbFakePR struct {
+	ID           int    `json:"id"`
+	URL          string `json:"url"`
+	State        string `json:"state"`
+	Source       string `json:"source"`
+	Dest         string `json:"dest"`
+	SourceCommit string `json:"source_commit"`
 }
 
 func loadBBState() bbFakeState {
@@ -1353,14 +1400,56 @@ func fakeTWGOutputSummaryNone(args []string) bool {
 }
 
 func fakeTWGPRJSON(state bbFakeState) string {
-	prState := state.State
+	return fakeTWGPRPayloadJSON(bbFakePR{
+		ID: state.ID, URL: state.URL, State: state.State,
+		Source: state.Source, Dest: state.Dest, SourceCommit: state.SourceCommit,
+	})
+}
+
+// fakeTWGWithSourceRepo stamps source.repository.full_name onto a PR payload,
+// as the real query listing does.
+func fakeTWGWithSourceRepo(payload, fullName string) string {
+	var pr map[string]any
+	if err := json.Unmarshal([]byte(payload), &pr); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	source, _ := pr["source"].(map[string]any)
+	if source == nil {
+		source = map[string]any{}
+	}
+	source["repository"] = map[string]string{"full_name": fullName}
+	pr["source"] = source
+	encoded, err := json.Marshal(pr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	return string(encoded)
+}
+
+func fakeTWGPRPayloadJSON(pr bbFakePR) string {
+	prState := pr.State
 	if prState == "" {
 		prState = "OPEN"
 	}
 	payload := map[string]any{
-		"id":    state.ID,
+		"id":    pr.ID,
 		"state": prState,
-		"links": map[string]any{"html": map[string]string{"href": state.URL}},
+		"links": map[string]any{"html": map[string]string{"href": pr.URL}},
+	}
+	source := map[string]any{}
+	if pr.Source != "" {
+		source["branch"] = map[string]string{"name": pr.Source}
+	}
+	if pr.SourceCommit != "" {
+		source["commit"] = map[string]string{"hash": pr.SourceCommit}
+	}
+	if len(source) > 0 {
+		payload["source"] = source
+	}
+	if pr.Dest != "" {
+		payload["destination"] = map[string]any{"branch": map[string]string{"name": pr.Dest}}
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -1379,26 +1468,51 @@ func fakeTWGPullRequests(args []string) {
 
 	switch sub {
 	case "query":
-		if !state.Exists {
-			fmt.Println("[]")
+		// Like the real command: --state defaults to OPEN, and --source and
+		// --dest narrow the listing. A PR with no recorded branch matches any
+		// branch filter.
+		wantState, ok := fakeCLIFlagValue(rest, "--state")
+		if !ok {
+			wantState = "OPEN"
+		}
+		if raw := os.Getenv("FAKE_CLI_BB_QUERY_MERGED_RAW"); raw != "" && strings.EqualFold(wantState, "MERGED") {
+			// An unreadable merged listing, for tests of the fail-closed lookup.
+			fmt.Println(raw)
 			os.Exit(0)
 		}
-		// Real twg reports the PR's source repository; the adapter requires it
+		// Real twg reports each PR's source repository; the adapter requires it
 		// to match the queried repository, so mirror the --workspace/--repo flags.
 		workspace, _ := fakeCLIFlagValue(rest, "--workspace")
 		repoSlug, _ := fakeCLIFlagValue(rest, "--repo")
-		var pr map[string]any
-		if err := json.Unmarshal([]byte(fakeTWGPRJSON(state)), &pr); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+		source, _ := fakeCLIFlagValue(rest, "--source")
+		dest, _ := fakeCLIFlagValue(rest, "--dest")
+		var listed []string
+		match := func(pr bbFakePR) {
+			prState := pr.State
+			if prState == "" {
+				prState = "OPEN"
+			}
+			if !strings.EqualFold(prState, wantState) {
+				return
+			}
+			if source != "" && pr.Source != "" && pr.Source != source {
+				return
+			}
+			if dest != "" && pr.Dest != "" && pr.Dest != dest {
+				return
+			}
+			listed = append(listed, fakeTWGWithSourceRepo(fakeTWGPRPayloadJSON(pr), workspace+"/"+repoSlug))
 		}
-		pr["source"] = map[string]any{"repository": map[string]string{"full_name": workspace + "/" + repoSlug}}
-		encoded, err := json.Marshal(pr)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+		if state.Exists {
+			match(bbFakePR{
+				ID: state.ID, URL: state.URL, State: state.State,
+				Source: state.Source, Dest: state.Dest, SourceCommit: state.SourceCommit,
+			})
 		}
-		fmt.Println("[" + string(encoded) + "]")
+		for _, other := range state.Others {
+			match(other)
+		}
+		fmt.Println("[" + strings.Join(listed, ",") + "]")
 		os.Exit(0)
 	case "get":
 		if len(rest) == 0 {

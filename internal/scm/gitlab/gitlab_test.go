@@ -1786,3 +1786,48 @@ func TestFindFailedJobTargetIDsIgnoresAllowedFailure(t *testing.T) {
 		t.Fatalf("findFailedJobTargetIDs() = %v, want [2]", got)
 	}
 }
+
+func TestFindMergedPRsReadsMergedHeadAndBase(t *testing.T) {
+	t.Parallel()
+
+	host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+		"glab mr list --source-branch feature --merged --output json": {
+			stdout: `[{"iid":3,"web_url":"https://gitlab.example.com/group/project/-/merge_requests/3","target_branch":"main","sha":"aaa"},
+				{"iid":8,"web_url":"https://gitlab.example.com/group/project/-/merge_requests/8","target_branch":"release","diff_refs":{"head_sha":"bbb"}}]` + "\n",
+		},
+	}), nil, "gitlab.example.com", "group/project")
+
+	prs, err := host.FindMergedPRs(context.Background(), "feature")
+	if err != nil {
+		t.Fatalf("FindMergedPRs() error = %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("FindMergedPRs() = %+v, want 2", prs)
+	}
+	if prs[0].Number != "8" || prs[0].HeadSHA != "bbb" || prs[0].BaseBranch != "release" {
+		t.Fatalf("newest MR = %+v", prs[0])
+	}
+	if prs[1].Number != "3" || prs[1].HeadSHA != "aaa" || prs[1].BaseBranch != "main" {
+		t.Fatalf("older MR = %+v", prs[1])
+	}
+}
+
+func TestFindMergedPRsFailsOnUnreadableOutput(t *testing.T) {
+	t.Parallel()
+
+	for name, resp := range map[string]gitlabTestResponse{
+		"not json": {stdout: "nope"},
+		"null":     {stdout: "null"},
+		"cli":      {stderr: "boom", code: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			host := New(gitlabTestCmdFactory(map[string]gitlabTestResponse{
+				"glab mr list --source-branch feature --merged --output json": resp,
+			}), nil, "", "")
+			if prs, err := host.FindMergedPRs(context.Background(), "feature"); err == nil {
+				t.Fatalf("FindMergedPRs() = %+v, want an error", prs)
+			}
+		})
+	}
+}

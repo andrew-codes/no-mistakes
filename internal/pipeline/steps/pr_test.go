@@ -801,8 +801,9 @@ func TestPRStep_BitbucketCreatesNewPR(t *testing.T) {
 	if outcome.NeedsApproval {
 		t.Fatal("bitbucket PR step should never need approval")
 	}
-	if api.logCount("pull-requests query") != 1 {
-		t.Fatalf("query calls = %d, want 1", api.logCount("pull-requests query"))
+	// One open lookup, then the merged lookup that guards against a duplicate.
+	if api.logCount("pull-requests query") != 2 {
+		t.Fatalf("query calls = %d, want 2 (open, then merged)", api.logCount("pull-requests query"))
 	}
 	if api.logCount("pull-requests create") != 1 {
 		t.Fatalf("create calls = %d, want 1", api.logCount("pull-requests create"))

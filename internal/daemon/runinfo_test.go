@@ -174,3 +174,32 @@ func TestStepToInfoNoFixSummariesWithoutFixRounds(t *testing.T) {
 		t.Errorf("fix summaries = %v, want none", info.FixSummaries)
 	}
 }
+
+func TestRunToInfoCarriesObservedPRState(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer d.Close()
+	repo, err := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := d.InsertRun(repo.ID, "feature", "head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info := runToInfo(d, run, nil); info.PRState != "" {
+		t.Fatalf("PRState = %q before any observation, want empty", info.PRState)
+	}
+	if err := d.UpdateRunPRState(run.ID, "merged"); err != nil {
+		t.Fatal(err)
+	}
+	run, err = d.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info := runToInfo(d, run, nil); info.PRState != "merged" {
+		t.Fatalf("PRState = %q, want merged", info.PRState)
+	}
+}

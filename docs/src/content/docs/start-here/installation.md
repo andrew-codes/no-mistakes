@@ -87,6 +87,7 @@ make install
   - `twg` CLI, authenticated (Bitbucket Cloud)
   - `az` CLI with the `azure-devops` extension (Azure DevOps)
   - `tea` CLI (Gitea)
+  - `origin` CLI (Cursor Origin)
   - or a configured [provider plugin](/no-mistakes/reference/global-config/#provider_plugins) for custom hosts
 
 Run `no-mistakes doctor` to check native agents, ACP aliases such as `cursor` and `devin`, provider tools, configured provider plugins, and whether the configured global runner can start a validation gate.
@@ -133,6 +134,7 @@ It does not remove repo-local agent skill files created by `no-mistakes init`.
 Stop the daemon, delete the binary, and clear state:
 
 ```sh
+no-mistakes daemon uninstall # macOS: removes the LaunchAgent
 no-mistakes daemon stop
 rm -f ~/.local/bin/no-mistakes /usr/local/bin/no-mistakes
 rm -rf ~/.no-mistakes
@@ -140,4 +142,4 @@ rm -rf ~/.no-mistakes
 
 If you configured [`worktree_roots`](/no-mistakes/reference/global-config/#worktree_roots), also delete the run worktree directories it placed outside `~/.no-mistakes`.
 
-On macOS, also remove `~/Library/LaunchAgents/com.kunchenguid.no-mistakes.daemon.*.plist`. On Linux, also remove `~/.config/systemd/user/no-mistakes-daemon-*.service`. On Windows, remove the `no-mistakes-daemon-*` Task Scheduler task.
+On macOS, `daemon uninstall` removes only the LaunchAgent for the current `NM_HOME`. Repeat it with each instance's `NM_HOME` if you installed multiple services. On Linux, also remove `~/.config/systemd/user/no-mistakes-daemon-*.service`. On Windows, remove the `no-mistakes-daemon-*` Task Scheduler task.

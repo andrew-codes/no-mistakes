@@ -45,21 +45,111 @@ func TestParseRepoRef(t *testing.T) {
 	}
 }
 
-func TestCapabilitiesDeclinesMergeableState(t *testing.T) {
+func TestCapabilitiesReportsMergeableState(t *testing.T) {
 	h := New(nil, nil, RepoRef{}, false)
 	caps := h.Capabilities()
-	if caps.MergeableState {
-		t.Fatal("expected MergeableState capability to be declined")
+	if !caps.MergeableState {
+		t.Fatal("expected MergeableState capability to be supported")
 	}
 	if !caps.FailedCheckLogs {
 		t.Fatal("expected FailedCheckLogs capability to be supported")
 	}
 }
 
-func TestGetMergeableStateReturnsErrUnsupported(t *testing.T) {
-	h := New(nil, nil, RepoRef{}, false)
-	if _, err := h.GetMergeableState(context.Background(), &scm.PR{}); err != scm.ErrUnsupported {
-		t.Fatalf("GetMergeableState() error = %v, want ErrUnsupported", err)
+const mergeabilityKey = "twg bb pull-requests mergeability 42 --workspace ws --repo repo -o json --output-summary none"
+
+func mergeStateFor(t *testing.T, stdout string) (scm.MergeableState, error) {
+	t.Helper()
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		mergeabilityKey: {stdout: stdout},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+	return h.GetMergeableState(context.Background(), &scm.PR{Number: "42"})
+}
+
+func TestGetMergeableState(t *testing.T) {
+	const (
+		gitPassed   = `{"type":"git_mergeability_check","status":"PASSED","blocking":false}`
+		gitFailed   = `{"type":"git_mergeability_check","status":"FAILED","blocking":true}`
+		gitUnknown  = `{"type":"git_mergeability_check","status":"UNKNOWN","blocking":false}`
+		gitPending  = `{"type":"git_mergeability_check","status":"PENDING","blocking":false}`
+		behindOK    = `{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"PASSED","blocking":false}`
+		behindBad   = `{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"FAILED","blocking":true}`
+		behindSoft  = `{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"FAILED","blocking":false}`
+		behindUnset = `{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"FAILED"}`
+		behindWait  = `{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"PENDING","blocking":false}`
+		approvals   = `{"type":"merge_check","check":{"kind":"minimum_approvals"},"status":"FAILED","blocking":true}`
+	)
+	tests := []struct {
+		name   string
+		stdout string
+		want   scm.MergeableState
+	}{
+		{"both checks pass", "[" + gitPassed + "," + behindOK + "]", scm.MergeableOK},
+		{"git check alone passes", "[" + gitPassed + "]", scm.MergeableOK},
+		{"git check failed is a conflict", "[" + gitFailed + "," + behindOK + "]", scm.MergeableConflict},
+		{"git check failed without blocking is still a conflict", `[{"type":"git_mergeability_check","status":"FAILED"}]`, scm.MergeableConflict},
+		{"blocking maximum_commits_behind failure", "[" + gitPassed + "," + behindBad + "]", scm.MergeableConflict},
+		{"maximum_commits_behind failure with blocking unset", "[" + gitPassed + "," + behindUnset + "]", scm.MergeableConflict},
+		{"non-blocking maximum_commits_behind failure", "[" + gitPassed + "," + behindSoft + "]", scm.MergeableOK},
+		{"failure outranks a pending check", "[" + gitUnknown + "," + behindBad + "]", scm.MergeableConflict},
+		{"unknown git check is pending", "[" + gitUnknown + "," + behindOK + "]", scm.MergeablePending},
+		{"pending git check is pending", "[" + gitPending + "]", scm.MergeablePending},
+		{"pending maximum_commits_behind is pending", "[" + gitPassed + "," + behindWait + "]", scm.MergeablePending},
+		{"missing git check is pending", "[" + behindOK + "]", scm.MergeablePending},
+		{"empty listing is pending", "[]", scm.MergeablePending},
+		{"unrelated failing check is ignored", "[" + gitPassed + "," + approvals + "]", scm.MergeableOK},
+		{"values envelope", `{"values":[` + gitFailed + `]}`, scm.MergeableConflict},
+		{"statuses are case-insensitive", `[{"type":"git_mergeability_check","status":"failed"}]`, scm.MergeableConflict},
+		{"type alone identifies maximum_commits_behind", `[` + gitPassed + `,{"type":"maximum_commits_behind","status":"FAILED","blocking":true}]`, scm.MergeableConflict},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := mergeStateFor(t, tt.stdout)
+			if err != nil {
+				t.Fatalf("GetMergeableState() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("GetMergeableState() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetMergeableStateFailsOnUnreadableOutput(t *testing.T) {
+	for name, stdout := range map[string]string{
+		"no json":        "something went wrong",
+		"malformed":      "[{",
+		"null":           "null",
+		"object no list": `{"ok":false}`,
+		"summary":        "summary: output too large to print inline\nfile: /tmp/x.json",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := mergeStateFor(t, stdout)
+			if err == nil {
+				t.Fatalf("GetMergeableState() = %q, want an error", got)
+			}
+			if got != "" {
+				t.Fatalf("GetMergeableState() = %q alongside an error, want empty", got)
+			}
+		})
+	}
+}
+
+func TestGetMergeableStateReturnsCLIError(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		mergeabilityKey: {stderr: "boom", code: 1},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+	if _, err := h.GetMergeableState(context.Background(), &scm.PR{Number: "42"}); err == nil {
+		t.Fatal("expected the twg failure to surface")
+	}
+}
+
+func TestGetMergeableStateRequiresPRNumber(t *testing.T) {
+	h := New(bbTestCmdFactory(nil), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+	for _, pr := range []*scm.PR{nil, {}} {
+		if _, err := h.GetMergeableState(context.Background(), pr); err == nil {
+			t.Fatalf("GetMergeableState(%+v) succeeded without a PR number", pr)
+		}
 	}
 }
 
@@ -91,7 +181,7 @@ func TestAvailableSucceedsWhenAuthenticated(t *testing.T) {
 func TestFindPRMatchesOpenPRForSourceBranch(t *testing.T) {
 	h := New(bbTestCmdFactory(map[string]bbTestResponse{
 		"twg bb pull-requests query --source feature --state OPEN --dest main --workspace ws --repo repo -o json --output-summary none": {
-			stdout: `[{"id":42,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/42"}}}]`,
+			stdout: `[{"id":42,"state":"OPEN","source":{"repository":{"full_name":"ws/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/42"}}}]`,
 		},
 	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
 
@@ -101,6 +191,52 @@ func TestFindPRMatchesOpenPRForSourceBranch(t *testing.T) {
 	}
 	if pr == nil || pr.Number != "42" || pr.URL != "https://bitbucket.org/ws/repo/pull-requests/42" {
 		t.Fatalf("FindPR() = %+v, want matched PR", pr)
+	}
+}
+
+func TestFindPRSkipsForkPRWithSameSourceBranch(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[{"id":7,"state":"OPEN","source":{"repository":{"full_name":"someone/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/7"}}},` +
+				`{"id":8,"state":"OPEN","source":{"repository":{"full_name":"ws/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/8"}}}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	pr, err := h.FindPR(context.Background(), "feature", "")
+	if err != nil {
+		t.Fatalf("FindPR() error = %v", err)
+	}
+	if pr == nil || pr.Number != "8" {
+		t.Fatalf("FindPR() = %+v, want the PR whose source repository is this repo", pr)
+	}
+}
+
+func TestFindPRReturnsNilWhenOnlyForkPRsMatch(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[{"id":7,"state":"OPEN","source":{"repository":{"full_name":"someone/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/7"}}}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	pr, err := h.FindPR(context.Background(), "feature", "")
+	if err != nil {
+		t.Fatalf("FindPR() error = %v", err)
+	}
+	if pr != nil {
+		t.Fatalf("FindPR() = %+v, want nil for a fork-only match", pr)
+	}
+}
+
+func TestFindPRReturnsErrorWhenSourceRepositoryMissing(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[{"id":42,"state":"OPEN"}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	pr, err := h.FindPR(context.Background(), "feature", "")
+	if err == nil {
+		t.Fatalf("FindPR() = %+v, want error for an entry without source repository", pr)
 	}
 }
 
@@ -287,10 +423,10 @@ func TestFetchFailedCheckTargetLogsKeepsOnlyTheTailOfHugeOutput(t *testing.T) {
 	// ~100 KB of output, over twice maxPipelineLogBytes, ending in the failure.
 	huge := strings.Repeat("noise line\n", 9000) + "FINAL FAILURE\n"
 	h := New(bbTestCmdFactory(map[string]bbTestResponse{
-		"twg bb pull-requests get 42 --statuses --workspace ws --repo repo -o json": {
+		"twg bb pull-requests get 42 --statuses --workspace ws --repo repo -o json --output-summary none": {
 			stdout: `{"id":42,"source":{"commit":{"hash":"abc123"}},"_statuses":[{"name":"build","state":"FAILED","url":"https://bitbucket.org/ws/repo/addon/pipelines/home#!/results/1"}]}`,
 		},
-		"twg bb pipeline get --pipeline 1 --logs --failed-steps --lines 0 --workspace ws --repo repo": {
+		"twg bb pipeline get --pipeline 1 --logs --failed-steps --lines 0 --output-summary none --workspace ws --repo repo": {
 			stdout: huge,
 		},
 	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
@@ -520,7 +656,7 @@ func TestBBHelperProcess(t *testing.T) {
 func TestEveryJSONCallPassesOutputSummaryNone(t *testing.T) {
 	const flags = "-o json --output-summary none"
 	pr := &scm.PR{Number: "42"}
-	prJSON := `{"id":42,"title":"T","description":"D","state":"OPEN","links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/42"}}}`
+	prJSON := `{"id":42,"title":"T","description":"D","state":"OPEN","source":{"repository":{"full_name":"ws/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/42"}}}`
 	tests := []struct {
 		name string
 		resp string
@@ -541,6 +677,12 @@ func TestEveryJSONCallPassesOutputSummaryNone(t *testing.T) {
 			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
 		{"GetChecks", prJSON, func(h *Host) error { _, err := h.GetChecks(context.Background(), pr); return err },
 			"bb pull-requests get 42 --statuses --workspace ws --repo repo " + flags},
+		{"GetMergeableState", "[]", func(h *Host) error { _, err := h.GetMergeableState(context.Background(), pr); return err },
+			"bb pull-requests mergeability 42 --workspace ws --repo repo " + flags},
+		{"GetPRBaseBranch", `{"id":42,"destination":{"branch":{"name":"main"}}}`, func(h *Host) error { _, err := h.GetPRBaseBranch(context.Background(), pr); return err },
+			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
+		{"SetPRBaseBranch", prJSON, func(h *Host) error { return h.SetPRBaseBranch(context.Background(), pr, "main") },
+			"bb pull-requests update --pull-request 42 --dest main --workspace ws --repo repo " + flags},
 		{"GetPRContent", prJSON, func(h *Host) error { _, err := h.GetPRContent(context.Background(), pr); return err },
 			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
 	}
@@ -584,7 +726,7 @@ func TestFindPRParsesLargePRList(t *testing.T) {
 		if i > 1 {
 			b.WriteString(",")
 		}
-		fmt.Fprintf(&b, `{"id":%d,"state":"OPEN","title":"PR %d","description":%q,"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/%d"}}}`,
+		fmt.Fprintf(&b, `{"id":%d,"state":"OPEN","source":{"repository":{"full_name":"ws/repo"}},"title":"PR %d","description":%q,"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/%d"}}}`,
 			i, i, strings.Repeat("long description ", 200), i)
 	}
 	b.WriteString("]")
@@ -609,5 +751,154 @@ func TestFindPRRejectsSummaryEnvelope(t *testing.T) {
 	h := New(capturingCmdFactory(new([]capturedCmd), bbTestResponse{stdout: "summary: output too large\nfile: /tmp/x.json\n"}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
 	if _, err := h.FindPR(context.Background(), "feature", ""); err == nil {
 		t.Fatal("expected an error for a YAML summary envelope")
+	}
+}
+
+func TestFindMergedPRsReadsMergedHeadAndBase(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[
+				{"id":41,"state":"MERGED","source":{"repository":{"full_name":"ws/repo"},"branch":{"name":"feature"},"commit":{"hash":"aaa"}},"destination":{"branch":{"name":"main"}}},
+				{"id":55,"state":"MERGED","links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/55"}},"source":{"repository":{"full_name":"ws/repo"},"branch":{"name":"feature"},"commit":{"hash":"bbb"}},"destination":{"branch":{"name":"release"}}}
+			]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	prs, err := h.FindMergedPRs(context.Background(), "feature")
+	if err != nil {
+		t.Fatalf("FindMergedPRs() error = %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("FindMergedPRs() = %+v, want 2 PRs", prs)
+	}
+	// Newest first.
+	if prs[0].Number != "55" || prs[0].URL != "https://bitbucket.org/ws/repo/pull-requests/55" || prs[0].HeadSHA != "bbb" || prs[0].BaseBranch != "release" {
+		t.Fatalf("newest PR = %+v", prs[0])
+	}
+	if prs[1].Number != "41" || prs[1].HeadSHA != "aaa" || prs[1].BaseBranch != "main" {
+		t.Fatalf("older PR = %+v", prs[1])
+	}
+}
+
+func TestFindMergedPRsIgnoresOtherSourceBranches(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[{"id":9,"state":"MERGED","source":{"repository":{"full_name":"ws/repo"},"branch":{"name":"other"},"commit":{"hash":"aaa"}},"destination":{"branch":{"name":"main"}}}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	prs, err := h.FindMergedPRs(context.Background(), "feature")
+	if err != nil {
+		t.Fatalf("FindMergedPRs() error = %v", err)
+	}
+	if len(prs) != 0 {
+		t.Fatalf("FindMergedPRs() = %+v, want none", prs)
+	}
+}
+
+func TestFindMergedPRsIgnoresForkPRsWithTheSameSourceBranch(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {
+			stdout: `[{"id":9,"state":"MERGED","source":{"repository":{"full_name":"someone/repo"},"branch":{"name":"feature"},"commit":{"hash":"aaa"}},"destination":{"branch":{"name":"main"}}}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	prs, err := h.FindMergedPRs(context.Background(), "feature")
+	if err != nil {
+		t.Fatalf("FindMergedPRs() error = %v", err)
+	}
+	if len(prs) != 0 {
+		t.Fatalf("FindMergedPRs() = %+v, want none for a fork-only match", prs)
+	}
+}
+
+func TestFindMergedPRsReturnsEmptyWhenNoneMerged(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {stdout: "[]"},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	prs, err := h.FindMergedPRs(context.Background(), "feature")
+	if err != nil || len(prs) != 0 {
+		t.Fatalf("FindMergedPRs() = %+v, %v; want none and no error", prs, err)
+	}
+}
+
+func TestFindMergedPRsFailsOnUnreadableOutput(t *testing.T) {
+	for name, stdout := range map[string]string{
+		"not json":  "something odd",
+		"null":      "null",
+		"envelope":  "summary: too large\nfile: /tmp/x.json",
+		"missingid": `[{"state":"MERGED"}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := New(bbTestCmdFactory(map[string]bbTestResponse{
+				"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {stdout: stdout},
+			}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+			if prs, err := h.FindMergedPRs(context.Background(), "feature"); err == nil {
+				t.Fatalf("FindMergedPRs() = %+v, want an error", prs)
+			}
+		})
+	}
+}
+
+func TestFindMergedPRsReturnsCLIError(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state MERGED --workspace ws --repo repo -o json --output-summary none": {stderr: "boom", code: 1},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+	if _, err := h.FindMergedPRs(context.Background(), "feature"); err == nil {
+		t.Fatal("expected a CLI failure to be an error, not an empty list")
+	}
+}
+
+func TestSetPRDraftTogglesWithDraftAndReadyFlags(t *testing.T) {
+	for _, tc := range []struct {
+		draft    bool
+		wantFlag string
+		notFlag  string
+	}{
+		{true, "--draft", "--ready"},
+		{false, "--ready", "--draft"},
+	} {
+		var rec []capturedCmd
+		h := New(capturingCmdFactory(&rec, bbTestResponse{stdout: `{"id":42,"state":"OPEN"}`}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, true)
+		if err := h.SetPRDraft(context.Background(), &scm.PR{Number: "42"}, tc.draft); err != nil {
+			t.Fatalf("SetPRDraft(%v) error = %v", tc.draft, err)
+		}
+		got := strings.Join(append([]string{rec[0].name}, rec[0].args...), " ")
+		if !strings.Contains(got, "pull-requests update --pull-request 42 "+tc.wantFlag) || strings.Contains(got, tc.notFlag) {
+			t.Fatalf("SetPRDraft(%v) command = %q", tc.draft, got)
+		}
+		if strings.Contains(got, "--description") || strings.Contains(got, "--title") {
+			t.Fatalf("a draft toggle must not rewrite the title or description: %q", got)
+		}
+	}
+}
+
+func TestGetPRDraftReadsTheDraftFieldAndFailsClosedWithoutIt(t *testing.T) {
+	get := "twg bb pull-requests get 42 --workspace ws --repo repo -o json --output-summary none"
+	for _, tc := range []struct {
+		name    string
+		stdout  string
+		want    bool
+		wantErr bool
+	}{
+		{name: "draft", stdout: `{"id":42,"state":"OPEN","draft":true}`, want: true},
+		{name: "ready", stdout: `{"id":42,"state":"OPEN","draft":false}`},
+		{name: "missing field is not read as ready", stdout: `{"id":42,"state":"OPEN"}`, wantErr: true},
+	} {
+		h := New(bbTestCmdFactory(map[string]bbTestResponse{get: {stdout: tc.stdout}}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, true)
+		got, err := h.GetPRDraft(context.Background(), &scm.PR{Number: "42"})
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("%s: GetPRDraft = %v, %v; want %v (err %v)", tc.name, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
+func TestDraftLifecycleFollowsTheDraftSetting(t *testing.T) {
+	for _, draft := range []bool{true, false} {
+		h := New(bbTestCmdFactory(nil), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, draft)
+		if h.DraftLifecycle() != draft {
+			t.Errorf("DraftLifecycle() = %v, want %v", h.DraftLifecycle(), draft)
+		}
 	}
 }

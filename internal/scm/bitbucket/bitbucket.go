@@ -140,10 +140,18 @@ type bitbucketPullRequest struct {
 		} `json:"html"`
 	} `json:"links"`
 	Source struct {
+		Branch struct {
+			Name string `json:"name"`
+		} `json:"branch"`
 		Commit struct {
 			Hash string `json:"hash"`
 		} `json:"commit"`
 	} `json:"source"`
+	Destination struct {
+		Branch struct {
+			Name string `json:"name"`
+		} `json:"branch"`
+	} `json:"destination"`
 }
 
 func (pr bitbucketPullRequest) toPR(repo RepoRef) *scm.PR {
@@ -154,7 +162,45 @@ func (pr bitbucketPullRequest) toPR(repo RepoRef) *scm.PR {
 }
 
 func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error) {
-	args := []string{"bb", "pull-requests", "query", "--source", branch, "--state", "OPEN"}
+	items, err := h.queryPRs(ctx, "OPEN", branch, base)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	return items[0].toPR(h.repo), nil
+}
+
+// FindMergedPRs lists the merged PRs opened from branch, newest first. Only
+// the MERGED state is requested, so a DECLINED or SUPERSEDED PR is never
+// returned. Every PR carries the target branch and the source commit the forge
+// recorded for it, which the caller compares against the commit it is about to
+// publish.
+func (h *Host) FindMergedPRs(ctx context.Context, branch string) ([]*scm.PR, error) {
+	items, err := h.queryPRs(ctx, "MERGED", branch, "")
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].ID > items[j].ID })
+	merged := make([]*scm.PR, 0, len(items))
+	for _, item := range items {
+		if name := strings.TrimSpace(item.Source.Branch.Name); name != "" && name != branch {
+			continue
+		}
+		pr := item.toPR(h.repo)
+		pr.BaseBranch = strings.TrimSpace(item.Destination.Branch.Name)
+		pr.HeadSHA = strings.TrimSpace(item.Source.Commit.Hash)
+		merged = append(merged, pr)
+	}
+	return merged, nil
+}
+
+// queryPRs lists PRs from branch in one state. It returns an error for any
+// lookup, decoding or validation failure so no caller can read an
+// indeterminate answer as "there is no such PR".
+func (h *Host) queryPRs(ctx context.Context, state, branch, base string) ([]bitbucketPullRequest, error) {
+	args := []string{"bb", "pull-requests", "query", "--source", branch, "--state", state}
 	if strings.TrimSpace(base) != "" {
 		args = append(args, "--dest", base)
 	}
@@ -185,15 +231,12 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 	if err := json.Unmarshal(trimmed, &items); err != nil {
 		return nil, fmt.Errorf("twg bb pull-requests query: invalid JSON output: %s", strings.TrimSpace(string(out)))
 	}
-	if len(items) == 0 {
-		return nil, nil
-	}
 	for i := range items {
 		if items[i].ID <= 0 {
 			return nil, fmt.Errorf("twg bb pull-requests query: entry %d missing positive id", i)
 		}
 	}
-	return items[0].toPR(h.repo), nil
+	return items, nil
 }
 
 // outputSummaryFlag turns off twg's default `--output-summary auto`, which
@@ -661,3 +704,5 @@ func bytesTrimToJSON(out []byte) []byte {
 	}
 	return out[idx:]
 }
+
+var _ scm.MergedPRFinder = (*Host)(nil)

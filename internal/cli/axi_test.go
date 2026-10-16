@@ -588,6 +588,26 @@ func TestOutcomeForRun(t *testing.T) {
 			want: "passed-with-override",
 		},
 		{
+			name: "a completed run whose PR merged is reported as already merged",
+			rv:   runView{Status: string(types.RunCompleted), PRState: "merged"},
+			want: "already-merged",
+		},
+		{
+			name: "an open or closed PR is an ordinary pass",
+			rv:   runView{Status: string(types.RunCompleted), PRState: "closed"},
+			want: "passed",
+		},
+		{
+			name: "an override stays visible on a merged PR",
+			rv:   runView{Status: string(types.RunCompleted), PRState: "merged", CIOverrideReason: "live checks still failing: required-check"},
+			want: "passed-with-override",
+		},
+		{
+			name: "a failed run with a merged PR is still failed",
+			rv:   runView{Status: string(types.RunFailed), PRState: "merged"},
+			want: "failed",
+		},
+		{
 			name: "a failed run is unaffected by a stray override reason",
 			rv:   runView{Status: string(types.RunFailed), CIOverrideReason: "live checks still failing: required-check"},
 			want: "failed",

@@ -125,7 +125,10 @@ func outcomeFor(status string) string {
 
 // outcomeForRun qualifies completed runs whose external checks were overridden
 // or whose publication/verification automatically skipped. Explicit per-run
-// skips carry no automatic cause and retain their existing outcome.
+// skips carry no automatic cause and retain their existing outcome. A completed
+// run whose PR is merged reports "already-merged": the forge delivered the work
+// (often on green, before or while the pipeline watched), so it is neither a
+// green PR awaiting a human nor an ordinary pass.
 func outcomeForRun(rv runView) string {
 	word := outcomeFor(rv.Status)
 	if word == "passed" && (rv.CIOverrideReason != "" || rv.TestOverrideReason != "") {
@@ -133,6 +136,9 @@ func outcomeForRun(rv runView) string {
 	}
 	if word == "passed" && len(rv.automaticSkips()) > 0 {
 		return "passed-with-skips"
+	}
+	if word == "passed" && rv.PRState == "merged" {
+		return "already-merged"
 	}
 	return word
 }
@@ -1415,6 +1421,9 @@ func renderDriveResultForRun(cmd *cobra.Command, run *ipc.RunInfo, ciReady bool,
 		}
 		if len(rv.automaticSkips()) > 0 {
 			help = append(help, "Publication or CI verification did not run (see `run.automatic_skips` and `run.head_sha`). Report the missing evidence and its cause; this outcome does not establish CI readiness or a code failure.")
+		}
+		if outcomeForRun(rv) == "already-merged" {
+			help = append(help, "The PR for this branch is already merged on the forge. Report the work as delivered, not as a green PR awaiting merge.")
 		}
 		if rv.PRURL != "" {
 			help = append(help, fmt.Sprintf("Open the PR: %s", rv.PRURL))

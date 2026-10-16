@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -254,7 +255,64 @@ func stdoutOnly(cmd *exec.Cmd) (out []byte, detail string, err error) {
 	return out, detail, err
 }
 
+// listedPR is one entry of `gh pr list --json`, decoded and validated.
+type listedPR struct {
+	Number              int    `json:"number"`
+	URL                 string `json:"url"`
+	BaseRefName         string `json:"baseRefName"`
+	HeadRefName         string `json:"headRefName"`
+	HeadRefOid          string `json:"headRefOid"`
+	HeadRepositoryOwner *struct {
+		Login string `json:"login"`
+	} `json:"headRepositoryOwner"`
+}
+
 func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error) {
+	prs, err := h.listPRs(ctx, branch, base, "open", "")
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range prs {
+		if !h.matchesHead(candidate.HeadRefName, candidate.HeadRepositoryOwner, branch) {
+			continue
+		}
+		return &scm.PR{
+			Number:     strconv.Itoa(candidate.Number),
+			URL:        strings.TrimSpace(candidate.URL),
+			BaseBranch: strings.TrimSpace(candidate.BaseRefName),
+		}, nil
+	}
+	return nil, nil
+}
+
+// FindMergedPRs lists the merged PRs opened from branch, newest first, with
+// the target branch and the head commit GitHub recorded for each. Closed
+// (unmerged) PRs are never returned: only `--state merged` is requested.
+func (h *Host) FindMergedPRs(ctx context.Context, branch string) ([]*scm.PR, error) {
+	prs, err := h.listPRs(ctx, branch, "", "merged", "headRefOid")
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(prs, func(i, j int) bool { return prs[i].Number > prs[j].Number })
+	merged := make([]*scm.PR, 0, len(prs))
+	for _, candidate := range prs {
+		if !h.matchesHead(candidate.HeadRefName, candidate.HeadRepositoryOwner, branch) {
+			continue
+		}
+		merged = append(merged, &scm.PR{
+			Number:     strconv.Itoa(candidate.Number),
+			URL:        strings.TrimSpace(candidate.URL),
+			BaseBranch: strings.TrimSpace(candidate.BaseRefName),
+			HeadSHA:    strings.TrimSpace(candidate.HeadRefOid),
+		})
+	}
+	return merged, nil
+}
+
+// listPRs runs `gh pr list` for branch in one state and returns the validated
+// entries. extraFields are appended to the JSON field list. Any failure to
+// decode or validate the listing is an error, never an empty result.
+func (h *Host) listPRs(ctx context.Context, branch, base, state, extraFields string) ([]listedPR, error) {
 	args := []string{"pr", "list", "--head", branch}
 	if strings.TrimSpace(base) != "" {
 		args = append(args, "--base", base)
@@ -264,31 +322,22 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 	if h.forkOwner != "" {
 		jsonFields = "number,url,baseRefName,headRefName,headRepositoryOwner"
 	}
-	args = append(args, "--state", "open", "--json", jsonFields)
+	if extraFields != "" {
+		jsonFields += "," + extraFields
+	}
+	args = append(args, "--state", state, "--json", jsonFields)
 	cmd := h.cmd(ctx, "gh", args...)
 	out, detail, err := stdoutOnly(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("gh pr list: %s: %w", detail, err)
 	}
-	var prs []struct {
-		Number              int    `json:"number"`
-		URL                 string `json:"url"`
-		BaseRefName         string `json:"baseRefName"`
-		HeadRefName         string `json:"headRefName"`
-		HeadRepositoryOwner *struct {
-			Login string `json:"login"`
-		} `json:"headRepositoryOwner"`
-	}
+	var prs []listedPR
 	if err := json.Unmarshal(out, &prs); err != nil {
 		return nil, fmt.Errorf("parse gh pr list JSON: %w", err)
 	}
 	if prs == nil {
 		return nil, errors.New("parse gh pr list JSON: expected array")
 	}
-	if len(prs) == 0 {
-		return nil, nil
-	}
-	prNumbers := make([]string, len(prs))
 	for i, candidate := range prs {
 		if candidate.Number <= 0 {
 			return nil, fmt.Errorf("parse gh pr list JSON: entry %d missing positive PR number", i)
@@ -304,7 +353,6 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 		if candidate.Number != number {
 			return nil, fmt.Errorf("parse gh pr list JSON: entry %d PR number %d does not match URL number %d", i, candidate.Number, number)
 		}
-		prNumbers[i] = strconv.Itoa(candidate.Number)
 		if h.forkOwner != "" {
 			if strings.TrimSpace(candidate.HeadRefName) == "" {
 				return nil, fmt.Errorf("parse gh pr list JSON: entry %d missing headRefName", i)
@@ -314,18 +362,7 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 			}
 		}
 	}
-	for i, candidate := range prs {
-		if !h.matchesHead(candidate.HeadRefName, candidate.HeadRepositoryOwner, branch) {
-			continue
-		}
-		pr := &scm.PR{
-			Number:     prNumbers[i],
-			URL:        strings.TrimSpace(candidate.URL),
-			BaseBranch: strings.TrimSpace(candidate.BaseRefName),
-		}
-		return pr, nil
-	}
-	return nil, nil
+	return prs, nil
 }
 
 func (h *Host) matchesHead(headRefName string, owner *struct {
@@ -1599,3 +1636,5 @@ func (h *Host) GetReviewComments(ctx context.Context, pr *scm.PR) ([]scm.ReviewC
 	}
 	return comments, nil
 }
+
+var _ scm.MergedPRFinder = (*Host)(nil)

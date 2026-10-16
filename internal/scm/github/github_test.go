@@ -2160,3 +2160,48 @@ func TestStdoutOnlyFailureDetail(t *testing.T) {
 		})
 	}
 }
+
+func TestFindMergedPRsReadsMergedHeadAndBase(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr list --head feature --state merged --json number,url,baseRefName,headRefOid": {
+			stdout: `[{"number":7,"url":"https://github.example.com/org/repo/pull/7","baseRefName":"main","headRefOid":"aaa"},
+				{"number":9,"url":"https://github.example.com/org/repo/pull/9","baseRefName":"release","headRefOid":"bbb"}]` + "\n",
+		},
+	}), nil, "", "")
+
+	prs, err := host.FindMergedPRs(context.Background(), "feature")
+	if err != nil {
+		t.Fatalf("FindMergedPRs() error = %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("FindMergedPRs() = %+v, want 2", prs)
+	}
+	if prs[0].Number != "9" || prs[0].HeadSHA != "bbb" || prs[0].BaseBranch != "release" {
+		t.Fatalf("newest PR = %+v", prs[0])
+	}
+	if prs[1].Number != "7" || prs[1].HeadSHA != "aaa" || prs[1].BaseBranch != "main" || prs[1].URL != "https://github.example.com/org/repo/pull/7" {
+		t.Fatalf("older PR = %+v", prs[1])
+	}
+}
+
+func TestFindMergedPRsFailsOnUnreadableOutput(t *testing.T) {
+	t.Parallel()
+
+	for name, resp := range map[string]githubTestResponse{
+		"not json": {stdout: "nope"},
+		"null":     {stdout: "null"},
+		"cli":      {stderr: "boom", code: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			host := New(githubTestCmdFactory(map[string]githubTestResponse{
+				"gh pr list --head feature --state merged --json number,url,baseRefName,headRefOid": resp,
+			}), nil, "", "")
+			if prs, err := host.FindMergedPRs(context.Background(), "feature"); err == nil {
+				t.Fatalf("FindMergedPRs() = %+v, want an error", prs)
+			}
+		})
+	}
+}

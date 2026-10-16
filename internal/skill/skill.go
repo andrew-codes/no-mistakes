@@ -260,6 +260,10 @@ Run the pipeline and decide on its findings as they come up:
      configured idle timeout elapses, so a human can watch it in the TUI.
    - ` + "`passed`" + ` - the pipeline completed under the requested steps, including any
      explicit per-run skips. This alone is not evidence that a PR was merged.
+   - ` + "`already-merged`" + ` - the pipeline completed and the PR for this branch is
+     already merged on the forge (some forges merge on green, before or while the
+     pipeline watches). Report the work as delivered; do not ask the user to
+     merge anything.
    - ` + "`passed-with-override`" + ` - the pipeline completed with an explicitly approved Test exception or CI failure.
      Report the exception, not a clean pass.
      Test evidence is in ` + "`run.test_override_reason`" + `, including when CI readiness returns ` + "`checks-passed`" + `; do not omit it from the summary.
@@ -427,7 +431,7 @@ Read the ` + "`action`" + ` column per row: decide ` + "`r1`" + ` (auto-fix) on 
 judgment - ` + "`respond --action fix --findings r1`" + ` hands it to the pipeline to
 fix - but stop and escalate ` + "`r2`" + ` (ask-user) to the user before responding. A
 final state
-instead shows ` + "`outcome: <checks-passed|passed|passed-with-override|passed-with-skips|failed|cancelled>`" + ` with no
+instead shows ` + "`outcome: <checks-passed|passed|already-merged|passed-with-override|passed-with-skips|failed|cancelled>`" + ` with no
 ` + "`findings`" + ` table. Field names and exact columns can vary by step and version,
 so read the actual ` + "`findings`" + ` header rather than assuming this layout.
 `

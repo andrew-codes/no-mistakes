@@ -31,8 +31,8 @@ What you do not get is PR automation and CI monitoring.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | **PR** (create/update) | `gh` CLI, authenticated | `glab` CLI, authenticated | `forgejo-axi`, authenticated | `twg` CLI, authenticated | `az` CLI + `azure-devops` extension, authenticated | `tea` CLI, authenticated | `origin` CLI, authenticated | configured plugin CLI (`status`, `pr create`/`update`) |
 | **CI** (polling, auto-fix) | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | `tea` CLI | `origin` CLI | configured plugin CLI (`status`, `pr checks`) |
-| **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
-| **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
+| **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
+| **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
 | **Failed check log fetching** | `gh` CLI | `glab` CLI | `forgejo-axi` when runtime routes are available | supported | not yet | supported | not yet | supported when plugin declares `failed_check_logs` |
 | **Review-bot findings and comments at the CI gate** | GitHub via `gh` CLI (check identity by app slug, comments from review threads) | GitLab via `glab` CLI (comments from unresolved discussion notes, matched by the bot's login; no check identity) | not supported | not supported | not supported | not supported | not supported | not supported |
 | **[Explicit issue closure](/no-mistakes/reference/cli/#closing-issues)** (`axi run --closes`) | `gh` CLI | `glab` CLI | not supported | not supported | not supported | not supported | not supported | not supported |
@@ -46,7 +46,7 @@ pushes to the configured target:
 - create or update the PR automatically
 - keep polling hosted CI until the PR is merged, closed, declined, or the configured `ci_timeout` idle window elapses
 - fetch failing job logs for the CI auto-fix loop when the provider exposes them
-- on GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, and provider plugins that declare `mergeable_state`, watch mergeability and fix merge conflicts when possible
+- on GitHub, GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, Cursor Origin, and provider plugins that declare `mergeable_state`, watch mergeability and fix merge conflicts when possible
 
 Draft PR and MR creation is configurable for supported providers. The [global](/no-mistakes/reference/global-config/#providersgithubdraft_pull_requests) and [per-repo](/no-mistakes/reference/repo-config/#providersgithubdraft_pull_requests) config references own provider support and behavior.
 
@@ -170,13 +170,11 @@ twg whoami
 - PR creation and update
 - CI pipeline status polling until the PR is merged, declined, or the configured `ci_timeout` idle window elapses
 - Failed pipeline step log fetching for the CI auto-fix step
+- Mergeability polling and merge-conflict auto-fix, read from Bitbucket's own merge checks (`twg bb pull-requests mergeability`). A failed `git_mergeability_check` is a merge conflict. A failing, blocking `maximum_commits_behind` check means Bitbucket will not merge the branch until it is rebased onto its destination, so it takes the same rebase and revalidate repair; no-mistakes does not count commits behind itself. Checks that are `PENDING` or `UNKNOWN` keep the monitor waiting, and other merge checks (approvals, tasks, builds) are not read.
 
 **What you don't get (yet):**
 
-- PR mergeability polling
-- Merge-conflict auto-fix
-
-These are GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, and provider plugins (declaring `mergeable_state`) only right now.
+- Review-bot findings, explicit issue closure, and transient-check reruns, which are GitHub (and, for review bots, GitLab) only right now.
 
 ## Azure DevOps
 
@@ -250,7 +248,7 @@ Verify with `tea logins list` (tea 0.x) or `tea auth status` (tea 1.0).
 
 **What you don't get (yet):**
 
-- PR mergeability polling and merge-conflict auto-fix. Gitea's PR `mergeable` field has a documented upstream reliability bug ([go-gitea/gitea#25849](https://github.com/go-gitea/gitea/issues/25849)) that can stick `false` after a conflict is actually resolved, so no-mistakes declines the capability rather than trust it - the same posture as Bitbucket Cloud.
+- PR mergeability polling and merge-conflict auto-fix. Gitea's PR `mergeable` field has a documented upstream reliability bug ([go-gitea/gitea#25849](https://github.com/go-gitea/gitea/issues/25849)) that can stick `false` after a conflict is actually resolved, so no-mistakes declines the capability rather than trust it.
 - Fork PR routing (same as all non-GitHub providers)
 - [Transient-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)
 

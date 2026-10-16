@@ -106,10 +106,11 @@ func New(cmd CmdFactory, cliAvailable func() bool, repo RepoRef, draft bool) *Ho
 
 func (h *Host) Provider() scm.Provider { return scm.ProviderBitbucket }
 
-// Capabilities reports Bitbucket's feature matrix. Bitbucket's REST API does
-// not expose a reliable merge-conflict probe, so MergeableState is off.
+// Capabilities reports Bitbucket's feature matrix. MergeableState is read from
+// the PR's merge checks (`twg bb pull-requests mergeability`), not from a
+// merge-conflict probe of its own.
 func (h *Host) Capabilities() scm.Capabilities {
-	return scm.Capabilities{MergeableState: false, FailedCheckLogs: true}
+	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true}
 }
 
 func (h *Host) Available(ctx context.Context) error {
@@ -413,8 +414,99 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 	return checks, nil
 }
 
-func (h *Host) GetMergeableState(_ context.Context, _ *scm.PR) (scm.MergeableState, error) {
-	return "", scm.ErrUnsupported
+// Bitbucket merge checks that decide the PR's mergeable state. Both are checks
+// Bitbucket itself evaluates; no-mistakes never counts how far behind a branch
+// is.
+const (
+	mergeCheckGit           = "git_mergeability_check"
+	mergeCheckCommitsBehind = "maximum_commits_behind"
+)
+
+// mergeCheck is one entry of `twg bb pull-requests mergeability`. The git
+// check is identified by its type; the other checks carry their kind under
+// `check.kind`. Blocking is a pointer because twg documents that a FAILED
+// status alone does not say the check blocks the merge.
+type mergeCheck struct {
+	Type     string `json:"type"`
+	Status   string `json:"status"`
+	Blocking *bool  `json:"blocking"`
+	Check    struct {
+		Kind string `json:"kind"`
+	} `json:"check"`
+}
+
+func (c mergeCheck) is(kind string) bool {
+	return strings.EqualFold(strings.TrimSpace(c.Type), kind) || strings.EqualFold(strings.TrimSpace(c.Check.Kind), kind)
+}
+
+// GetMergeableState maps Bitbucket's own merge checks onto the shared
+// mergeable state. A failed git mergeability check is a merge conflict. A
+// failed, blocking maximum_commits_behind check means Bitbucket refuses the
+// merge until the branch is rebased onto its destination, which the CI
+// monitor's merge-conflict repair does, so it reads as CONFLICTING too. Any
+// check that is PENDING or UNKNOWN, or a response without the git check, is
+// PENDING: UNKNOWN means the check could not be evaluated, not that it passed.
+// Any other status is a pass, so a status name twg adds later cannot park a
+// green PR until the CI timeout.
+func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.MergeableState, error) {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return "", errors.New("twg bb pull-requests mergeability: missing pull request number")
+	}
+	args := append([]string{"bb", "pull-requests", "mergeability", pr.Number}, h.repoArgs()...)
+	out, err := h.runJSON(ctx, args)
+	if err != nil {
+		return "", fmt.Errorf("twg bb pull-requests mergeability: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	checks, err := parseMergeChecks(out)
+	if err != nil {
+		return "", err
+	}
+	gitSeen, pending := false, false
+	for _, check := range checks {
+		isGit, isBehind := check.is(mergeCheckGit), check.is(mergeCheckCommitsBehind)
+		if !isGit && !isBehind {
+			continue
+		}
+		if isGit {
+			gitSeen = true
+		}
+		switch strings.ToUpper(strings.TrimSpace(check.Status)) {
+		case "FAILED":
+			if isGit || check.Blocking == nil || *check.Blocking {
+				return scm.MergeableConflict, nil
+			}
+		case "PENDING", "UNKNOWN", "":
+			pending = true
+		}
+	}
+	if pending || !gitSeen {
+		return scm.MergeablePending, nil
+	}
+	return scm.MergeableOK, nil
+}
+
+// parseMergeChecks decodes the mergeability listing: a bare array, or an
+// object carrying the array under `values`. Anything else is an error so an
+// unreadable answer is never read as "mergeable".
+func parseMergeChecks(out []byte) ([]mergeCheck, error) {
+	trimmed := bytesTrimToJSON(out)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("twg bb pull-requests mergeability: invalid JSON output: %s", strings.TrimSpace(string(out)))
+	}
+	var checks []mergeCheck
+	if trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &checks); err != nil {
+			return nil, fmt.Errorf("twg bb pull-requests mergeability: invalid JSON output: %s", strings.TrimSpace(string(out)))
+		}
+		return checks, nil
+	}
+	var wrapped struct {
+		Values *[]mergeCheck `json:"values"`
+	}
+	if err := json.Unmarshal(trimmed, &wrapped); err != nil || wrapped.Values == nil {
+		return nil, fmt.Errorf("twg bb pull-requests mergeability: invalid JSON output: %s", strings.TrimSpace(string(out)))
+	}
+	return *wrapped.Values, nil
 }
 
 func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, headSHA string, failingNames []string) (string, error) {

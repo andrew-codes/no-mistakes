@@ -1520,6 +1520,15 @@ func fakeTWGPullRequests(args []string) {
 		}
 		fmt.Println(string(encoded))
 		os.Exit(0)
+	case "mergeability":
+		// FAKE_CLI_BB_MERGEABILITY_JSON overrides the merge-check listing; the
+		// default is a PR whose git and commits-behind checks both pass.
+		checks := os.Getenv("FAKE_CLI_BB_MERGEABILITY_JSON")
+		if checks == "" {
+			checks = `[{"type":"git_mergeability_check","status":"PASSED","blocking":false},{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"PASSED","blocking":false}]`
+		}
+		fmt.Println(checks)
+		os.Exit(0)
 	case "create":
 		title, _ := fakeCLIFlagValue(rest, "--title")
 		descFile, _ := fakeCLIFlagValue(rest, "--description-file")

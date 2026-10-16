@@ -828,6 +828,54 @@ func TestPRStep_BitbucketCreatesNewPR(t *testing.T) {
 	}
 }
 
+func TestPRStep_BitbucketRiskAssessmentReachesDescription(t *testing.T) {
+	t.Parallel()
+	const findings = `{"findings":[],"summary":"clean","risk_level":"medium","risk_rationale":"touches critical error handling"}`
+	for _, tc := range []struct {
+		name       string
+		existingID int
+		existing   string
+		mutation   string
+	}{
+		{name: "create", mutation: "pull-requests create"},
+		{name: "update", existingID: 42, existing: "https://bitbucket.org/test/repo/pull-requests/42", mutation: "pull-requests update"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir, baseSHA, headSHA := setupGitRepo(t)
+			api := newFakeBitbucketAPI(t, tc.existingID, tc.existing)
+
+			ag := &mockAgent{name: "test"}
+			sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+			sctx.Env = api.Env()
+			sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
+			reviewStep, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := sctx.DB.UpdateStepStatus(reviewStep.ID, types.StepStatusCompleted); err != nil {
+				t.Fatal(err)
+			}
+			if err := sctx.DB.SetStepFindings(reviewStep.ID, findings); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := (&PRStep{}).Execute(sctx); err != nil {
+				t.Fatal(err)
+			}
+			if api.logCount(tc.mutation) != 1 {
+				t.Fatalf("%s calls = %d, want 1", tc.mutation, api.logCount(tc.mutation))
+			}
+			desc := api.lastDescription(t)
+			for _, want := range []string{"## Risk Assessment", "touches critical error handling"} {
+				if !strings.Contains(desc, want) {
+					t.Errorf("Bitbucket PR %s description is missing %q:\n%s", tc.name, want, desc)
+				}
+			}
+		})
+	}
+}
+
 func TestPRStep_BitbucketCreatesNewPRWithoutHTMLLink(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

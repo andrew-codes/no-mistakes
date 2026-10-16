@@ -136,6 +136,19 @@ func TestFindPRReturnsNilWhenOnlyForkPRsMatch(t *testing.T) {
 	}
 }
 
+func TestFindPRReturnsErrorWhenSourceRepositoryMissing(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json": {
+			stdout: `[{"id":42,"state":"OPEN"}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	pr, err := h.FindPR(context.Background(), "feature", "")
+	if err == nil {
+		t.Fatalf("FindPR() = %+v, want error for an entry without source repository", pr)
+	}
+}
+
 func TestFindPRReturnsNilWhenNoneOpen(t *testing.T) {
 	h := New(bbTestCmdFactory(map[string]bbTestResponse{
 		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json": {stdout: "[]"},

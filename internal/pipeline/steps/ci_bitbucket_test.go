@@ -239,6 +239,138 @@ func TestCIStep_BitbucketAutoFixIncludesPipelineLogs(t *testing.T) {
 	}
 }
 
+// A green Bitbucket PR whose merge checks fail is repaired through the shared
+// merge-conflict path, whichever of the two checks failed.
+func TestCIStep_BitbucketFailedMergeCheckTriggersConflictRepair(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		json string
+	}{
+		{"git mergeability check", `[{"type":"git_mergeability_check","status":"FAILED","blocking":true},{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"PASSED","blocking":false}]`},
+		{"maximum commits behind", `[{"type":"git_mergeability_check","status":"PASSED","blocking":false},{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"FAILED","blocking":true}]`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			upstream := t.TempDir()
+			gitCmd(t, upstream, "init", "--bare")
+
+			dir := t.TempDir()
+			gitCmd(t, dir, "init")
+			gitCmd(t, dir, "config", "user.name", "test")
+			gitCmd(t, dir, "config", "user.email", "test@test.com")
+			gitCmd(t, dir, "checkout", "-b", "main")
+			os.WriteFile(filepath.Join(dir, "init.txt"), []byte("init"), 0o644)
+			gitCmd(t, dir, "add", "-A")
+			gitCmd(t, dir, "commit", "-m", "initial")
+			baseSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+			gitCmd(t, dir, "remote", "add", "origin", upstream)
+			gitCmd(t, dir, "push", "origin", "main")
+
+			gitCmd(t, dir, "checkout", "-b", "feature")
+			os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature"), 0o644)
+			gitCmd(t, dir, "add", "-A")
+			gitCmd(t, dir, "commit", "-m", "feature")
+			headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+			gitCmd(t, dir, "push", "origin", "feature")
+
+			api := newFakeBitbucketAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42").
+				withPRState("OPEN").
+				withSourceCommit(headSHA).
+				withStatuses(`[{"name":"build","state":"SUCCESSFUL"}]`).
+				withMergeability(tt.json)
+
+			var capturedPrompt string
+			ag := &mockAgent{
+				name: "test",
+				runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+					capturedPrompt = opts.Prompt
+					os.WriteFile(filepath.Join(opts.CWD, "rebased.txt"), []byte("rebased"), 0o644)
+					return &agent.Result{}, nil
+				},
+			}
+
+			prURL := "https://bitbucket.org/test/repo/pull-requests/42"
+			sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
+			sctx.Env = api.Env()
+			sctx.Run.PRURL = &prURL
+			sctx.Repo.UpstreamURL = upstream
+			sctx.Run.Branch = "refs/heads/feature"
+			sctx.Config.CITimeout = 30 * time.Second
+			sctx.Config.AutoFix = config.AutoFix{CI: 1}
+			sctx.Config.CI.RevalidateRepairs = true
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sctx.Ctx = ctx
+
+			step := &CIStep{
+				waitForNextPoll: func(ctx context.Context, interval time.Duration) error {
+					cancel()
+					return ctx.Err()
+				},
+			}
+			outcome, err := driveCI(t, step, sctx)
+			assertCIRestartsValidation(t, outcome, err)
+			if !strings.Contains(capturedPrompt, "Rebase onto the base branch and resolve the merge conflicts") {
+				t.Fatalf("expected the merge-conflict repair prompt, got:\n%s", capturedPrompt)
+			}
+			if api.logCount("pull-requests mergeability 42") == 0 {
+				t.Fatal("expected the Bitbucket merge checks to be read")
+			}
+		})
+	}
+}
+
+// Passing merge checks leave a green Bitbucket PR to keep monitoring with no
+// repair.
+func TestCIStep_BitbucketPassedMergeChecksDoNotTriggerRepair(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	api := newFakeBitbucketAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42").
+		withPRState("OPEN").
+		withStatuses(`[{"name":"build","state":"SUCCESSFUL"}]`).
+		withMergeability(`[{"type":"git_mergeability_check","status":"PASSED","blocking":false}]`)
+
+	agentCalled := false
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			agentCalled = true
+			return &agent.Result{}, nil
+		},
+	}
+	prURL := "https://bitbucket.org/test/repo/pull-requests/42"
+	sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = api.Env()
+	sctx.Run.PRURL = &prURL
+	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
+	sctx.Config.CITimeout = 30 * time.Second
+	sctx.Config.AutoFix = config.AutoFix{CI: 1}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sctx.Ctx = ctx
+
+	step := &CIStep{
+		waitForNextPoll: func(ctx context.Context, interval time.Duration) error {
+			cancel()
+			return ctx.Err()
+		},
+	}
+	_, err := driveCI(t, step, sctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the monitor to keep watching an open PR, got %v", err)
+	}
+	if agentCalled {
+		t.Fatal("passing merge checks must not start a repair")
+	}
+	if api.logCount("pull-requests mergeability 42") == 0 {
+		t.Fatal("expected the Bitbucket merge checks to be read")
+	}
+}
+
 func TestCIStep_BitbucketAutoFixAggregatesSelectedPipelineLogs(t *testing.T) {
 	t.Parallel()
 	upstream := t.TempDir()

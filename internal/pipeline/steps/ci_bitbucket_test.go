@@ -323,6 +323,64 @@ func TestCIStep_BitbucketFailedMergeCheckTriggersConflictRepair(t *testing.T) {
 	}
 }
 
+// A merge-check repair is a conflict repair, so it revalidates even under the
+// publish policy (ci.revalidate_repairs off) and nothing it rewrote reaches the
+// remote before Review approves the repaired head again.
+func TestCIStep_BitbucketMergeCheckRepairRevalidatesUnderThePublishPolicy(t *testing.T) {
+	t.Parallel()
+	// The base and the feature edit the same line, so the repair agent has a
+	// real conflict to resolve while rebasing, which changes the commit's
+	// patch-id and so cannot be proven to continue the reviewed head.
+	var f *ciRepairFixture
+	f = newCIRepairFixture(t, false, func(workDir string) {
+		if _, err := stepGitRun(f.sctx, "rebase", "main"); err == nil {
+			t.Error("expected the rebase to conflict")
+			return
+		}
+		if err := os.WriteFile(filepath.Join(workDir, "feature.txt"), []byte("base rewrote this line\nthe user's feature, resolved\n"), 0o644); err != nil {
+			t.Error(err)
+			return
+		}
+		gitCmd(t, workDir, "add", "-A")
+		if _, err := stepGitRun(f.sctx, "-c", "core.editor=true", "rebase", "--continue"); err != nil {
+			t.Errorf("resolve the conflict: %v", err)
+		}
+	})
+	gitCmd(t, f.dir, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(f.dir, "feature.txt"), []byte("base rewrote this line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, f.dir, "add", "-A")
+	gitCmd(t, f.dir, "commit", "-m", "advance base over the same line")
+	gitCmd(t, f.dir, "checkout", "feature")
+	api := newFakeBitbucketAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42").
+		withPRState("OPEN").
+		withSourceCommit(f.headSHA).
+		withStatuses(`[{"name":"build","state":"SUCCESSFUL"}]`).
+		withMergeability(`[{"type":"git_mergeability_check","status":"FAILED","blocking":true}]`)
+
+	f.sctx.Env = api.Env()
+	prURL := "https://bitbucket.org/test/repo/pull-requests/42"
+	f.sctx.Run.PRURL = &prURL
+	f.sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
+
+	outcome, err := f.run(t)
+	assertCIRestartsValidation(t, outcome, err)
+	if api.logCount("pull-requests mergeability 42") == 0 {
+		t.Fatal("expected the Bitbucket merge checks to be read")
+	}
+	if f.remoteHead(t) != f.headSHA {
+		t.Fatalf("remote moved to %s; the reviewed head %s must stay published until revalidation", f.remoteHead(t), f.headSHA)
+	}
+	run, err := f.sctx.DB.GetRun(f.sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.ReviewApprovedHeadSHA != nil && strings.TrimSpace(*run.ReviewApprovedHeadSHA) != "" {
+		t.Error("review approval survived a conflict repair")
+	}
+}
+
 // Passing merge checks leave a green Bitbucket PR to keep monitoring with no
 // repair.
 func TestCIStep_BitbucketPassedMergeChecksDoNotTriggerRepair(t *testing.T) {

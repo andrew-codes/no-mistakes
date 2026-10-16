@@ -90,7 +90,7 @@ func TestAvailableSucceedsWhenAuthenticated(t *testing.T) {
 func TestFindPRMatchesOpenPRForSourceBranch(t *testing.T) {
 	h := New(bbTestCmdFactory(map[string]bbTestResponse{
 		"twg bb pull-requests query --source feature --state OPEN --dest main --workspace ws --repo repo -o json": {
-			stdout: `[{"id":42,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/42"}}}]`,
+			stdout: `[{"id":42,"state":"OPEN","source":{"repository":{"full_name":"ws/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/42"}}}]`,
 		},
 	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
 
@@ -100,6 +100,39 @@ func TestFindPRMatchesOpenPRForSourceBranch(t *testing.T) {
 	}
 	if pr == nil || pr.Number != "42" || pr.URL != "https://bitbucket.org/ws/repo/pull-requests/42" {
 		t.Fatalf("FindPR() = %+v, want matched PR", pr)
+	}
+}
+
+func TestFindPRSkipsForkPRWithSameSourceBranch(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json": {
+			stdout: `[{"id":7,"state":"OPEN","source":{"repository":{"full_name":"someone/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/7"}}},` +
+				`{"id":8,"state":"OPEN","source":{"repository":{"full_name":"ws/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/8"}}}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	pr, err := h.FindPR(context.Background(), "feature", "")
+	if err != nil {
+		t.Fatalf("FindPR() error = %v", err)
+	}
+	if pr == nil || pr.Number != "8" {
+		t.Fatalf("FindPR() = %+v, want the PR whose source repository is this repo", pr)
+	}
+}
+
+func TestFindPRReturnsNilWhenOnlyForkPRsMatch(t *testing.T) {
+	h := New(bbTestCmdFactory(map[string]bbTestResponse{
+		"twg bb pull-requests query --source feature --state OPEN --workspace ws --repo repo -o json": {
+			stdout: `[{"id":7,"state":"OPEN","source":{"repository":{"full_name":"someone/repo"}},"links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/7"}}}]`,
+		},
+	}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
+
+	pr, err := h.FindPR(context.Background(), "feature", "")
+	if err != nil {
+		t.Fatalf("FindPR() error = %v", err)
+	}
+	if pr != nil {
+		t.Fatalf("FindPR() = %+v, want nil for a fork-only match", pr)
 	}
 }
 

@@ -143,6 +143,9 @@ type bitbucketPullRequest struct {
 		Commit struct {
 			Hash string `json:"hash"`
 		} `json:"commit"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
 	} `json:"source"`
 }
 
@@ -194,7 +197,17 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 			return nil, fmt.Errorf("twg bb pull-requests query: entry %d missing positive id", i)
 		}
 	}
-	return items[0].toPR(h.repo), nil
+	// twg's query matches by source branch name alone, so a fork PR that
+	// happens to use the same branch name must not be bound. Only a PR whose
+	// source repository is this repository counts; a missing full_name never
+	// matches.
+	wantRepo := h.repo.Workspace + "/" + h.repo.RepoSlug
+	for i := range items {
+		if strings.EqualFold(items[i].Source.Repository.FullName, wantRepo) {
+			return items[i].toPR(h.repo), nil
+		}
+	}
+	return nil, nil
 }
 
 // runWithDescription runs a twg bb pull-requests command whose description is

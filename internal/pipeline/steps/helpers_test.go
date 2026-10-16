@@ -398,14 +398,55 @@ func (api *fakeBitbucketAPI) withPipelineLog(buildNumber, log string) *fakeBitbu
 	return api
 }
 
+// bbFakeStateForTest mirrors the fake twg's on-disk state (see bbFakeState in
+// internal/pipeline/fakecli); a field missing here would be dropped by
+// updateState's read-modify-write.
 type bbFakeStateForTest struct {
-	Exists      bool   `json:"exists"`
-	ID          int    `json:"id"`
-	URL         string `json:"url"`
-	State       string `json:"state"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Puts        int    `json:"puts"`
+	Exists       bool              `json:"exists"`
+	ID           int               `json:"id"`
+	URL          string            `json:"url"`
+	State        string            `json:"state"`
+	Title        string            `json:"title"`
+	Description  string            `json:"description"`
+	Puts         int               `json:"puts"`
+	Source       string            `json:"source,omitempty"`
+	Dest         string            `json:"dest,omitempty"`
+	SourceCommit string            `json:"source_commit,omitempty"`
+	Others       []bbFakePRForTest `json:"others,omitempty"`
+}
+
+// bbFakePRForTest is one extra PR the fake twg lists from `query`.
+type bbFakePRForTest struct {
+	ID           int    `json:"id"`
+	URL          string `json:"url"`
+	State        string `json:"state"`
+	Source       string `json:"source"`
+	Dest         string `json:"dest"`
+	SourceCommit string `json:"source_commit"`
+}
+
+// withOtherPR adds a sibling PR that `pull-requests query` lists (subject to
+// its --state, --source and --dest filters) but `get` never reads.
+func (api *fakeBitbucketAPI) withOtherPR(pr bbFakePRForTest) *fakeBitbucketAPI {
+	api.updateState(func(s *bbFakeStateForTest) { s.Others = append(s.Others, pr) })
+	return api
+}
+
+// withPrimaryPR makes the primary PR (the one `get` reads) a PR in the given
+// state, so a merged PR can also be read back by the CI step.
+func (api *fakeBitbucketAPI) withPrimaryPR(pr bbFakePRForTest) *fakeBitbucketAPI {
+	api.updateState(func(s *bbFakeStateForTest) {
+		s.Exists = true
+		s.ID = pr.ID
+		s.URL = pr.URL
+		s.State = pr.State
+		s.Source = pr.Source
+		s.Dest = pr.Dest
+		s.SourceCommit = pr.SourceCommit
+		s.Title = "Merged title"
+		s.Description = "Merged description"
+	})
+	return api
 }
 
 func (api *fakeBitbucketAPI) updateState(mutate func(*bbFakeStateForTest)) {

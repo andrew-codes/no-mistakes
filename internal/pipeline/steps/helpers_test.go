@@ -314,6 +314,9 @@ type fakeBitbucketAPI struct {
 	env         map[string]string
 	existingID  int
 	existingURL string
+	// commentsPath is the JSON array the fake's `comment` subcommands serve
+	// and mutate; empty until withComments.
+	commentsPath string
 }
 
 // newFakeBitbucketAPI wires up a fake `twg` binary on PATH. existingPRID == 0
@@ -376,6 +379,46 @@ func (api *fakeBitbucketAPI) withPRState(state string) *fakeBitbucketAPI {
 func (api *fakeBitbucketAPI) withStatuses(statusesJSON string) *fakeBitbucketAPI {
 	api.env["FAKE_CLI_BB_STATUSES_JSON"] = statusesJSON
 	return api
+}
+
+// withComments seeds the review comments `comment query` returns (a JSON
+// array of Bitbucket comment objects). The fake appends the replies the
+// pipeline posts and stamps a resolution on the threads it resolves, which
+// comments() reads back.
+func (api *fakeBitbucketAPI) withComments(commentsJSON string) *fakeBitbucketAPI {
+	api.t.Helper()
+	api.commentsPath = filepath.Join(api.t.TempDir(), "bb-comments.json")
+	if err := os.WriteFile(api.commentsPath, []byte(commentsJSON), 0o644); err != nil {
+		api.t.Fatal(err)
+	}
+	api.env["FAKE_CLI_BB_COMMENTS_FILE"] = api.commentsPath
+	return api
+}
+
+// bbCommentForTest is the part of a fake comment the tests assert on.
+type bbCommentForTest struct {
+	ID      int `json:"id"`
+	Content struct {
+		Raw string `json:"raw"`
+	} `json:"content"`
+	Parent *struct {
+		ID int `json:"id"`
+	} `json:"parent"`
+	Resolution json.RawMessage `json:"resolution"`
+}
+
+// comments reads the fake's current comment list.
+func (api *fakeBitbucketAPI) comments() []bbCommentForTest {
+	api.t.Helper()
+	data, err := os.ReadFile(api.commentsPath)
+	if err != nil {
+		api.t.Fatal(err)
+	}
+	var out []bbCommentForTest
+	if err := json.Unmarshal(data, &out); err != nil {
+		api.t.Fatal(err)
+	}
+	return out
 }
 
 // withMergeability seeds the merge-check listing `pull-requests mergeability`

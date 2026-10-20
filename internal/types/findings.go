@@ -102,6 +102,12 @@ const (
 	FindingCategoryCIBehindBase    = "ci-behind-base"
 	FindingCategoryCITransient     = "ci-transient"
 	FindingCategoryCIReviewBot     = "ci-review-bot"
+	// FindingCategoryCIReviewComment carries one unresolved human or bot
+	// review comment on a provider that can also reply to it (see
+	// scm.Capabilities.ReviewCommentReplies). Unlike a review-bot finding it
+	// is an auto-fix finding: the CI fix agent addresses the comment, and the
+	// step then replies on the thread. Finding.CommentID names the comment.
+	FindingCategoryCIReviewComment = "ci-review-comment"
 )
 
 // FindingCategoryReviewQuestion marks the synthetic finding the review step
@@ -214,6 +220,11 @@ type Finding struct {
 	// every non-CI finding.
 	Check   string `json:"check,omitempty"`
 	CheckID string `json:"check_id,omitempty"`
+	// CommentID is the provider's identity for the review comment a
+	// FindingCategoryCIReviewComment finding was derived from, so the CI step
+	// can reply on that exact comment after the fix. Empty on every other
+	// finding.
+	CommentID string `json:"comment_id,omitempty"`
 }
 
 // TestScenario is one named end-to-end scenario the test step derived from the
@@ -284,6 +295,7 @@ type findingWire struct {
 	Category            string `json:"category,omitempty"`
 	Check               string `json:"check,omitempty"`
 	CheckID             string `json:"check_id,omitempty"`
+	CommentID           string `json:"comment_id,omitempty"`
 	RequiresHumanReview *bool  `json:"requires_human_review,omitempty"`
 }
 
@@ -654,6 +666,7 @@ func (f *Finding) UnmarshalJSON(data []byte) error {
 	f.Category = wire.Category
 	f.Check = wire.Check
 	f.CheckID = wire.CheckID
+	f.CommentID = wire.CommentID
 	if f.Action == "" && wire.RequiresHumanReview != nil {
 		if *wire.RequiresHumanReview {
 			f.Action = ActionAskUser

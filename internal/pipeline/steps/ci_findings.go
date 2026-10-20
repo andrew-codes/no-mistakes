@@ -59,6 +59,11 @@ type ciIssues struct {
 	// or, under ci.review_bot_comments: always, when it completed green or
 	// has not registered on the head yet.
 	botComments []scm.ReviewComment
+	// reviewComments are the unresolved human and bot review comments of a
+	// provider that can reply to them (scm.Capabilities.ReviewCommentReplies).
+	// Each becomes an auto-fix finding the fix agent addresses and the step
+	// then answers on the thread.
+	reviewComments []scm.ReviewComment
 	// greenBots asks the classifier to also read the registered review bots
 	// whose check completed green or has not registered on the head yet
 	// (ci.review_bot_comments: always).
@@ -114,6 +119,7 @@ func ciObservationFindings(issues ciIssues) Findings {
 		botChecks = append(botChecks, greenReviewBotChecks(issues.checks)...)
 	}
 	items = append(items, reviewBotFindings(issues.provider, botChecks, issues.botComments)...)
+	items = append(items, reviewCommentFindings(issues.reviewComments)...)
 	if issues.mergeConflict {
 		items = append(items, Finding{
 			Severity:    types.FindingSeverityError,
@@ -148,6 +154,9 @@ func ciObservationFindings(issues ciIssues) Findings {
 		parts = append(parts, ciBehindBaseDescription)
 	}
 	if summary := reviewBotSummary(items); summary != "" {
+		parts = append(parts, summary)
+	}
+	if summary := reviewCommentSummary(items); summary != "" {
 		parts = append(parts, summary)
 	}
 	if len(transient) > 0 {
@@ -312,6 +321,67 @@ func reviewBotFindings(provider scm.Provider, checks []reviewBotCheck, comments 
 	return append(items, marker)
 }
 
+// reviewCommentFindings renders unresolved review comments as auto-fix
+// findings, one per comment, anchored to the file and line the comment is
+// about. The count and size are bounded like review-bot findings (the payload
+// rides the same IPC event stream), and a comment left out of the bound is
+// named by an omission marker that carries no comment id: it is never replied
+// to, so it is raised again on a later poll once the others are handled.
+func reviewCommentFindings(comments []scm.ReviewComment) []Finding {
+	var items []Finding
+	bytesUsed := 0
+	seen := map[string]bool{}
+	for i, comment := range comments {
+		if comment.ID == "" || seen[comment.ID] {
+			continue
+		}
+		seen[comment.ID] = true
+		body := strings.TrimSpace(comment.Body)
+		if len(body) > maxReviewBotCommentBytes {
+			body = body[:maxReviewBotCommentBytes] + "..."
+		}
+		item := Finding{
+			Severity:    types.FindingSeverityWarning,
+			Action:      types.ActionAutoFix,
+			Category:    types.FindingCategoryCIReviewComment,
+			CommentID:   comment.ID,
+			File:        comment.Path,
+			Line:        comment.Line,
+			Description: fmt.Sprintf("%s: %s", strings.TrimSpace(comment.Author), body),
+		}
+		raw, _ := json.Marshal(item)
+		if len(items) == maxReviewBotCommentFindings || bytesUsed+len(raw) > maxReviewBotObservationBytes {
+			omitted := len(comments) - i
+			items = append(items, Finding{
+				Severity:    types.FindingSeverityWarning,
+				Action:      types.ActionAskUser,
+				Category:    types.FindingCategoryCIReviewComment,
+				Description: fmt.Sprintf("%d more unresolved review comments were omitted from this gate; read them on the pull request", omitted),
+			})
+			break
+		}
+		items = append(items, item)
+		bytesUsed += len(raw)
+	}
+	return items
+}
+
+func reviewCommentSummary(items []Finding) string {
+	count := 0
+	for _, item := range items {
+		if item.Category == types.FindingCategoryCIReviewComment && item.CommentID != "" {
+			count++
+		}
+	}
+	switch count {
+	case 0:
+		return ""
+	case 1:
+		return "1 unresolved review comment to address"
+	}
+	return fmt.Sprintf("%d unresolved review comments to address", count)
+}
+
 func reviewBotSummary(items []Finding) string {
 	byCheck := map[string]int{}
 	var order []string
@@ -424,20 +494,86 @@ func reviewBotComments(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, ch
 // returns the read error, because the caller would otherwise report
 // checks-passed over comments it never read.
 func (s *CIStep) greenReviewBotFindings(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, checks []scm.Check) (Findings, error) {
-	if !reviewBotCommentsAlways(sctx) || len(greenReviewBotChecks(checks)) == 0 {
-		return Findings{}, nil
-	}
-	comments, err := readReviewBotComments(sctx, host, pr)
+	botWanted := reviewBotCommentsAlways(sctx) && len(greenReviewBotChecks(checks)) > 0
+	// A provider that can reply to review comments has every unresolved
+	// human and bot comment raised as a finding on a green head too,
+	// whatever ci.review_bot_comments says: the comments are the requests
+	// the fix agent answers, not a bot's opinion.
+	reviewComments, err := s.unansweredReviewComments(sctx, host, pr)
 	if err != nil {
 		return Findings{}, err
 	}
+	var botComments []scm.ReviewComment
+	if botWanted {
+		botComments, err = readReviewBotComments(sctx, host, pr)
+		if err != nil {
+			return Findings{}, err
+		}
+	}
+	if !botWanted && len(reviewComments) == 0 {
+		return Findings{}, nil
+	}
 	return ciObservationFindings(ciIssues{
-		provider:    host.Provider(),
-		checks:      checks,
-		reruns:      s.transientReruns.used,
-		botComments: comments,
-		greenBots:   true,
+		provider:       host.Provider(),
+		checks:         checks,
+		reruns:         s.transientReruns.used,
+		botComments:    botComments,
+		reviewComments: reviewComments,
+		greenBots:      botWanted,
 	}), nil
+}
+
+// bestEffortReviewComments is unansweredReviewComments for an observation that
+// already has a failing check to report: an unreadable comment list leaves the
+// comments out of this round rather than failing the observation, and the
+// next green head reads them again.
+func (s *CIStep) bestEffortReviewComments(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR) []scm.ReviewComment {
+	comments, err := s.unansweredReviewComments(sctx, host, pr)
+	if err != nil {
+		sctx.Log(fmt.Sprintf("warning: could not read review comments: %v", err))
+		return nil
+	}
+	return comments
+}
+
+// reviewCommentsReadError marks a failure to read the review comments of a
+// provider that replies to them, so the park that follows repeated failures
+// names the right cause.
+type reviewCommentsReadError struct{ err error }
+
+func (e *reviewCommentsReadError) Error() string { return "read review comments: " + e.err.Error() }
+func (e *reviewCommentsReadError) Unwrap() error { return e.err }
+
+// unansweredReviewComments returns the PR's unresolved human and bot review
+// comments that this step has not answered yet, or nil when the host cannot
+// both read and answer them. A comment the step already replied to is dropped
+// even when the provider's listing still shows it, so a slow-to-update thread
+// is never answered twice.
+func (s *CIStep) unansweredReviewComments(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR) ([]scm.ReviewComment, error) {
+	if !host.Capabilities().ReviewCommentReplies {
+		return nil, nil
+	}
+	rch, ok := host.(scm.ReviewCommentsHost)
+	if !ok {
+		return nil, nil
+	}
+	if _, ok := host.(scm.ReviewCommentResponder); !ok {
+		return nil, nil
+	}
+	comments, err := rch.GetReviewComments(sctx.Ctx, pr)
+	if errors.Is(err, scm.ErrUnsupported) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, &reviewCommentsReadError{err: err}
+	}
+	unanswered := comments[:0:0]
+	for _, comment := range comments {
+		if !s.answeredComments[comment.ID] {
+			unanswered = append(unanswered, comment)
+		}
+	}
+	return unanswered, nil
 }
 
 // reviewBotCommentsReadFailureOutcome parks the step when, under
@@ -454,6 +590,12 @@ func reviewBotCommentsReadFailureOutcome(err error) *pipeline.StepOutcome {
 			Category:    types.FindingCategoryCIReviewBot,
 			Description: fmt.Sprintf("Every check passed, but the review bot's unresolved comments could not be read: %v. ci.review_bot_comments is \"always\", so checks-passed is not reported without reading them; decide whether to proceed.", err),
 		}},
+	}
+	var commentsErr *reviewCommentsReadError
+	if errors.As(err, &commentsErr) {
+		findings.Summary = "review comments could not be read from the provider"
+		findings.Items[0].Category = types.FindingCategoryCIReviewComment
+		findings.Items[0].Description = fmt.Sprintf("Every check passed, but the pull request's unresolved review comments could not be read: %v. checks-passed is not reported without reading them; decide whether to proceed.", err)
 	}
 	encoded, _ := json.Marshal(findings)
 	return &pipeline.StepOutcome{NeedsApproval: true, Findings: string(encoded)}

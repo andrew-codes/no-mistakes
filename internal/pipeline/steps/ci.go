@@ -70,6 +70,10 @@ type CIStep struct {
 	// set only for the duration of that repair's recording. recordRepair
 	// proves a pure replay against exactly this commit and nothing else.
 	replayBase string
+	// answeredComments are the review comments this step has already replied
+	// to, so a provider listing that lags its own thread never gets a second
+	// reply.
+	answeredComments map[string]bool
 }
 
 // SetPollIntervalOverride is a test hook; production leaves the override unset.
@@ -798,6 +802,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 						mergeConflict:       mergeConflict,
 						reruns:              s.transientReruns.used,
 						botComments:         reviewBotComments(sctx, host, pr, checks),
+						reviewComments:      s.bestEffortReviewComments(sctx, host, pr),
 						greenBots:           reviewBotCommentsAlways(sctx),
 					})
 					if hasAwaitingApprovalChecks(checks) {

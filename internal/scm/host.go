@@ -290,6 +290,13 @@ type Capabilities struct {
 	FailedCheckLogs bool
 	MergedProof     bool
 	ReviewComments  bool
+	// ReviewCommentReplies declares that the provider's ReviewCommentsHost
+	// reads EVERY unresolved human and bot comment (not only review-bot
+	// ones) and that the host implements ReviewCommentResponder. The CI step
+	// then turns each comment into an auto-fix finding, has the fix agent
+	// address it, and replies on the thread afterwards. Providers without it
+	// keep the review-bot-only, ask-user behavior.
+	ReviewCommentReplies bool
 	// ClosingReferences declares that the provider closes issues from a
 	// closing keyword in the pull request body ("Closes #42"), which is what
 	// makes an explicitly requested --closes reference render and verify. False
@@ -360,6 +367,20 @@ type ReviewComment struct {
 // unresolved review comments on a pull request.
 type ReviewCommentsHost interface {
 	GetReviewComments(ctx context.Context, pr *PR) ([]ReviewComment, error)
+}
+
+// ReviewCommentResponder is implemented by hosts that can answer a review
+// comment: a reply on its thread, and resolving the thread. A host that
+// declares Capabilities().ReviewCommentReplies implements it, and its
+// GetReviewComments must stop returning a comment once a reply from
+// ReplyToReviewComment exists on its thread, so a handled comment is never
+// raised, or answered, twice.
+type ReviewCommentResponder interface {
+	// ReplyToReviewComment posts body as a reply to the comment.
+	ReplyToReviewComment(ctx context.Context, pr *PR, commentID, body string) error
+	// ResolveReviewComment resolves the comment's thread. A provider without
+	// resolvable threads returns ErrUnsupported.
+	ResolveReviewComment(ctx context.Context, pr *PR, commentID string) error
 }
 
 // PRContentReader is an optional interface for hosts that can read the current

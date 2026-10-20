@@ -125,6 +125,7 @@ func (s *CIStep) repairFromFindings(sctx *pipeline.StepContext, host scm.Host, p
 		sctx.Log(fmt.Sprintf("warning: CI fix failed: %v", err))
 		return nil, nil
 	}
+	s.respondToReviewComments(sctx, host, pr, targets, repair)
 	if repair.HeadAdvanced || sctx.Run.HeadSHA != previousHeadSHA {
 		s.lastFixedChecks = fixKey
 		s.lastFixedCompletedAt = fixCompletedAt
@@ -255,6 +256,10 @@ CI logs:
 	if len(targets.Findings.Items) > 0 {
 		prompt += ciSelectedFindingsPrompt(targets.Findings)
 	}
+	hasReviewComments := len(reviewCommentTargets(targets.Findings)) > 0
+	if hasReviewComments {
+		prompt += ciReviewCommentRules
+	}
 	// Recorded human decisions, before the user intent and in the same order
 	// every other fix-capable step composes them. The intent is frozen at run
 	// start, so it always predates any decision a human made at a later gate;
@@ -272,7 +277,7 @@ CI logs:
 	result, err := sctx.RunAgentContext(ctx, agent.RunOpts{
 		Prompt:     prompt,
 		CWD:        sctx.WorkDir,
-		JSONSchema: ciFixConclusionSchema,
+		JSONSchema: ciFixSchema(hasReviewComments),
 		OnChunk:    sctx.LogChunk,
 	})
 	if err != nil {
@@ -288,6 +293,7 @@ CI logs:
 		defer func() { s.replayBase = "" }()
 	}
 	repair, err := s.commitRepair(sctx, conclusion.Summary, result)
+	repair.CommentReplies = conclusion.CommentReplies
 	var refusal *pipeline.ProtectedPathError
 	if errors.As(err, &refusal) {
 		head, recordErr := stepGitHeadSHA(sctx)
@@ -430,8 +436,9 @@ func boundedCILogError(err error, maxBytes int) string {
 }
 
 type ciFixConclusion struct {
-	Summary          string `json:"summary"`
-	CodeChangeNeeded *bool  `json:"code_change_needed"`
+	Summary          string              `json:"summary"`
+	CodeChangeNeeded *bool               `json:"code_change_needed"`
+	CommentReplies   []ciCommentDecision `json:"comment_replies,omitempty"`
 }
 
 var ciFixConclusionSchema = json.RawMessage(fmt.Sprintf(`{
@@ -473,12 +480,13 @@ func ciSelectedFindingsPrompt(findings Findings) string {
 	safe := types.FindingsMetadata(findings)
 	type externalDescription struct {
 		ID          string `json:"id,omitempty"`
+		CommentID   string `json:"comment_id,omitempty"`
 		Description string `json:"description"`
 	}
 	var external []externalDescription
 	for _, item := range findings.Items {
-		if item.Category == types.FindingCategoryCIReviewBot {
-			external = append(external, externalDescription{ID: item.ID, Description: item.Description})
+		if item.Category == types.FindingCategoryCIReviewBot || (item.Category == types.FindingCategoryCIReviewComment && item.CommentID != "") {
+			external = append(external, externalDescription{ID: item.ID, CommentID: item.CommentID, Description: item.Description})
 			item.Description = "See the separately framed untrusted review-bot description."
 		}
 		safe.Items = append(safe.Items, item)
@@ -578,6 +586,9 @@ type ciRepairResult struct {
 	ReviewCarried      bool
 	NoCodeChangeNeeded bool
 	Summary            string
+	// CommentReplies are the fix agent's per-comment decisions for the review
+	// comments the round was asked to address.
+	CommentReplies []ciCommentDecision
 }
 
 // restartFrom is the step a revalidating repair restarts validation at.

@@ -295,3 +295,19 @@ func TestAutoFixLimit(t *testing.T) {
 		}
 	}
 }
+
+func TestMerge_BitbucketDraftLifecycleDefaultsOnAndCanBeOptedOut(t *testing.T) {
+	falsy := false
+	if cfg := Merge(&GlobalConfig{}, &RepoConfig{}); !cfg.Providers.Bitbucket.DraftPullRequests {
+		t.Error("bitbucket draft_pull_requests = false, want the default true")
+	}
+	global := &GlobalConfig{Providers: ProvidersRaw{Bitbucket: BitbucketProviderRaw{DraftPullRequests: &falsy}}}
+	if cfg := Merge(global, &RepoConfig{}); cfg.Providers.Bitbucket.DraftPullRequests {
+		t.Error("bitbucket draft_pull_requests = true, want false when the operator opts out")
+	}
+	// Every other provider keeps creating ready PRs.
+	cfg := Merge(&GlobalConfig{}, &RepoConfig{})
+	if cfg.Providers.GitHub.DraftPullRequests || cfg.Providers.GitLab.DraftPullRequests || cfg.Providers.AzureDevOps.DraftPullRequests || cfg.Providers.Origin.DraftPullRequests {
+		t.Error("only Bitbucket defaults to draft")
+	}
+}

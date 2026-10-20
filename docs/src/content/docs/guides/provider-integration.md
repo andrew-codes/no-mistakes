@@ -171,8 +171,7 @@ twg whoami
 - PR creation and update
 - CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed pipeline step log fetching for the CI auto-fix step
-
-
+- Reading and changing an existing PR's destination branch (`twg bb pull-requests get`, `twg bb pull-requests update --dest`), so a per-run `--base-branch` retargets the open PR instead of failing the PR step. When no base was requested and Bitbucket does not report one, the PR step updates the PR in place and logs that it could not read the base
 - Review comments, human and bot, inline and general: each unresolved comment (read with `twg bb pull-requests comment query`) becomes a finding the CI fix agent addresses. After the fix the step replies on the comment (`twg bb pull-requests comment create --reply-to`) and resolves the thread where it changed the code; a comment the agent decides not to change gets a reply saying why and stays open. Notices such as a merge-on-green message, a review bot's summary, the pipeline's own attestation, and comments written by the authenticated `twg` user are ignored, and a thread is never answered twice. See the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
 
 **What you don't get (yet):**

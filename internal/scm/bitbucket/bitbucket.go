@@ -108,8 +108,11 @@ func (h *Host) Provider() scm.Provider { return scm.ProviderBitbucket }
 
 // Capabilities reports Bitbucket's feature matrix. Bitbucket's REST API does
 // not expose a reliable merge-conflict probe, so MergeableState is off.
+// ReviewComments and ReviewCommentReplies declare the comment thread support in
+// review_comments.go: every unresolved human and bot comment is readable and
+// each can be answered.
 func (h *Host) Capabilities() scm.Capabilities {
-	return scm.Capabilities{MergeableState: false, FailedCheckLogs: true}
+	return scm.Capabilities{MergeableState: false, FailedCheckLogs: true, ReviewComments: true, ReviewCommentReplies: true}
 }
 
 func (h *Host) Available(ctx context.Context) error {

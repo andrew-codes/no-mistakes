@@ -170,6 +170,7 @@ twg whoami
 - PR creation and update
 - CI pipeline status polling until the PR is merged, declined, or the configured `ci_timeout` idle window elapses
 - Failed pipeline step log fetching for the CI auto-fix step
+- Reading and changing an existing PR's destination branch (`twg bb pull-requests get`, `twg bb pull-requests update --dest`), so a per-run `--base-branch` retargets the open PR instead of failing the PR step. When no base was requested and Bitbucket does not report one, the PR step updates the PR in place and logs that it could not read the base
 - Mergeability polling and merge-conflict auto-fix, read from Bitbucket's own merge checks (`twg bb pull-requests mergeability`). A failed `git_mergeability_check` is a merge conflict. A failing, blocking `maximum_commits_behind` check means Bitbucket will not merge the branch until it is rebased onto its destination, so it takes the same rebase and revalidate repair; no-mistakes does not count commits behind itself. Checks that are `PENDING` or `UNKNOWN` keep the monitor waiting, and other merge checks (approvals, tasks, builds) are not read.
 
 **What you don't get (yet):**

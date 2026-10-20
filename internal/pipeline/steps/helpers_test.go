@@ -372,6 +372,20 @@ func (api *fakeBitbucketAPI) withPRState(state string) *fakeBitbucketAPI {
 	return api
 }
 
+// withDestination sets the PR's destination branch: `get` reports it as
+// destination.branch.name, `query` lists it, and `update --dest` changes it.
+// Without it the fake reports no destination at all.
+func (api *fakeBitbucketAPI) withDestination(branch string) *fakeBitbucketAPI {
+	api.updateState(func(s *bbFakeStateForTest) { s.Dest = branch })
+	return api
+}
+
+// destination reads the PR's current destination branch back.
+func (api *fakeBitbucketAPI) destination(t *testing.T) string { return api.readState(t).Dest }
+
+// destUpdates counts the `update --dest` retargets the fake served.
+func (api *fakeBitbucketAPI) destUpdates(t *testing.T) int { return api.readState(t).DestUpdates }
+
 // withStatuses seeds the `_statuses` array `pull-requests get --statuses` returns.
 func (api *fakeBitbucketAPI) withStatuses(statusesJSON string) *fakeBitbucketAPI {
 	api.env["FAKE_CLI_BB_STATUSES_JSON"] = statusesJSON
@@ -416,6 +430,7 @@ type bbFakeStateForTest struct {
 	Title        string            `json:"title"`
 	Description  string            `json:"description"`
 	Puts         int               `json:"puts"`
+	DestUpdates  int               `json:"dest_updates,omitempty"`
 	Source       string            `json:"source,omitempty"`
 	Dest         string            `json:"dest,omitempty"`
 	SourceCommit string            `json:"source_commit,omitempty"`

@@ -175,7 +175,56 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 	if len(items) == 0 {
 		return nil, nil
 	}
-	return items[0].toPR(h.repo), nil
+	// The listing carries the destination, so an existing PR's live base is
+	// known without a second read.
+	pr := items[0].toPR(h.repo)
+	pr.BaseBranch = strings.TrimSpace(items[0].Destination.Branch.Name)
+	return pr, nil
+}
+
+// GetPRBaseBranch implements scm.PRBaseBranchReader: the PR's destination
+// branch, read from `twg bb pull-requests get`. A response without one is an
+// error, never an empty base the caller could mistake for "unset".
+func (h *Host) GetPRBaseBranch(ctx context.Context, pr *scm.PR) (string, error) {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return "", errors.New("twg bb pull-requests get: missing pull request number")
+	}
+	view, _, err := h.getPR(ctx, strings.TrimSpace(pr.Number))
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSpace(view.Destination.Branch.Name)
+	if base == "" {
+		return "", fmt.Errorf("twg bb pull-requests get: pull request %s has no destination branch", pr.Number)
+	}
+	return base, nil
+}
+
+// SetPRBaseBranch implements scm.PRBaseRetargeter with `twg bb pull-requests
+// update --dest`. twg echoes the updated PR; when that echo names a
+// destination it must be the requested one, so a silently ignored flag cannot
+// read as a successful retarget.
+func (h *Host) SetPRBaseBranch(ctx context.Context, pr *scm.PR, baseBranch string) error {
+	baseBranch = strings.TrimSpace(baseBranch)
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return errors.New("twg bb pull-requests update: missing pull request number")
+	}
+	if baseBranch == "" {
+		return errors.New("twg bb pull-requests update: missing destination branch")
+	}
+	args := []string{"bb", "pull-requests", "update", "--pull-request", strings.TrimSpace(pr.Number), "--dest", baseBranch}
+	args = append(args, h.repoArgs()...)
+	out, err := h.runJSON(ctx, args)
+	if err != nil {
+		return fmt.Errorf("twg bb pull-requests update: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var updated bitbucketPullRequest
+	if trimmed := bytesTrimToJSON(out); len(trimmed) > 0 && json.Unmarshal(trimmed, &updated) == nil {
+		if got := strings.TrimSpace(updated.Destination.Branch.Name); got != "" && got != baseBranch {
+			return fmt.Errorf("twg bb pull-requests update: pull request %s still targets %s, not %s", pr.Number, got, baseBranch)
+		}
+	}
+	return nil
 }
 
 // FindMergedPRs lists the merged PRs opened from branch, newest first. Only
@@ -850,4 +899,8 @@ func bytesTrimToJSON(out []byte) []byte {
 	return out[idx:]
 }
 
-var _ scm.MergedPRFinder = (*Host)(nil)
+var (
+	_ scm.MergedPRFinder     = (*Host)(nil)
+	_ scm.PRBaseBranchReader = (*Host)(nil)
+	_ scm.PRBaseRetargeter   = (*Host)(nil)
+)

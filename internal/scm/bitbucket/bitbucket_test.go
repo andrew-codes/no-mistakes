@@ -679,6 +679,10 @@ func TestEveryJSONCallPassesOutputSummaryNone(t *testing.T) {
 			"bb pull-requests get 42 --statuses --workspace ws --repo repo " + flags},
 		{"GetMergeableState", "[]", func(h *Host) error { _, err := h.GetMergeableState(context.Background(), pr); return err },
 			"bb pull-requests mergeability 42 --workspace ws --repo repo " + flags},
+		{"GetPRBaseBranch", `{"id":42,"destination":{"branch":{"name":"main"}}}`, func(h *Host) error { _, err := h.GetPRBaseBranch(context.Background(), pr); return err },
+			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
+		{"SetPRBaseBranch", prJSON, func(h *Host) error { return h.SetPRBaseBranch(context.Background(), pr, "main") },
+			"bb pull-requests update --pull-request 42 --dest main --workspace ws --repo repo " + flags},
 		{"GetPRContent", prJSON, func(h *Host) error { _, err := h.GetPRContent(context.Background(), pr); return err },
 			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
 	}

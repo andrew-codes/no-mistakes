@@ -352,6 +352,16 @@ func bindExistingPR(sctx *pipeline.StepContext, host scm.Host, discovered *scm.P
 	}
 	base, err := reader.GetPRBaseBranch(ctx, existing)
 	if err != nil {
+		// The base is only needed to compare against a per-run --base-branch
+		// override. With none requested, a provider that merely could not read
+		// it must not fail the step; the CI monitor re-reads the live base
+		// itself. A broken provider-plugin contract still fails closed.
+		if runPRBaseBranch(sctx) == "" && !pluginContractBroken(err) {
+			if sctx != nil && sctx.Log != nil {
+				sctx.Log(fmt.Sprintf("warning: could not read the base branch of pull request %s, and no base was requested: %v", owned, err))
+			}
+			return existing, nil
+		}
 		return nil, fmt.Errorf("read persisted pull request %s: %w", owned, err)
 	}
 	existing.BaseBranch = strings.TrimSpace(base)

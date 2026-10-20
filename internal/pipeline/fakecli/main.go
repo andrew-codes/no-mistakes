@@ -1307,6 +1307,8 @@ type bbFakeState struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Puts        int    `json:"puts"`
+	// DestUpdates counts `update --dest` retargets.
+	DestUpdates int `json:"dest_updates,omitempty"`
 	// Source, Dest and SourceCommit describe the primary PR for `query`
 	// filtering and output. Empty Source/Dest match any filter, so a state file
 	// that never set them behaves as before.
@@ -1542,6 +1544,9 @@ func fakeTWGPullRequests(args []string) {
 		if sourceCommit := os.Getenv("FAKE_CLI_BB_SOURCE_COMMIT"); sourceCommit != "" {
 			payload["source"] = map[string]any{"commit": map[string]string{"hash": sourceCommit}}
 		}
+		if state.Dest != "" {
+			payload["destination"] = map[string]any{"branch": map[string]string{"name": state.Dest}}
+		}
 		if fakeCLIHasFlag(rest, "--statuses") {
 			statuses := os.Getenv("FAKE_CLI_BB_STATUSES_JSON")
 			if statuses == "" {
@@ -1582,6 +1587,21 @@ func fakeTWGPullRequests(args []string) {
 		fmt.Println(fakeTWGPRJSON(state))
 		os.Exit(0)
 	case "update":
+		if dest, ok := fakeCLIFlagValue(rest, "--dest"); ok {
+			// A retarget: like the real command it changes only the destination
+			// and leaves the title and description alone.
+			if msg := os.Getenv("FAKE_CLI_BB_REJECT_DEST_ON_UPDATE"); msg != "" {
+				fmt.Fprintln(os.Stderr, msg)
+				os.Exit(1)
+			}
+			if os.Getenv("FAKE_CLI_BB_IGNORE_DEST_ON_UPDATE") == "" {
+				state.Dest = dest
+			}
+			state.DestUpdates++
+			saveBBState(state)
+			fmt.Println(fakeTWGPRJSON(state))
+			os.Exit(0)
+		}
 		if title, ok := fakeCLIFlagValue(rest, "--title"); ok {
 			if os.Getenv("FAKE_CLI_BB_REJECT_TITLE_ON_UPDATE") != "" {
 				fmt.Fprintln(os.Stderr, "author title would be overwritten")

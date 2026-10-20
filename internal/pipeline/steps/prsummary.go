@@ -414,13 +414,7 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 		}
 		if opts.includeTestedDetails {
 			for _, detail := range tested {
-				rendered := renderTestedDetailFor(detail, opts.flavor)
-				if rendered == "" {
-					continue
-				}
-				b.WriteString("- ")
-				b.WriteString(rendered)
-				b.WriteString("\n")
+				b.WriteString(renderTestedDetailBullet(detail, opts.flavor))
 			}
 		}
 		renderState := testingArtifactRenderState{remainingEmbeddedBytes: maxEmbeddedArtifactsTotalBytes}
@@ -634,7 +628,7 @@ func appendTestingDetails(details []string, seen map[string]bool, raw *string) [
 		return details
 	}
 	for _, detail := range findings.Tested {
-		clean := sanitizePromptText(detail)
+		clean := sanitizeTestedDetail(detail)
 		if clean == "" || seen[clean] {
 			continue
 		}
@@ -644,23 +638,106 @@ func appendTestingDetails(details []string, seen map[string]bool, raw *string) [
 	return details
 }
 
-func renderTestedDetailFor(detail string, flavor prBodyFlavor) string {
-	clean := sanitizePromptMultilineText(detail)
-	if clean == "" {
-		return ""
+// sanitizeTestedDetail cleans a tested-command detail without destroying its
+// layout. A detail is often a whole script (a heredoc with nested blocks), so
+// unlike sanitizePromptMultilineText it keeps each line's leading indentation
+// and never joins lines: a flattened heredoc is no longer the command that ran.
+func sanitizeTestedDetail(text string) string {
+	text = strings.NewReplacer("<<<<<<<", " ", "=======", " ", ">>>>>>>", " ").Replace(text)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = strings.ReplaceAll(text, "\t", "    ")
+	lines := strings.Split(text, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimRight(lines[i], " ")
 	}
+	return strings.Trim(strings.Join(lines, "\n"), "\n")
+}
+
+// testedDetailInline reports the one-line code span form of a detail, if it has one.
+func testedDetailInline(clean string) (string, bool) {
 	if strings.HasPrefix(clean, "`") && strings.HasSuffix(clean, "`") && strings.Count(clean, "`") == 2 && !strings.Contains(clean[1:len(clean)-1], "\n") {
-		return clean
+		return clean, true
 	}
 	if !strings.Contains(clean, "`") && !strings.Contains(clean, "\n") {
-		return fmt.Sprintf("`%s`", clean)
+		return fmt.Sprintf("`%s`", strings.TrimSpace(clean)), true
+	}
+	return "", false
+}
+
+// testedDetailLanguage picks the fence language for a command or script.
+// Shell is by far the common case for a tested detail, and a language tag is
+// what makes Bitbucket render the block as code; anything else stays "text".
+func testedDetailLanguage(clean string) string {
+	first := strings.TrimSpace(strings.SplitN(clean, "\n", 2)[0])
+	switch {
+	case strings.HasPrefix(first, "#!"), strings.HasPrefix(first, "$ "),
+		strings.Contains(clean, "<<'"), strings.Contains(clean, "<<\""), strings.Contains(clean, "<<-"),
+		strings.HasPrefix(first, "set -"), strings.Contains(clean, "\nset -"):
+		return "bash"
+	}
+	switch strings.Fields(first + " x")[0] {
+	case "bash", "sh", "zsh", "yarn", "npm", "npx", "pnpm", "make", "go", "git", "cd", "export", "echo", "node", "python", "python3", "pytest", "cargo", "docker", "nx":
+		return "bash"
+	}
+	return "text"
+}
+
+// markdownCodeBlock renders a fenced block whose every line is prefixed with
+// indent, so the block can sit inside a list item. The fence is always
+// preceded by a blank line when the caller places it after prose.
+func markdownCodeBlock(lang, content, indent string) string {
+	var b strings.Builder
+	b.WriteString(indent + "```" + lang + "\n")
+	for _, line := range strings.Split(content, "\n") {
+		if line == "" {
+			b.WriteString("\n")
+			continue
+		}
+		b.WriteString(indent + line + "\n")
+	}
+	b.WriteString(indent + "```")
+	return b.String()
+}
+
+func renderTestedDetailFor(detail string, flavor prBodyFlavor) string {
+	clean := sanitizeTestedDetail(detail)
+	if strings.TrimSpace(clean) == "" {
+		return ""
+	}
+	if inline, ok := testedDetailInline(clean); ok {
+		return inline
 	}
 	if flavor == prBodyMarkdown {
-		return fmt.Sprintf("```text\n%s\n```", escapeMarkdownFence(escapePipelineFoldMarkers(clean)))
+		return markdownCodeBlock(testedDetailLanguage(clean), escapeMarkdownFence(escapePipelineFoldMarkers(clean)), "")
 	}
 	escaped := html.EscapeString(clean)
 	escaped = strings.ReplaceAll(escaped, "\n", "&#10;")
 	return fmt.Sprintf("<code>%s</code>", escaped)
+}
+
+// renderTestedDetailBullet renders a tested detail as a list item, ending in a
+// newline. A code block cannot share its line with the bullet marker (Bitbucket
+// Cloud's markdown then reads "- ```text" as an inline code span and leaves the
+// language word as prose, and the unindented script lines end the list), so the
+// block goes on its own indented lines under a short label.
+func renderTestedDetailBullet(detail string, flavor prBodyFlavor) string {
+	if flavor != prBodyMarkdown {
+		rendered := renderTestedDetailFor(detail, flavor)
+		if rendered == "" {
+			return ""
+		}
+		return "- " + rendered + "\n"
+	}
+	clean := sanitizeTestedDetail(detail)
+	if strings.TrimSpace(clean) == "" {
+		return ""
+	}
+	if inline, ok := testedDetailInline(clean); ok {
+		return "- " + inline + "\n"
+	}
+	block := markdownCodeBlock(testedDetailLanguage(clean), escapeMarkdownFence(escapePipelineFoldMarkers(clean)), "    ")
+	return "- Ran:\n\n" + block + "\n\n"
 }
 
 func renderTestingSummaryFor(summary string, flavor prBodyFlavor) string {
@@ -1590,11 +1667,7 @@ func writeTestedDetails(b *strings.Builder, sr *db.StepResult, findings *types.F
 		b.WriteString("\n")
 	}
 	for _, detail := range findings.Tested {
-		rendered := renderTestedDetailFor(detail, flavor)
-		if rendered == "" {
-			continue
-		}
-		b.WriteString(fmt.Sprintf("- %s\n", rendered))
+		b.WriteString(renderTestedDetailBullet(detail, flavor))
 	}
 }
 

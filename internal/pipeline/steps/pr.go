@@ -773,6 +773,12 @@ func (s *PRStep) buildPipelineSection(sctx *pipeline.StepContext, provider scm.P
 }
 
 func (s *PRStep) buildPipelineSectionFor(sctx *pipeline.StepContext, provider scm.Provider, owned bool) (pipelineMD, riskLine, testingMD string) {
+	return s.buildPipelineSectionWith(sctx, provider, owned, false)
+}
+
+// buildPipelineSectionWith is buildPipelineSectionFor with the end-of-run
+// rendering switched on by final: see pipelineAttestationPolicy.Final.
+func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider scm.Provider, owned, final bool) (pipelineMD, riskLine, testingMD string) {
 	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
 	if err != nil {
 		slog.Warn("failed to query step results for pipeline summary", "error", err)
@@ -792,6 +798,10 @@ func (s *PRStep) buildPipelineSectionFor(sctx *pipeline.StepContext, provider sc
 	policy := pipelineAttestationPolicy{}
 	if sctx.Config != nil {
 		policy.AllowTestCommandOverride = strings.TrimSpace(sctx.Config.Test.AllowApproveOverFailure)
+	}
+	if final {
+		policy.Final = true
+		policy.Outcome = finalRunOutcomeLine(sctx.Run, steps)
 	}
 	pipelineMD, riskLine = buildPipelineSummaryFor(steps, rounds, sctx.Run.HeadSHA, provider, policy)
 	// The review conversation rides inside the Pipeline section as an ordinary

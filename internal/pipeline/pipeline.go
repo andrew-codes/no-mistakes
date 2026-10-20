@@ -208,6 +208,17 @@ type Step interface {
 	Execute(sctx *StepContext) (*StepOutcome, error)
 }
 
+// RunFinalizer is implemented by a step that owns an artifact published
+// mid-run which goes stale by the time the run ends (the PR step's
+// description, written once before the CI step and any repair rounds). The
+// executor calls it once after the run reaches a terminal completed or failed
+// status, with every step's final state in the database, so the artifact
+// describes how the run actually ended. It is best effort: an error is logged
+// and never changes the run's outcome.
+type RunFinalizer interface {
+	FinalizeRun(sctx *StepContext) error
+}
+
 // ApprovalGateReconciler is implemented by a step whose parked approval gate
 // can become obsolete when an external source of truth changes. The executor
 // invokes it with a bounded context while also waiting for an approval. A true

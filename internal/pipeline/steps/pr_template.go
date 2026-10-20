@@ -195,7 +195,11 @@ func templateStructureLines(text string) []string {
 }
 
 func (s *PRStep) buildPRAppendix(sctx *pipeline.StepContext, provider scm.Provider) (string, error) {
-	pipelineMD, risk, testing := s.buildPipelineSectionFor(sctx, provider, true)
+	return s.buildPRAppendixWith(sctx, provider, false)
+}
+
+func (s *PRStep) buildPRAppendixWith(sctx *pipeline.StepContext, provider scm.Provider, final bool) (string, error) {
+	pipelineMD, risk, testing := s.buildPipelineSectionWith(sctx, provider, true, final)
 	if strings.Count(pipelineMD, pipelineAttestationCommentPrefix) != 1 {
 		return "", fmt.Errorf("cannot publish template narrative without recorded pipeline evidence and attestation")
 	}

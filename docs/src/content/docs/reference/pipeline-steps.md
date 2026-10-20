@@ -307,6 +307,10 @@ Creates or updates a pull request.
 
 Stores the PR URL in the database and streams it to the TUI.
 
+### Final description refresh
+
+The PR step writes the description once, before the CI step and any CI repair rounds, so what it says about the run is a snapshot. When the run ends (completed or failed, not cancelled or superseded), the executor asks the PR step to refresh the description from the final state: the Risk, Testing and Pipeline sections are recomposed, the Pipeline section opens with the run outcome, and each step shows only its latest round's findings (earlier rounds collapse to a one-line count). The narrative is not redrafted and no agent runs. Only a PR whose body this run's PR step wrote is touched, and a refresh failure never changes the run's result.
+
 ### Pipeline step attestation
 
 Immediately after the existing `Updates from [git push no-mistakes](https://github.com/kunchenguid/no-mistakes)` signature, no-mistakes writes one stable HTML comment:

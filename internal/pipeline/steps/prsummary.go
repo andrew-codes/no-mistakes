@@ -122,6 +122,13 @@ func BuildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 
 type pipelineAttestationPolicy struct {
 	AllowTestCommandOverride string
+	// Final renders the end-of-run description: every step's detail shows only
+	// its latest round's findings (earlier rounds collapse to a one-line count,
+	// since whatever they raised was either fixed or is repeated by the latest
+	// round), and the section opens with the run's outcome.
+	Final bool
+	// Outcome is the one-line run outcome shown when Final is set.
+	Outcome string
 }
 
 func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.StepRound, headSHA string, provider scm.Provider, policy pipelineAttestationPolicy) (string, string) {
@@ -137,7 +144,7 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 			continue
 		}
 		stepRounds := rounds[sr.ID]
-		line, detail := buildStepEntry(sr, stepRounds, flavor)
+		line, detail := buildStepEntryFor(sr, stepRounds, flavor, policy.Final)
 		if line != "" && detail != "" {
 			// Step details quote agent text (findings, fix summaries, tested
 			// commands). A foreign attestation comment in one lands after the
@@ -158,6 +165,10 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 	b.WriteString("## Pipeline\n\n")
 	b.WriteString(noMistakesPRSignature)
 	b.WriteString("\n\n")
+	if policy.Final && policy.Outcome != "" {
+		b.WriteString(policy.Outcome)
+		b.WriteString("\n\n")
+	}
 	if flavor == prBodyHTML {
 		b.WriteString(buildPipelineAttestationWithPolicy(steps, rounds, headSHA, policy))
 		b.WriteString("\n\n")
@@ -1242,9 +1253,13 @@ func formatTestingDuration(ms int64) string {
 }
 
 func buildStepEntry(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor) (statusLine, detailBlock string) {
+	return buildStepEntryFor(sr, rounds, flavor, false)
+}
+
+func buildStepEntryFor(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final bool) (statusLine, detailBlock string) {
 	name := stepDisplayName(sr.StepName)
 	buildDetail := func(line string) (string, string) {
-		return line, buildStepDetails(line, sr, rounds, flavor)
+		return line, buildStepDetails(line, sr, rounds, flavor, final)
 	}
 
 	switch sr.Status {
@@ -1497,7 +1512,7 @@ func buildFixResultText(rounds []*db.StepRound) string {
 // round is shown as the review state observed at its end; a fix round is
 // prefixed with its recorded outcome so a reader can follow the result without
 // mentally replaying rounds.
-func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor) string {
+func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final bool) string {
 	var inner strings.Builder
 	// A skipped step whose rounds recorded no findings never checked
 	// anything, so "No issues found" under a "skipped" summary would
@@ -1511,11 +1526,21 @@ func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRo
 	// them - a data gap we must not paper over as "no issues found".
 	missingRoundFindingsData := sr.FindingsJSON != nil && !roundsHaveFindings(rounds) && !roundsHaveParseFailure(rounds)
 
-	for _, r := range rounds {
+	for ri, r := range rounds {
 		isFixRound := r.IsFixRound()
 		if isFixRound {
 			inner.WriteString(fixRoundLine(r))
 			inner.WriteString("\n")
+		}
+		if final && ri < len(rounds)-1 {
+			// A superseded round's findings are history, not state: the
+			// reader of a finished run needs what is still open, which the
+			// latest round reports.
+			if line := supersededRoundLine(r); line != "" {
+				inner.WriteString(line)
+				inner.WriteString("\n\n")
+			}
+			continue
 		}
 
 		if r.FindingsJSON == nil {
@@ -1557,6 +1582,19 @@ func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRo
 	}
 
 	return foldPRBlock(summaryLine, inner.String(), flavor)
+}
+
+// supersededRoundLine summarises an earlier round for the end-of-run
+// description without repeating its findings.
+func supersededRoundLine(r *db.StepRound) string {
+	if r.FindingsJSON == nil {
+		return ""
+	}
+	findings, err := types.ParseFindingsJSON(*r.FindingsJSON)
+	if err != nil || len(findings.Items) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("Round %d raised %s; superseded by a later round.", r.Round, countFindingsBySeverity(&findings))
 }
 
 func foldPRBlock(summaryLine, inner string, flavor prBodyFlavor) string {

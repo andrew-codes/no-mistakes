@@ -2181,6 +2181,9 @@ func (e *Executor) failRun(run *db.Run, repo *db.Repo, err error, ctxs ...contex
 	run.Status = runStatus
 	run.Error = &errMsg
 	e.emitRunEvent(ipc.EventRunCompleted, run, repo)
+	if runStatus == types.RunFailed {
+		e.finalizeRun(run, repo)
+	}
 	return err
 }
 
@@ -2200,7 +2203,74 @@ func (e *Executor) completeRun(run *db.Run, repo *db.Repo) error {
 	}
 	run.Status = types.RunCompleted
 	e.emitRunEvent(ipc.EventRunCompleted, run, repo)
+	e.finalizeRun(run, repo)
 	return nil
+}
+
+// finalizeRunTimeout bounds the end-of-run refresh so a slow forge cannot hold
+// the run's worktree (released after Execute returns) indefinitely.
+const finalizeRunTimeout = 2 * time.Minute
+
+// finalizeRun lets steps that published something mid-run bring it up to date
+// with the run's final state. It runs after the terminal status is recorded so
+// the step reads the same outcome subscribers see, and it never fails the run.
+func (e *Executor) finalizeRun(run *db.Run, repo *db.Repo) {
+	if run == nil || repo == nil || strings.TrimSpace(e.workDir) == "" {
+		return
+	}
+	var finalizers []RunFinalizer
+	for _, step := range e.steps {
+		if f, ok := step.(RunFinalizer); ok {
+			finalizers = append(finalizers, f)
+		}
+	}
+	if len(finalizers) == 0 {
+		return
+	}
+	latest, err := e.db.GetRun(run.ID)
+	if err != nil || latest == nil {
+		slog.Warn("failed to reload run before finalization", "run", run.ID, "error", err)
+		return
+	}
+	// A terminalization that raced a cancellation leaves nothing to describe.
+	if latest.Status != types.RunCompleted && latest.Status != types.RunFailed {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizeRunTimeout)
+	defer cancel()
+	logf := func(text string) { slog.Info("run finalization: "+strings.TrimSpace(text), "run", run.ID) }
+	userIntent, userIntentSource := "", ""
+	if latest.Intent != nil {
+		userIntent = *latest.Intent
+	}
+	if latest.IntentSource != nil {
+		userIntentSource = *latest.IntentSource
+	}
+	sctx := &StepContext{
+		Ctx:          ctx,
+		Run:          latest,
+		Repo:         repo,
+		WorkDir:      e.workDir,
+		GateDir:      e.paths.RepoDir(repo.ID),
+		Config:       e.config,
+		ForgeContext: e.forge,
+		DB:           e.db,
+		UserIntent:   userIntent,
+		IntentSource: userIntentSource,
+		Sessions:     e.sessions,
+		Shared:       e.shared,
+		EvidenceDir:  e.runEvidenceDir(run.ID),
+		Log:          logf,
+		LogChunk:     logf,
+		LogFile:      func(string) {},
+		OnPRMerged:   e.onPRMerged,
+	}
+	BindBranchDecisions(sctx)
+	for _, f := range finalizers {
+		if err := f.FinalizeRun(sctx); err != nil {
+			slog.Warn("run finalization failed", "run", run.ID, "error", err)
+		}
+	}
 }
 
 func (e *Executor) reconcileTerminalRunHead(run *db.Run) (string, bool) {

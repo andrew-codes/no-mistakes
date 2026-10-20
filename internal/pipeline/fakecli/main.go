@@ -1307,6 +1307,10 @@ type bbFakeState struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Puts        int    `json:"puts"`
+	// Draft is the PR's draft state; DraftToggles counts `update --draft` and
+	// `update --ready` calls.
+	Draft        bool `json:"draft,omitempty"`
+	DraftToggles int  `json:"draft_toggles,omitempty"`
 	// DestUpdates counts `update --dest` retargets.
 	DestUpdates int `json:"dest_updates,omitempty"`
 	// Source, Dest and SourceCommit describe the primary PR for `query`
@@ -1536,6 +1540,7 @@ func fakeTWGPullRequests(args []string) {
 			"title":       state.Title,
 			"description": state.Description,
 			"state":       state.State,
+			"draft":       state.Draft,
 			"links":       map[string]any{"html": map[string]string{"href": state.URL}},
 		}
 		if payload["state"] == "" {
@@ -1583,10 +1588,23 @@ func fakeTWGPullRequests(args []string) {
 		}
 		state.Title = title
 		state.Description = description
+		state.Draft = fakeCLIHasFlag(rest, "--draft")
 		saveBBState(state)
 		fmt.Println(fakeTWGPRJSON(state))
 		os.Exit(0)
 	case "update":
+		if fakeCLIHasFlag(rest, "--draft") || fakeCLIHasFlag(rest, "--ready") {
+			// A draft toggle changes only the draft state.
+			if msg := os.Getenv("FAKE_CLI_BB_REJECT_DRAFT_TOGGLE"); msg != "" {
+				fmt.Fprintln(os.Stderr, msg)
+				os.Exit(1)
+			}
+			state.Draft = fakeCLIHasFlag(rest, "--draft")
+			state.DraftToggles++
+			saveBBState(state)
+			fmt.Println(fakeTWGPRJSON(state))
+			os.Exit(0)
+		}
 		if dest, ok := fakeCLIFlagValue(rest, "--dest"); ok {
 			// A retarget: like the real command it changes only the destination
 			// and leaves the title and description alone.

@@ -137,6 +137,7 @@ func (h *Host) repoArgs() []string {
 type bitbucketPullRequest struct {
 	ID    int    `json:"id"`
 	State string `json:"state"`
+	Draft bool   `json:"draft"`
 	Links struct {
 		HTML struct {
 			Href string `json:"href"`
@@ -418,6 +419,48 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 		return nil, fmt.Errorf("twg bb pull-requests update: invalid JSON output: %s", strings.TrimSpace(string(out)))
 	}
 	return updated.toPR(h.repo), nil
+}
+
+// DraftLifecycle reports whether PRs are opened as drafts and kept there until
+// the run proves them ready (providers.bitbucket.draft_pull_requests).
+func (h *Host) DraftLifecycle() bool { return h.draft }
+
+func (h *Host) GetPRDraft(ctx context.Context, pr *scm.PR) (bool, error) {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return false, errors.New("twg bb pull-requests get: missing pull request number")
+	}
+	view, trimmed, err := h.getPR(ctx, pr.Number)
+	if err != nil {
+		return false, err
+	}
+	// A response without the field would read as "ready" and let a draft be
+	// published by mistake, so absence is an error rather than false.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return false, fmt.Errorf("twg bb pull-requests get: invalid JSON output: %s", strings.TrimSpace(string(trimmed)))
+	}
+	if _, ok := raw["draft"]; !ok {
+		return false, errors.New("twg bb pull-requests get: response does not report the draft state")
+	}
+	return view.Draft, nil
+}
+
+// SetPRDraft toggles draft state with `twg bb pull-requests update --draft` or
+// `--ready`, without touching the title or description.
+func (h *Host) SetPRDraft(ctx context.Context, pr *scm.PR, draft bool) error {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return errors.New("twg bb pull-requests update: missing pull request number")
+	}
+	flag := "--ready"
+	if draft {
+		flag = "--draft"
+	}
+	args := []string{"bb", "pull-requests", "update", "--pull-request", pr.Number, flag}
+	args = append(args, h.repoArgs()...)
+	if out, err := h.runJSON(ctx, args); err != nil {
+		return fmt.Errorf("twg bb pull-requests update %s: %s: %w", flag, strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func (h *Host) getPR(ctx context.Context, number string, extraArgs ...string) (bitbucketPullRequest, []byte, error) {

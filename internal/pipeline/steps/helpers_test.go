@@ -473,6 +473,8 @@ type bbFakeStateForTest struct {
 	Title        string            `json:"title"`
 	Description  string            `json:"description"`
 	Puts         int               `json:"puts"`
+	Draft        bool              `json:"draft,omitempty"`
+	DraftToggles int               `json:"draft_toggles,omitempty"`
 	DestUpdates  int               `json:"dest_updates,omitempty"`
 	Source       string            `json:"source,omitempty"`
 	Dest         string            `json:"dest,omitempty"`

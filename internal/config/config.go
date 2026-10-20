@@ -935,8 +935,9 @@ type GitLabProvider struct {
 
 // BitbucketProvider holds resolved Bitbucket provider settings.
 type BitbucketProvider struct {
-	// DraftPullRequests opens created Bitbucket PRs as drafts
-	// ("draft": true in the create-PR request body). Default false.
+	// DraftPullRequests opens created Bitbucket PRs as drafts and has the PR
+	// step and the end-of-run finalizer keep them draft until the run has
+	// passed (twg bb pull-requests update --draft/--ready). Default true.
 	DraftPullRequests bool
 }
 
@@ -3712,7 +3713,9 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		}
 	}
 
-	providers := Providers{}
+	// Bitbucket PRs are opened as drafts and published as ready only once the
+	// run has passed; draft_pull_requests: false opts out of that lifecycle.
+	providers := Providers{Bitbucket: BitbucketProvider{DraftPullRequests: true}}
 	applyProvidersOverrides(&providers, &global.Providers)
 	applyProvidersOverrides(&providers, &repo.Providers)
 

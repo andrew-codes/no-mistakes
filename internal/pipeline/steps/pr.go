@@ -203,6 +203,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		if err := verifyClosingIssues(ctx, host, updated, sctx); err != nil {
 			return nil, err
 		}
+		// A new run restarts validation, so a PR an earlier run published as
+		// ready is not ready any more. The run's end decides again.
+		holdPRAsDraft(sctx, host, updated)
 		if updated != nil && updated.URL != "" {
 			if err := sctx.DB.UpdateRunPRURL(sctx.Run.ID, updated.URL); err != nil {
 				slog.Warn("failed to persist PR URL", "run", sctx.Run.ID, "url", updated.URL, "err", err)

@@ -383,6 +383,20 @@ type ReviewCommentResponder interface {
 	ResolveReviewComment(ctx context.Context, pr *PR, commentID string) error
 }
 
+// PRDraftController is implemented by hosts that can read and toggle a PR's
+// draft state. A PR is opened as a draft and published as ready only once its
+// run has passed, so the PR step and the end-of-run finalizer drive this to
+// keep a PR from claiming ready while it is not.
+type PRDraftController interface {
+	// DraftLifecycle reports whether the host is configured to keep PRs in
+	// draft until they are ready. False leaves draft state entirely alone.
+	DraftLifecycle() bool
+	// GetPRDraft reports whether the PR is currently a draft.
+	GetPRDraft(ctx context.Context, pr *PR) (bool, error)
+	// SetPRDraft converts the PR to a draft (true) or marks it ready (false).
+	SetPRDraft(ctx context.Context, pr *PR, draft bool) error
+}
+
 // PRContentReader is an optional interface for hosts that can read the current
 // title and raw body of an existing PR. Readers must distinguish an explicitly
 // empty body from missing, null, or malformed content and reject the latter.

@@ -1,6 +1,7 @@
 package steps
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -28,9 +29,22 @@ var _ pipeline.RunFinalizer = (*PRStep)(nil)
 // narrative (no agent call), and only touches a PR whose body this run's PR
 // step wrote.
 func (s *PRStep) FinalizeRun(sctx *pipeline.StepContext) error {
+	host, pr, err := s.openPublishedPR(sctx)
+	if err != nil || pr == nil {
+		return err
+	}
+	refreshErr := s.refreshDescription(sctx, host, pr)
+	// Readiness is decided last, after the description is current: a PR whose
+	// description could not be refreshed is not published as ready.
+	return errors.Join(refreshErr, syncPRDraftState(sctx, host, pr, refreshErr == nil))
+}
+
+// openPublishedPR resolves the PR this run's PR step wrote, or nil when there
+// is none to finalize.
+func (s *PRStep) openPublishedPR(sctx *pipeline.StepContext) (scm.Host, *scm.PR, error) {
 	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
 	if err != nil {
-		return fmt.Errorf("read steps: %w", err)
+		return nil, nil, fmt.Errorf("read steps: %w", err)
 	}
 	published := false
 	for _, sr := range steps {
@@ -41,38 +55,41 @@ func (s *PRStep) FinalizeRun(sctx *pipeline.StepContext) error {
 	if !published {
 		// This run never wrote the body (skipped, failed first, or no forge),
 		// so whatever is there belongs to an earlier run.
-		return nil
+		return nil, nil, nil
 	}
 	branch := strings.TrimPrefix(sctx.Run.Branch, "refs/heads/")
 	if branch == effectivePRBaseBranch(sctx) {
-		return nil
+		return nil, nil, nil
 	}
 	provider := resolvedProvider(sctx)
 	host, _ := buildHost(sctx, provider)
 	if host == nil {
-		return nil
+		return nil, nil, nil
 	}
 	if err := host.Available(sctx.Ctx); err != nil {
 		if pluginContractBroken(err) {
-			return err
+			return nil, nil, err
 		}
-		return nil
-	}
-	reader, ok := host.(scm.PRContentReader)
-	if !ok {
-		return nil
+		return nil, nil, nil
 	}
 	found, err := host.FindPR(sctx.Ctx, branch, "")
 	if err != nil {
-		return fmt.Errorf("find pull request: %w", err)
+		return nil, nil, fmt.Errorf("find pull request: %w", err)
 	}
 	pr, err := bindExistingPR(sctx, host, found)
 	if err != nil {
-		return fmt.Errorf("resolve pull request: %w", err)
+		return nil, nil, fmt.Errorf("resolve pull request: %w", err)
 	}
-	if pr == nil {
-		return nil
+	return host, pr, nil
+}
+
+// refreshDescription recomposes the generated sections of pr's description.
+func (s *PRStep) refreshDescription(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR) error {
+	reader, ok := host.(scm.PRContentReader)
+	if !ok {
+		return fmt.Errorf("provider cannot read pull request content")
 	}
+	provider := resolvedProvider(sctx)
 	live, err := reader.GetPRContent(sctx.Ctx, pr)
 	if err != nil {
 		return fmt.Errorf("read pull request: %w", err)

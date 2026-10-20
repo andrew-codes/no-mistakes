@@ -1387,14 +1387,14 @@ This is a global default. Per-repo config can override it via `providers.gitlab.
 
 ### providers.bitbucket.draft_pull_requests
 
-Open pull requests created on Bitbucket Cloud as drafts (`"draft": true` in the create-PR API request).
+Keep Bitbucket Cloud pull requests as drafts until the run has proved them ready. The PR step opens a new PR as a draft (`twg bb pull-requests create --draft`) and puts an existing one back to draft when a new run starts validating it (`twg bb pull-requests update --draft`). When the run ends, the PR is marked ready (`update --ready`) only if the run completed with every step passed (no approval override), every check is green, no review comment is waiting for a reply, and the description was regenerated for the final state. Otherwise it stays a draft.
 
 | | |
 |---|---|
 | Type | `bool` |
-| Default | `false` |
+| Default | `true` |
 
-Only affects PR creation; existing PRs are not toggled between draft and ready. Bitbucket only — ignored for other providers.
+Set it to `false` to open PRs ready for review and never toggle draft state. Bitbucket only - ignored for other providers.
 This is a global default. Per-repo config can override it via `providers.bitbucket.draft_pull_requests`.
 
 ### providers.azuredevops.draft_pull_requests

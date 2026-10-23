@@ -61,3 +61,19 @@ func TestExecutor_FinalizesAfterAFailedRun(t *testing.T) {
 		t.Fatalf("finalizer calls=%d run status=%q, want one call on a failed run", fin.calls, fin.seenRun)
 	}
 }
+
+// A run that ends at the opt-in checks_passed verdict has settled every step
+// the same way a completed one has, so its PR gets the same end-of-run
+// refresh and ready decision.
+func TestExecutor_FinalizesAfterAChecksPassedRun(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	fin := &finalizingStep{mockStep: newPassStep(types.StepPR)}
+	exec := NewExecutor(database, p, nil, nil, []Step{fin, releasingCIStep{}}, nil)
+
+	if err := exec.Execute(context.Background(), run, repo, t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	if fin.calls != 1 || fin.seenRun != types.RunChecksPassed {
+		t.Fatalf("finalizer calls=%d run status=%q, want one call on a checks_passed run", fin.calls, fin.seenRun)
+	}
+}

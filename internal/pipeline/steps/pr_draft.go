@@ -32,6 +32,23 @@ func draftController(host scm.Host) (scm.PRDraftController, bool) {
 	return controller, true
 }
 
+// draftMergeabilityIsUnreadable reports whether a pending mergeability reading
+// should be taken as "not reported" rather than "not yet": the PR is a draft
+// under the draft lifecycle. Bitbucket does not evaluate a draft's git
+// mergeability check, so twg lists it PENDING (or omits it) until the PR is
+// published, and the lifecycle publishes only after the CI step has ended. A
+// monitor that waited for the reading would wait for the thing it is blocking.
+// An unanswerable draft state keeps the reading unresolved: not knowing
+// whether a PR is a draft is no reason to stop waiting.
+func draftMergeabilityIsUnreadable(ctx context.Context, host scm.Host, pr *scm.PR) bool {
+	controller, ok := draftController(host)
+	if !ok || pr == nil {
+		return false
+	}
+	draft, err := controller.GetPRDraft(ctx, pr)
+	return err == nil && draft
+}
+
 // holdPRAsDraft puts the PR into draft. Best effort: the run's end converges
 // the state again, so a forge hiccup here must not fail an otherwise good run.
 func holdPRAsDraft(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR) {
@@ -62,7 +79,9 @@ func setDraftState(ctx context.Context, controller scm.PRDraftController, pr *sc
 // prReadiness reports whether the finished run justifies a ready PR, and if
 // not, why. An error answering any question is "not ready".
 func prReadiness(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, steps []*db.StepResult, descriptionCurrent bool) (bool, string) {
-	if sctx.Run.Status != types.RunCompleted {
+	// checks_passed is the opt-in release verdict (ci.release_after_checks_pass):
+	// the run proved the same things and left the merge to a human.
+	if sctx.Run.Status != types.RunCompleted && sctx.Run.Status != types.RunChecksPassed {
 		return false, fmt.Sprintf("run %s", sctx.Run.Status)
 	}
 	if !descriptionCurrent {
@@ -87,6 +106,19 @@ func prReadiness(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, steps []
 		case scm.CheckBucketPass, scm.CheckBucketSkip:
 		default:
 			return false, fmt.Sprintf("check %s is %s", check.Name, check.Bucket)
+		}
+	}
+	// The CI monitor cannot read a draft's mergeability, so it could not rule a
+	// conflict out. Once the forge does report one, publishing would put a PR
+	// that cannot merge in front of a reviewer. A reading that is merely
+	// pending is the draft's usual state and proves nothing either way.
+	if host.Capabilities().MergeableState {
+		state, err := host.GetMergeableState(sctx.Ctx, pr)
+		if err != nil {
+			return false, fmt.Sprintf("mergeability unreadable: %v", err)
+		}
+		if state.Conflict() {
+			return false, "the pull request has a merge conflict or is too far behind its base"
 		}
 	}
 	if comments, ok := host.(scm.ReviewCommentsHost); ok && host.Capabilities().ReviewComments {

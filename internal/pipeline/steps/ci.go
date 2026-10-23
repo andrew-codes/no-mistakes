@@ -532,6 +532,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	// rebase and a full revalidation on a head that is stale again at once.
 	behindBaseTip := ""
 	mergeabilityBlockedReason := ""
+	draftMergeabilityLogged := false
 	var timeoutFailingChecks []scm.CheckTarget
 	lastCheckHeadSHA := sctx.Run.HeadSHA
 	var timeoutExternalReviews []scm.Check
@@ -691,6 +692,17 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				// the green PR reports checks-passed and waits for a human.
 				mergeBehind = mergeState.Behind() && sctx.Config != nil && sctx.Config.CI.RebaseBehind
 				mergeabilityKnown = mergeState.Resolved()
+				if !mergeabilityKnown && mergeState == scm.MergeablePending && draftMergeabilityIsUnreadable(ctx, host, pr) {
+					// Nothing is known about conflicts, and nothing can be until
+					// the PR leaves draft, which only this run's end does. The
+					// verdict rests on what is provable: checks, review
+					// comments, and any merge check the forge did report failed.
+					mergeabilityKnown = true
+					if !draftMergeabilityLogged {
+						draftMergeabilityLogged = true
+						sctx.Log("pull request is a draft and its mergeability is not reported until it is published; judging it on checks and comments")
+					}
+				}
 				if !mergeabilityKnown {
 					sctx.Log(fmt.Sprintf("mergeable state still pending: %s", mergeState))
 					mergeabilityBlockedReason = fmt.Sprintf("PR mergeability remained unresolved before timeout: %s", mergeState)

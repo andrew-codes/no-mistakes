@@ -60,52 +60,66 @@ func onePollThenCancel(sctx *pipeline.StepContext) *CIStep {
 	}}
 }
 
-func TestCIStep_BitbucketDraftPRWithUnreadableMergeabilityIsNotHeldPending(t *testing.T) {
+// A green draft ends the monitor at the checks verdict: a draft cannot merge,
+// and the run's end is what publishes it, so watching it any longer would wait
+// on the step this wait holds back.
+func TestCIStep_BitbucketGreenDraftPRReleasesTheRunDespiteUnreadableMergeability(t *testing.T) {
 	t.Parallel()
 	for name, mergeability := range map[string]string{
 		"git check pending":     bbDraftPendingGitCheck,
 		"git check not listed":  bbDraftNoGitCheck,
 		"empty merge check set": `[]`,
+		"git check passed":      `[{"type":"git_mergeability_check","status":"PASSED","blocking":false}]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			sctx, logs := bbCIDraftContext(t, bbDraftAPI(t, mergeability), true)
 			step := onePollThenCancel(sctx)
 
-			_, err := driveCI(t, step, sctx)
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("expected the monitor to keep watching the green PR, got %v", err)
-			}
+			outcome, err := driveCI(t, step, sctx)
 			joined := strings.Join(*logs, "\n")
+			if err != nil {
+				t.Fatalf("expected the green draft to release the run, got %v\nlogs:\n%s", err, joined)
+			}
+			if outcome == nil || outcome.NeedsApproval || outcome.AutoFixable || outcome.Findings != "" || outcome.CIReadyNoCI == nil {
+				t.Fatalf("outcome = %#v, want a plain checks-passed success", outcome)
+			}
 			if strings.Contains(joined, "mergeable state still pending") {
 				t.Fatalf("a draft's unreadable mergeability must not hold the monitor, logs:\n%s", joined)
-			}
-			if !strings.Contains(joined, "all CI checks passed - still monitoring until merged or closed") {
-				t.Fatalf("expected the checks-passed verdict for a green draft, logs:\n%s", joined)
-			}
-			run, err := sctx.DB.GetRun(sctx.Run.ID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if run.CIReadyAt == nil {
-				t.Fatal("a green draft PR must publish checks-passed readiness")
 			}
 		})
 	}
 }
 
-func TestCIStep_BitbucketDraftPRWithUnreadableMergeabilityReleasesAfterGreenChecks(t *testing.T) {
+// Releasing publishes nothing by itself: a draft with feedback nobody has
+// answered is not a verdict, it is a repair.
+func TestCIStep_BitbucketGreenDraftPRWithUnrepliedCommentsIsNotReleased(t *testing.T) {
 	t.Parallel()
-	sctx, logs := bbCIDraftContext(t, bbDraftAPI(t, bbDraftPendingGitCheck), true)
-	sctx.Config.CI.ReleaseAfterChecksPass = true
+	api := bbDraftAPI(t, bbDraftPendingGitCheck).withComments(bbReviewCommentsJSON)
+	sctx, _ := bbCIDraftContext(t, api, true)
 	step := onePollThenCancel(sctx)
 
 	outcome, err := driveCI(t, step, sctx)
 	if err != nil {
-		t.Fatalf("expected the release verdict, got %v\nlogs:\n%s", err, strings.Join(*logs, "\n"))
+		t.Fatal(err)
 	}
-	if outcome == nil || outcome.NeedsApproval || outcome.AutoFixable || outcome.Findings != "" || outcome.CIReadyNoCI == nil {
-		t.Fatalf("outcome = %#v, want a plain checks-passed success", outcome)
+	if outcome == nil || outcome.CIReadyNoCI != nil || outcome.Findings == "" {
+		t.Fatalf("outcome = %#v, want the review comments as findings and no release", outcome)
+	}
+}
+
+// The draft lifecycle only applies to a PR that is a draft. Once it is ready,
+// the monitor watches it until it is merged or closed, as before.
+func TestCIStep_BitbucketReadyPRUnderTheDraftLifecycleKeepsMonitoring(t *testing.T) {
+	t.Parallel()
+	sctx, logs := bbCIDraftContext(t, bbDraftAPI(t, `[{"type":"git_mergeability_check","status":"PASSED","blocking":false}]`), false)
+	step := onePollThenCancel(sctx)
+
+	if _, err := driveCI(t, step, sctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the monitor to keep watching a ready PR, got %v", err)
+	}
+	if joined := strings.Join(*logs, "\n"); !strings.Contains(joined, "all CI checks passed - still monitoring until merged or closed") {
+		t.Fatalf("expected the checks-passed verdict while still monitoring, logs:\n%s", joined)
 	}
 }
 

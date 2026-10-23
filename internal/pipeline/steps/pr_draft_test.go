@@ -224,3 +224,55 @@ func TestFinalizeRun_BitbucketNeverPublishesAnOverriddenRunAsReady(t *testing.T)
 		t.Fatal("an approval override is not a clean pass, so the PR must stay draft")
 	}
 }
+
+// A draft's mergeability is only readable once the forge has a reason to
+// report a conflict, so a pending reading must not keep a green PR from being
+// published, while a reported conflict must.
+func TestFinalizeRun_BitbucketMergeabilityDecidesReadiness(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		mergeability string
+		wantDraft    bool
+	}{
+		"pending git check is the usual draft state": {bbDraftPendingGitCheck, false},
+		"git check not listed":                       {bbDraftNoGitCheck, false},
+		"failed git check":                           {`[{"type":"git_mergeability_check","status":"FAILED","blocking":true}]`, true},
+		"blocking commits behind":                    {`[{"type":"git_mergeability_check","status":"PENDING","blocking":true},{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"FAILED","blocking":true}]`, true},
+	} {
+		tc := tc
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			api := newFakeBitbucketAPI(t, 42, bbBasePRURL).
+				withStatuses(`[{"name":"build","state":"SUCCESSFUL"}]`).
+				withMergeability(tc.mergeability)
+			c, step := publishedDraftFixture(t, api)
+			finishRun(t, c, types.RunCompleted)
+			if err := step.FinalizeRun(c); err != nil {
+				t.Fatal(err)
+			}
+			if got := api.readState(t).Draft; got != tc.wantDraft {
+				t.Fatalf("draft = %v, want %v", got, tc.wantDraft)
+			}
+		})
+	}
+}
+
+// ci.release_after_checks_pass ends the run as checks_passed. That is the same
+// proof as a completed run, so it is published and refreshed the same way.
+func TestFinalizeRun_BitbucketPublishesAChecksPassedRunAsReady(t *testing.T) {
+	t.Parallel()
+	api := newFakeBitbucketAPI(t, 42, bbBasePRURL).withStatuses(`[{"name":"build","state":"SUCCESSFUL"}]`)
+	c, step := publishedDraftFixture(t, api)
+	finishRun(t, c, types.RunCompleted)
+	c.Run.Status = types.RunChecksPassed
+
+	if err := step.FinalizeRun(c); err != nil {
+		t.Fatal(err)
+	}
+	if api.readState(t).Draft {
+		t.Fatal("a checks_passed run with green checks must publish the PR ready")
+	}
+	if !strings.Contains(api.lastDescription(t), "**Run outcome:** ✅ pipeline passed") {
+		t.Fatal("the checks_passed outcome must be described as passed")
+	}
+}

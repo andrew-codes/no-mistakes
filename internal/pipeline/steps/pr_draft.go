@@ -32,15 +32,14 @@ func draftController(host scm.Host) (scm.PRDraftController, bool) {
 	return controller, true
 }
 
-// draftMergeabilityIsUnreadable reports whether a pending mergeability reading
-// should be taken as "not reported" rather than "not yet": the PR is a draft
-// under the draft lifecycle. Bitbucket does not evaluate a draft's git
-// mergeability check, so twg lists it PENDING (or omits it) until the PR is
-// published, and the lifecycle publishes only after the CI step has ended. A
-// monitor that waited for the reading would wait for the thing it is blocking.
-// An unanswerable draft state keeps the reading unresolved: not knowing
-// whether a PR is a draft is no reason to stop waiting.
-func draftMergeabilityIsUnreadable(ctx context.Context, host scm.Host, pr *scm.PR) bool {
+// draftAwaitsPublication reports whether the PR is a draft that only this run's
+// end can publish: it is a draft under the draft lifecycle. Bitbucket does not
+// evaluate a draft's git mergeability check, so twg lists it PENDING (or omits
+// it) until the PR is published, and the lifecycle publishes only after the CI
+// step has ended. A monitor that waited for that reading, or for the draft to
+// merge, would wait on the thing it is holding back. An unanswerable draft
+// state counts as not a draft: not knowing is no reason to stop waiting.
+func draftAwaitsPublication(ctx context.Context, host scm.Host, pr *scm.PR) bool {
 	controller, ok := draftController(host)
 	if !ok || pr == nil {
 		return false

@@ -92,7 +92,9 @@ type testingSummaryOptions struct {
 	compactArtifacts     bool
 	summaryParagraph     bool
 	omitOutcome          bool
-	repoRoot             string
+	// ciPassed is the finished run's known CI result for a Test exception note.
+	ciPassed bool
+	repoRoot string
 	// evidenceRoot is the run's evidence directory. Together with repoRoot it
 	// is the allowlist for absolute artifact paths an agent reported: a path
 	// under neither is dropped rather than rendered into the PR body. Empty
@@ -129,6 +131,9 @@ type pipelineAttestationPolicy struct {
 	Final bool
 	// Outcome is the one-line run outcome shown when Final is set.
 	Outcome string
+	// CIPassed is set only when the finished run already knows CI passed on
+	// the PR head, so a Test exception can name the real gate beside it.
+	CIPassed bool
 }
 
 func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.StepRound, headSHA string, provider scm.Provider, policy pipelineAttestationPolicy) (string, string) {
@@ -144,7 +149,7 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 			continue
 		}
 		stepRounds := rounds[sr.ID]
-		line, detail := buildStepEntryFor(sr, stepRounds, flavor, policy.Final)
+		line, detail := buildStepEntryFor(sr, stepRounds, flavor, policy.Final, policy.CIPassed)
 		if line != "" && detail != "" {
 			// Step details quote agent text (findings, fix summaries, tested
 			// commands). A foreign attestation comment in one lands after the
@@ -360,10 +365,10 @@ func BuildTestingSummaryForPR(steps []*db.StepResult, rounds map[string][]*db.St
 }
 
 func BuildTestingSummaryForPRWithProvider(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider) string {
-	return buildPRTestingSummary(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, nil, true)
+	return buildPRTestingSummary(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, nil, true, false)
 }
 
-func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact bool) string {
+func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact, ciPassed bool) string {
 	opts := testingSummaryOptionsForGitHub(upstreamURL, ref)
 	opts.flavor = prBodyFlavorFor(provider)
 	opts.compactArtifacts = compact
@@ -374,6 +379,7 @@ func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepR
 	opts.evidenceRoot = evidenceRoot
 	opts.evidence = links
 	opts.attachments = attachments
+	opts.ciPassed = ciPassed
 	return buildTestingSummary(steps, rounds, opts)
 }
 
@@ -389,12 +395,19 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 			return ""
 		}
 
+		exceptionNote := ""
+		if ex, ok := testExceptionFor(sr, stepRounds); ok {
+			exceptionNote = testExceptionNote(ex, opts.ciPassed, opts.flavor)
+		}
 		testingSummary := collectTestingSummary(sr, stepRounds)
 		tested := collectTestingDetails(sr, stepRounds)
 		artifacts := collectTestingArtifacts(sr, stepRounds, opts)
 		scenarios := collectTestingScenarios(sr, stepRounds)
 		liveValidation := renderLiveValidationLine(scenarios, collectTestingVerdict(sr, stepRounds))
 		if testingSummary == "" && len(tested) == 0 && len(artifacts) == 0 && liveValidation == "" {
+			if exceptionNote != "" {
+				return "## Testing\n\n- " + line + "\n- " + exceptionNote
+			}
 			return "## Testing\n\n- " + line
 		}
 
@@ -410,6 +423,11 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 		} else if !opts.includeTestedDetails && len(tested) > 0 {
 			writeTestingSummary(&b, compactTestedSummary(len(tested)), opts)
 			wroteSummary = true
+		}
+		if exceptionNote != "" {
+			b.WriteString("- ")
+			b.WriteString(exceptionNote)
+			b.WriteString("\n")
 		}
 		// The verdict and the scenario table come before the tested commands
 		// and the artifacts: they are the step's answer, and the commands and
@@ -711,6 +729,20 @@ func markdownCodeBlock(lang, content, indent string) string {
 	return b.String()
 }
 
+// testedDetailScriptSummary reduces a script (a detail with several lines, such
+// as a configured test command that is a whole heredoc) to the line that says
+// what ran plus its length. The body never carries the script itself.
+func testedDetailScriptSummary(clean string) (string, bool) {
+	if !strings.Contains(clean, "\n") {
+		return "", false
+	}
+	label, lines := testedDetailLabel(clean)
+	return fmt.Sprintf("`%s` (%d-line script)", escapePipelineFoldMarkers(label), lines), true
+}
+
+// renderTestedDetailFor renders any recorded detail (a tested command, a
+// summary, an artifact caption) in full. Tested commands go through
+// renderTestedDetailBullet, which reduces a script to a label.
 func renderTestedDetailFor(detail string, flavor prBodyFlavor) string {
 	clean := sanitizeTestedDetail(detail)
 	if strings.TrimSpace(clean) == "" {
@@ -730,19 +762,18 @@ func renderTestedDetailFor(detail string, flavor prBodyFlavor) string {
 // renderTestedDetailBullet renders a tested detail as a list item, ending in a
 // newline. A code block cannot share its line with the bullet marker (Bitbucket
 // Cloud's markdown then reads "- ```text" as an inline code span and leaves the
-// language word as prose, and the unindented script lines end the list), so the
-// block goes on its own indented lines under a short label.
+// language word as prose, and the unindented lines end the list), so the block
+// goes on its own indented lines under a short label.
 func renderTestedDetailBullet(detail string, flavor prBodyFlavor) string {
-	if flavor != prBodyMarkdown {
-		rendered := renderTestedDetailFor(detail, flavor)
-		if rendered == "" {
-			return ""
-		}
-		return "- " + rendered + "\n"
-	}
 	clean := sanitizeTestedDetail(detail)
 	if strings.TrimSpace(clean) == "" {
 		return ""
+	}
+	if summary, ok := testedDetailScriptSummary(clean); ok {
+		return "- Ran " + summary + "\n"
+	}
+	if flavor != prBodyMarkdown {
+		return "- " + renderTestedDetailFor(detail, flavor) + "\n"
 	}
 	if inline, ok := testedDetailInline(clean); ok {
 		return "- " + inline + "\n"
@@ -1268,13 +1299,15 @@ func formatTestingDuration(ms int64) string {
 }
 
 func buildStepEntry(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor) (statusLine, detailBlock string) {
-	return buildStepEntryFor(sr, rounds, flavor, false)
+	return buildStepEntryFor(sr, rounds, flavor, false, false)
 }
 
-func buildStepEntryFor(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final bool) (statusLine, detailBlock string) {
+// buildStepEntryFor renders a step's status line and detail fold. ciPassed is
+// the finished run's known CI result, shown beside a Test exception.
+func buildStepEntryFor(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool) (statusLine, detailBlock string) {
 	name := stepDisplayName(sr.StepName)
 	buildDetail := func(line string) (string, string) {
-		return line, buildStepDetails(line, sr, rounds, flavor, final)
+		return line, buildStepDetails(line, sr, rounds, flavor, final, ciPassed)
 	}
 
 	switch sr.Status {
@@ -1294,6 +1327,13 @@ func buildStepEntryFor(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyF
 
 	if sr.Status == types.StepStatusSkipped {
 		return buildDetail(fmt.Sprintf("⏭️ **%s** - skipped", name))
+	}
+
+	// A Test step approved over a failure is a pass with an accepted
+	// exception, not an error: the findings below still describe the failure,
+	// and the detail fold says why it was accepted.
+	if _, ok := testExceptionFor(sr, rounds); ok {
+		return buildDetail(testExceptionStatusLine(name))
 	}
 
 	// Parse the final findings on the step result (last state).
@@ -1527,8 +1567,13 @@ func buildFixResultText(rounds []*db.StepRound) string {
 // round is shown as the review state observed at its end; a fix round is
 // prefixed with its recorded outcome so a reader can follow the result without
 // mentally replaying rounds.
-func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final bool) string {
+func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool) string {
 	var inner strings.Builder
+	exception, accepted := testExceptionFor(sr, rounds)
+	if accepted {
+		inner.WriteString(testExceptionNote(exception, ciPassed, flavor))
+		inner.WriteString("\n\n")
+	}
 	// A skipped step whose rounds recorded no findings never checked
 	// anything, so "No issues found" under a "skipped" summary would
 	// claim a pass.
@@ -1589,10 +1634,13 @@ func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRo
 
 		// A fix round that still has findings means the fix did not fully
 		// land; label what remained so the chain reads as fix -> still open.
-		if isFixRound {
+		// An accepted exception's last round is the failure that was accepted,
+		// not one that is still open.
+		acceptedRound := accepted && ri == len(rounds)-1
+		if isFixRound && !acceptedRound {
 			inner.WriteString(fmt.Sprintf("%s still open:\n\n", countFindingsBySeverity(&findings)))
 		}
-		writeFindingItems(&inner, sr, &findings, flavor)
+		writeFindingItems(&inner, sr, &findings, flavor, acceptedRound)
 		inner.WriteString("\n")
 	}
 
@@ -1681,9 +1729,15 @@ func fixRoundLine(r *db.StepRound) string {
 
 // writeFindingItems renders each finding as a `file:line - description` bullet,
 // followed by any test command details for the test step.
-func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor) {
+//
+// accepted renders the findings of a Test step's accepted exception: the
+// failure is listed without the severity emoji that would read as unresolved.
+func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor, accepted bool) {
 	for _, f := range findings.Items {
-		emoji := severityEmoji(f.Severity)
+		emoji := severityEmoji(f.Severity) + " "
+		if accepted {
+			emoji = ""
+		}
 		loc := ""
 		if f.File != "" {
 			loc = fmt.Sprintf("`%s", escapePRText(f.File, flavor))
@@ -1692,7 +1746,7 @@ func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Fi
 			}
 			loc += "` - "
 		}
-		b.WriteString(fmt.Sprintf("- %s %s%s\n", emoji, loc, escapePRText(f.Description, flavor)))
+		b.WriteString(fmt.Sprintf("- %s%s%s\n", emoji, loc, escapePRText(f.Description, flavor)))
 	}
 	writeTestedDetails(b, sr, findings, flavor)
 }

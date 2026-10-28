@@ -37,59 +37,62 @@ func testStepWithTested(t *testing.T, tested ...string) ([]*db.StepResult, map[s
 		map[string][]*db.StepRound{"s1": {{Round: 1, Trigger: "initial", FindingsJSON: &findings, DurationMS: 100}}}
 }
 
-// assertBitbucketScriptBullet checks the Bitbucket Cloud rules for a script in
-// a list item: nothing but the marker's label on the bullet line, a blank
-// line, then an indented fence whose every script line keeps real newlines
-// and its own indentation.
-func assertBitbucketScriptBullet(t *testing.T, md string) {
+// assertScriptIsLabelled checks that a recorded script is reduced to a short
+// label and never dumped: no fence, no script body, just what ran and how long
+// the script was.
+func assertScriptIsLabelled(t *testing.T, md string) {
 	t.Helper()
-	if strings.Contains(md, "- ```") {
-		t.Fatalf("fence must not share a line with the bullet marker:\n%s", md)
+	if !strings.Contains(md, "- Ran `bash <<'SCRIPT'` (13-line script)\n") {
+		t.Fatalf("expected a one-line label with the script length, got:\n%s", md)
 	}
-	if !strings.Contains(md, "- Ran:\n\n    ```bash\n    bash <<'SCRIPT'\n    set -uo pipefail\n") {
-		t.Fatalf("expected an indented bash fence with real newlines under the bullet, got:\n%s", md)
-	}
-	// Indentation inside the script survives (4 list spaces + 2 script spaces).
-	if !strings.Contains(md, "\n      local holder dir=") || !strings.Contains(md, "\n        sleep 5\n") && !strings.Contains(md, "\n      sleep 5\n") {
-		t.Fatalf("script indentation was lost:\n%s", md)
-	}
-	if !strings.Contains(md, "\n    SCRIPT\n    ```\n") {
-		t.Fatalf("heredoc terminator must stay on its own line inside the fence:\n%s", md)
-	}
-	if strings.Contains(md, "bash <<'SCRIPT' set -uo") {
-		t.Fatalf("heredoc was joined onto one line:\n%s", md)
-	}
-	// No bare language word outside a fence.
-	for _, line := range strings.Split(md, "\n") {
-		if strings.TrimSpace(line) == "text" || strings.TrimSpace(line) == "bash" {
-			t.Fatalf("stray language word %q outside a fence:\n%s", line, md)
+	for _, leaked := range []string{"```", "set -uo pipefail", "lock_stale()", "sleep 5", "SCRIPT\n", "&#10;"} {
+		if strings.Contains(md, leaked) {
+			t.Fatalf("the script body must not be dumped into the description (found %q):\n%s", leaked, md)
 		}
 	}
 }
 
-func TestBitbucketPipelineSummary_HeredocScriptIsAnIndentedFencedBullet(t *testing.T) {
+func TestBitbucketPipelineSummary_HeredocScriptIsAShortLabel(t *testing.T) {
 	t.Parallel()
 	steps, rounds := testStepWithTested(t, heredocTestCommand, "`bash scripts/test-setup.sh`")
 	md, _ := BuildPipelineSummaryFor(steps, rounds, testPipelineHeadSHA, scm.ProviderBitbucket)
-	assertBitbucketScriptBullet(t, md)
+	assertScriptIsLabelled(t, md)
 	if !strings.Contains(md, "- `bash scripts/test-setup.sh`\n") {
 		t.Fatalf("single-line commands stay inline code bullets:\n%s", md)
 	}
 }
 
-func TestBitbucketTestingSummary_HeredocScriptIsAnIndentedFencedBullet(t *testing.T) {
+func TestBitbucketTestingSummary_HeredocScriptIsAShortLabel(t *testing.T) {
 	t.Parallel()
 	steps, rounds := testStepWithTested(t, heredocTestCommand)
 	md := buildTestingSummary(steps, rounds, testingSummaryOptions{flavor: prBodyMarkdown, includeTestedDetails: true})
-	assertBitbucketScriptBullet(t, md)
+	assertScriptIsLabelled(t, md)
 }
 
-func TestTestedDetailRenderingKeepsHTMLProvidersOnInlineCode(t *testing.T) {
+func TestTestedDetailRenderingLabelsScriptsForHTMLProvidersToo(t *testing.T) {
 	t.Parallel()
 	steps, rounds := testStepWithTested(t, heredocTestCommand)
 	md, _ := BuildPipelineSummaryFor(steps, rounds, testPipelineHeadSHA, scm.ProviderGitHub)
-	if strings.Contains(md, "- Ran:") || !strings.Contains(md, "<code>bash &lt;&lt;&#39;SCRIPT&#39;&#10;set -uo pipefail&#10;") {
-		t.Fatalf("html providers must keep the <code> rendering, got:\n%s", md)
+	assertScriptIsLabelled(t, md)
+}
+
+func TestTestedDetailLabel(t *testing.T) {
+	t.Parallel()
+	long := "yarn jest " + strings.Repeat("--flag ", 40)
+	for name, tc := range map[string]struct {
+		detail    string
+		wantLabel string
+		wantLines int
+	}{
+		"heredoc opener":              {heredocTestCommand, "bash <<'SCRIPT'", 13},
+		"skips shebang and set lines": {"#!/bin/bash\nset -euo pipefail\n\nyarn jest --ci\nyarn lint", "yarn jest --ci", 5},
+		"backticks become quotes":     {"echo `date`\nmake test", "echo 'date'", 2},
+		"long first line is bounded":  {long + "\nnext", strings.TrimSpace(long)[:maxTestedLabelBytes] + "...", 2},
+	} {
+		label, lines := testedDetailLabel(tc.detail)
+		if lines != tc.wantLines || label != tc.wantLabel {
+			t.Errorf("%s: testedDetailLabel = (%q, %d), want (%q, %d)", name, label, lines, tc.wantLabel, tc.wantLines)
+		}
 	}
 }
 

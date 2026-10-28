@@ -113,7 +113,7 @@ func (s *PRStep) refreshDescription(sctx *pipeline.StepContext, host scm.Host, p
 	narrative := neutralizeAttestationMarkers(provider, stripGeneratedSections(live.Body))
 	pipelineMD, riskLine, testingMD := s.buildPipelineSectionWith(sctx, provider, false, true)
 	body := assembleDraftPRBody(sctx, narrative, riskLine, testingMD, pipelineMD, bodyLimit, provider)
-	content := redactPRContent(prContent{Body: body})
+	content := redactPRContent(prContent{Body: body}, sctx.WorkDir, nmWorktreesRoot())
 	if err := verifyClosingIssuesInBody(content.Body, sctx); err != nil {
 		return err
 	}
@@ -121,7 +121,7 @@ func (s *PRStep) refreshDescription(sctx *pipeline.StepContext, host scm.Host, p
 		return nil
 	}
 	// Body only: a concurrent title edit stays untouched.
-	if _, err := host.UpdatePR(sctx.Ctx, pr, scm.PRContent(content)); err != nil {
+	if _, err := host.UpdatePR(sctx.Ctx, pr, scm.PRContent{Title: content.Title, Body: content.Body}); err != nil {
 		return fmt.Errorf("update pull request description: %w", err)
 	}
 	return nil
@@ -135,7 +135,19 @@ func finalRunOutcomeLine(run *db.Run, steps []*db.StepResult) string {
 		head = head[:8]
 	}
 	switch run.Status {
-	case types.RunCompleted:
+	case types.RunCompleted, types.RunChecksPassed:
+		// A Test step approved over a failure is a pass with an accepted
+		// exception, and the line says so rather than reading as a clean pass.
+		for _, sr := range steps {
+			if _, ok := testExceptionFor(sr, nil); !ok {
+				continue
+			}
+			ci := ""
+			if finalCIPassed(run, steps) {
+				ci = "; CI on the PR head passed"
+			}
+			return fmt.Sprintf("**Run outcome:** ✅ pipeline passed on `%s` with an accepted Test exception%s.", head, ci)
+		}
 		return fmt.Sprintf("**Run outcome:** ✅ pipeline passed on `%s`.", head)
 	case types.RunFailed:
 		where := ""
@@ -157,4 +169,24 @@ func finalRunOutcomeLine(run *db.Run, steps []*db.StepResult) string {
 		return fmt.Sprintf("**Run outcome:** ❌ pipeline failed%s on `%s`%s", where, head, reason)
 	}
 	return ""
+}
+
+// finalCIPassed reports whether the finished run already knows CI passed on the
+// PR head: the run ended successfully and its CI step completed without being
+// approved over a failing check, on a repository that has checks. It reads only
+// what the run recorded, never the forge.
+func finalCIPassed(run *db.Run, steps []*db.StepResult) bool {
+	if run == nil || run.CIReadyNoCI {
+		return false
+	}
+	if run.Status != types.RunCompleted && run.Status != types.RunChecksPassed {
+		return false
+	}
+	for _, sr := range steps {
+		if sr.StepName != types.StepCI {
+			continue
+		}
+		return sr.Status == types.StepStatusCompleted && (sr.OverrideReason == nil || strings.TrimSpace(*sr.OverrideReason) == "")
+	}
+	return false
 }

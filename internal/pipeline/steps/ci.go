@@ -604,6 +604,10 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		pollBaseTip := ""
 		botCommentReadFailed := false
 		behindObserved := false
+		// commentsRead is set once this poll has already read the review
+		// comments (the green path does, before it reports anything), so the
+		// wait below does not read them a second time.
+		commentsRead := false
 
 		if !unlimited && now().Sub(timeoutAnchor) >= timeout {
 			return timeoutOutcome()
@@ -1005,6 +1009,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 							return nil, err
 						}
 						lastMonitorLog = ciMonitorStatus{}
+						commentsRead = true
 						botCommentReadFailed = true
 						consecutiveBotCommentErrs++
 						sctx.Log(fmt.Sprintf("warning: could not read review bot comments: %v", botErr))
@@ -1014,6 +1019,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 						}
 						break
 					}
+					commentsRead = true
 					if len(botFindings.Items) > 0 {
 						if err := clearCIMonitorReady(sctx); err != nil {
 							return nil, err
@@ -1099,6 +1105,28 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		}
 		if !behindObserved {
 			behindBaseTip = ""
+		}
+		// Reaching this point means the poll is about to wait: it neither
+		// settled on issues nor reported a verdict. Feedback left on the PR
+		// meanwhile is still a request, so it is raised now, on the same
+		// cadence as the checks, instead of after they settle. That holds
+		// for a draft awaiting publication too: the draft is never touched
+		// here, only the comments on it are answered.
+		if !commentsRead {
+			if comments := s.bestEffortReviewComments(sctx, host, pr); len(comments) > 0 {
+				if err := clearCIMonitorReady(sctx); err != nil {
+					return nil, err
+				}
+				sctx.DeferredFindings = ""
+				findings := ciObservationFindings(ciIssues{
+					provider:        host.Provider(),
+					requiredReviews: requiredReviews(sctx),
+					checks:          checks,
+					reviewComments:  comments,
+				})
+				sctx.Log(fmt.Sprintf("review feedback arrived while waiting: %s", findings.Summary))
+				return ciObservationOutcome(findings), nil
+			}
 		}
 		woken, err := waitForPoll()
 		if err != nil {

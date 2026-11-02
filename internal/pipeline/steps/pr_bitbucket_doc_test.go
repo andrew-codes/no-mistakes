@@ -50,7 +50,7 @@ func docSectionNamed(t *testing.T, body, heading string) docSection {
 	return docSection{}
 }
 
-func TestBitbucketDescription_LeadsWithWhatChangedThenIntent(t *testing.T) {
+func TestBitbucketDescription_KeepsIntentOnTop(t *testing.T) {
 	t.Parallel()
 	body := bitbucketDocBody(t, newBitbucketDocContext(t))
 
@@ -58,17 +58,17 @@ func TestBitbucketDescription_LeadsWithWhatChangedThenIntent(t *testing.T) {
 	for _, s := range docSections(body) {
 		headings = append(headings, s.heading)
 	}
-	want := []string{"What Changed", "Intent", "Testing", "Pipeline"}
+	want := []string{"Intent", "What Changed", "Testing", "Pipeline"}
 	if strings.Join(headings, "|") != strings.Join(want, "|") {
 		t.Fatalf("section order = %v, want %v:\n%s", headings, want, body)
 	}
-	if !strings.HasPrefix(body, "## What Changed\n\n- ") {
-		t.Fatalf("the description must open with the what-changed summary, not the intent:\n%s", body)
+	if !strings.HasPrefix(body, "## Intent\n\n") {
+		t.Fatalf("the description must open with the intent:\n%s", body)
 	}
-	// The intent is the author's own text and stays verbatim, paragraphs intact.
+	// ...and the intent reads as a goal then points, not as the author's prose.
 	intent := strings.Join(docSectionNamed(t, body, "Intent").lines, "\n")
-	if !strings.Contains(intent, "The ask:\n\nWrite script guidelines for agents") {
-		t.Fatalf("intent paragraphs were not preserved:\n%s", intent)
+	if !strings.Contains(intent, "\n- ") || !strings.Contains(intent, "**The ask:**") {
+		t.Fatalf("the intent was published as a wall of text:\n%s", intent)
 	}
 }
 
@@ -213,28 +213,6 @@ func TestBitbucketPipeline_CoveredTestStillShowsUnacceptedFindings(t *testing.T)
 	}
 }
 
-func TestPlaceIntentSection(t *testing.T) {
-	t.Parallel()
-	const intent = "## Intent\n\nwhy"
-	body := "## What Changed\n\n- a\n\n## Risk Assessment\n\nlow\n\n## Pipeline\n\n- x"
-	for _, tc := range []struct {
-		name     string
-		provider scm.Provider
-		body     string
-		want     string
-	}{
-		{"github leads", scm.ProviderGitHub, body, intent + "\n\n" + body},
-		{"bitbucket follows the narrative", scm.ProviderBitbucket, body, "## What Changed\n\n- a\n\n" + intent + "\n\n## Risk Assessment\n\nlow\n\n## Pipeline\n\n- x"},
-		{"bitbucket narrative only", scm.ProviderBitbucket, "## What Changed\n\n- a", "## What Changed\n\n- a\n\n" + intent},
-		{"bitbucket no narrative", scm.ProviderBitbucket, "## Pipeline\n\n- x", intent + "\n\n## Pipeline\n\n- x"},
-		{"bitbucket empty", scm.ProviderBitbucket, "  \n", intent},
-	} {
-		if got := placeIntentSection(tc.body, intent, tc.provider); got != tc.want {
-			t.Errorf("%s:\n got %q\nwant %q", tc.name, got, tc.want)
-		}
-	}
-}
-
 // The end-of-run refresh strips every generated section from the live body and
 // rebuilds it. The new order must survive that round trip unchanged.
 func TestBitbucketDescription_RefreshRebuildsTheSameDocument(t *testing.T) {
@@ -267,7 +245,7 @@ func TestBitbucketDescription_OrderHoldsUnderABodyBudget(t *testing.T) {
 	for _, s := range docSections(body) {
 		headings = append(headings, s.heading)
 	}
-	if got, want := strings.Join(headings, "|"), "What Changed|Intent|Pipeline"; got != want {
+	if got, want := strings.Join(headings, "|"), "Intent|What Changed|Pipeline"; got != want {
 		t.Fatalf("section order under budget = %q, want %q (Testing is the section shed first):\n%s", got, want, body)
 	}
 }

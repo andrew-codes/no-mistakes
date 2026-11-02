@@ -149,6 +149,11 @@ asked for that might otherwise look surprising in the diff. A few sentences to a
 short paragraph is normal - write down what you learned from the conversation
 that a reviewer reading only the diff would not know.
 
+Shape it so it reads well when published as the PR's Intent section: open with
+a one- or two-line statement of the goal, then short bullets, one requirement,
+decision or constraint each, with identifiers in backticks. State each point
+once. Complete does not mean repetitive.
+
 ## Validate and decide
 
 Run the pipeline and decide on its findings as they come up:

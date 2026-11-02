@@ -1046,7 +1046,7 @@ func buildPRBodyFull(body, riskLine, testingMD, pipelineMD string, sctx *pipelin
 	sections := appendGeneratedSectionsToCleanBodyWithinLimit(body, riskLine, testingMD, pipelineMD, maxBytes, provider)
 	// Neutralized for the same reason as in prependIntentSection: intent is
 	// agent-extracted text placed ahead of the pipeline section.
-	cleaned := neutralizeAttestationMarkers(provider, publicPRIntent(sctx))
+	cleaned := neutralizeAttestationMarkers(provider, publicPRIntentFor(sctx, provider))
 	if cleaned == "" {
 		return sections
 	}
@@ -1054,20 +1054,20 @@ func buildPRBodyFull(body, riskLine, testingMD, pipelineMD string, sctx *pipelin
 	intent := "## Intent\n\n" + cleaned
 	separator := "\n\n"
 	if len(intent)+len(separator)+len(sections) <= maxBytes {
-		return placeIntentSection(sections, intent, provider)
+		return intent + separator + sections
 	}
 	sectionsBudget := maxBytes - len(separator) - len(intent)
 	minimumSectionsBytes := len(pipelineSectionHeader(pipelineMD))
 	if sectionsBudget > 0 && (minimumSectionsBytes == 0 || sectionsBudget >= minimumSectionsBytes) {
 		sections = appendGeneratedSectionsToCleanBodyWithinLimit(body, riskLine, testingMD, pipelineMD, sectionsBudget, provider)
-		return placeIntentSection(sections, intent, provider)
+		return intent + separator + sections
 	}
 
 	intentBudget := maxBytes - len(separator) - len(sections)
 	if intentBudget <= 0 {
 		return sections
 	}
-	return placeIntentSection(sections, truncateTextAtLineBoundary(intent, intentBudget, essentialPRBodyTruncationMarker()), provider)
+	return truncateTextAtLineBoundary(intent, intentBudget, essentialPRBodyTruncationMarker()) + separator + sections
 }
 
 func appendGeneratedSectionsToCleanBody(body, riskLine, testingMD, pipelineMD string, provider scm.Provider) string {
@@ -1795,62 +1795,26 @@ func isGeneratedSectionHeading(line string) bool {
 	}
 }
 
-// prependIntentSection adds a "## Intent" section sourced from the
-// already-extracted user intent. The intent text is reused verbatim (after
-// the same secret/adversarial scrubbing the agent prompt path applies)
-// rather than being paraphrased by the agent. Returns body unchanged when
-// no intent is available or publication is disabled. Where the section lands
-// is placeIntentSection's call.
+// prependIntentSection prepends a "## Intent" section sourced from the
+// already-extracted user intent. The intent text is reused (after the same
+// secret/adversarial scrubbing the agent prompt path applies) rather than being
+// paraphrased by the agent; on Bitbucket Cloud it is restructured
+// deterministically into scannable points (see structureIntent). Returns body
+// unchanged when no intent is available or publication is disabled.
 func prependIntentSection(body string, sctx *pipeline.StepContext) string {
 	// Intent is agent-extracted text that lands ahead of the pipeline section,
 	// so it can shadow the real attestation the same way the Testing section
 	// can. See appendGeneratedSectionsToCleanBodyWithinLimit.
 	provider := resolvedProviderForBody(sctx)
-	cleaned := neutralizeAttestationMarkers(provider, publicPRIntent(sctx))
+	cleaned := neutralizeAttestationMarkers(provider, publicPRIntentFor(sctx, provider))
 	if cleaned == "" {
 		return body
 	}
-	return placeIntentSection(body, "## Intent\n\n"+cleaned, provider)
-}
-
-// placeIntentSection puts the Intent section into body. It leads the body on
-// every host except Bitbucket Cloud, where the intent is the author's own
-// multi-paragraph brief and a reviewer opening the description meets a wall of
-// prose before learning what changed. There the narrative ("What Changed")
-// comes first and the Intent follows it, ahead of the generated Risk, Testing
-// and Pipeline sections.
-func placeIntentSection(body, section string, provider scm.Provider) string {
+	section := "## Intent\n\n" + cleaned
 	if strings.TrimSpace(body) == "" {
 		return section
 	}
-	if prBodyFlavorFor(provider) != prBodyMarkdown {
-		return section + "\n\n" + body
-	}
-	at := generatedSectionOffset(body)
-	if at < 0 {
-		return strings.TrimRight(body, "\n") + "\n\n" + section
-	}
-	head := strings.TrimRight(body[:at], "\n")
-	if head == "" {
-		return section + "\n\n" + body[at:]
-	}
-	return head + "\n\n" + section + "\n\n" + body[at:]
-}
-
-// generatedSectionOffset returns the byte offset of the first deterministic
-// section heading (Risk Assessment, Testing, Pipeline) in body, or -1. The
-// narrative has already had every generated heading stripped, so the first one
-// is ours.
-func generatedSectionOffset(body string) int {
-	offset := 0
-	for _, line := range strings.SplitAfter(body, "\n") {
-		switch strings.TrimRight(line, "\r\n") {
-		case "## Risk Assessment", "## Testing", "## Pipeline":
-			return offset
-		}
-		offset += len(line)
-	}
-	return -1
+	return section + "\n\n" + body
 }
 
 func (s *PRStep) fallbackPRContent(sctx *pipeline.StepContext, finalDiff, riskLine, testingMD, pipelineMD string, bodyLimit int, provider scm.Provider) (prContent, error) {

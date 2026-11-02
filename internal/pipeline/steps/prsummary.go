@@ -134,6 +134,23 @@ type pipelineAttestationPolicy struct {
 	// CIPassed is set only when the finished run already knows CI passed on
 	// the PR head, so a Test exception can name the real gate beside it.
 	CIPassed bool
+	// TestingCovers names what the same description's Testing section already
+	// says about the Test step, so its Pipeline group does not repeat it.
+	TestingCovers testingCoverage
+}
+
+// testingCoverage records which Test-step facts the description's Testing
+// section already carries. It is set only for the no-HTML Bitbucket flavor,
+// whose Pipeline groups cannot fold the repeat away. When the body budget later
+// drops the Testing section, the facts it covered are shed with it, exactly as
+// the Testing section's own content already is.
+type testingCoverage struct {
+	// Verdict covers the accepted-exception note, the live-validation line and
+	// the scenario table.
+	Verdict bool
+	// Commands covers the tested commands, which the Testing section lists only
+	// outside compact mode.
+	Commands bool
 }
 
 func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.StepRound, headSHA string, provider scm.Provider, policy pipelineAttestationPolicy) (string, string) {
@@ -142,14 +159,17 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 	}
 
 	flavor := prBodyFlavorFor(provider)
-	var detailBlocks []string
+	// overview is the no-HTML flavor's one-line-per-step list. A step's own
+	// group follows it under a heading only when it has something to say, so a
+	// run of clean steps never reads as part of the heading above it.
+	var overview, detailBlocks []string
 
 	for _, sr := range steps {
 		if shouldOmitPipelineStep(sr) {
 			continue
 		}
 		stepRounds := rounds[sr.ID]
-		line, detail := buildStepEntryFor(sr, stepRounds, flavor, policy.Final, policy.CIPassed)
+		line, detail := buildStepEntryFor(sr, stepRounds, flavor, policy.Final, policy.CIPassed, policy.TestingCovers)
 		if line != "" && detail != "" {
 			// Step details quote agent text (findings, fix summaries, tested
 			// commands). A foreign attestation comment in one lands after the
@@ -158,11 +178,18 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 			// worth holding: it survives any future reordering of this section
 			// and is what the regression asserts. The real attestation is
 			// emitted separately by buildPipelineAttestation and is untouched.
+			if flavor == prBodyMarkdown {
+				overview = append(overview, "- "+neutralizeAttestationMarkers(provider, line))
+				if strings.HasPrefix(detail, "### ") {
+					detailBlocks = append(detailBlocks, neutralizeAttestationMarkers(provider, detail))
+				}
+				continue
+			}
 			detailBlocks = append(detailBlocks, neutralizeAttestationMarkers(provider, detail))
 		}
 	}
 
-	if len(detailBlocks) == 0 {
+	if len(detailBlocks) == 0 && len(overview) == 0 {
 		return "", ""
 	}
 
@@ -177,6 +204,13 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 	if flavor == prBodyHTML {
 		b.WriteString(buildPipelineAttestationWithPolicy(steps, rounds, headSHA, policy))
 		b.WriteString("\n\n")
+	}
+	if len(overview) > 0 {
+		b.WriteString(strings.Join(overview, "\n"))
+		b.WriteString("\n")
+		if len(detailBlocks) > 0 {
+			b.WriteString("\n")
+		}
 	}
 	for i, detail := range detailBlocks {
 		if i > 0 {
@@ -760,10 +794,12 @@ func renderTestedDetailFor(detail string, flavor prBodyFlavor) string {
 }
 
 // renderTestedDetailBullet renders a tested detail as a list item, ending in a
-// newline. A code block cannot share its line with the bullet marker (Bitbucket
-// Cloud's markdown then reads "- ```text" as an inline code span and leaves the
-// language word as prose, and the unindented lines end the list), so the block
-// goes on its own indented lines under a short label.
+// newline. A script (several lines) is reduced to a label. A single line that
+// mixes prose with code spans, such as "`yarn test` (7 suites, all passing)",
+// is already inline markdown and stays a plain bullet: Bitbucket Cloud only
+// recognizes a fence that starts in column 0, so a fenced block nested under a
+// bullet comes out as a broken inline code span and the backticks of the
+// command inside it are printed literally.
 func renderTestedDetailBullet(detail string, flavor prBodyFlavor) string {
 	clean := sanitizeTestedDetail(detail)
 	if strings.TrimSpace(clean) == "" {
@@ -778,8 +814,7 @@ func renderTestedDetailBullet(detail string, flavor prBodyFlavor) string {
 	if inline, ok := testedDetailInline(clean); ok {
 		return "- " + inline + "\n"
 	}
-	block := markdownCodeBlock(testedDetailLanguage(clean), escapeMarkdownFence(escapePipelineFoldMarkers(clean)), "    ")
-	return "- Ran:\n\n" + block + "\n\n"
+	return "- " + escapeMarkdownFence(escapePipelineFoldMarkers(strings.TrimSpace(clean))) + "\n"
 }
 
 func renderTestingSummaryFor(summary string, flavor prBodyFlavor) string {
@@ -1299,15 +1334,15 @@ func formatTestingDuration(ms int64) string {
 }
 
 func buildStepEntry(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor) (statusLine, detailBlock string) {
-	return buildStepEntryFor(sr, rounds, flavor, false, false)
+	return buildStepEntryFor(sr, rounds, flavor, false, false, testingCoverage{})
 }
 
 // buildStepEntryFor renders a step's status line and detail fold. ciPassed is
 // the finished run's known CI result, shown beside a Test exception.
-func buildStepEntryFor(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool) (statusLine, detailBlock string) {
+func buildStepEntryFor(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool, covers testingCoverage) (statusLine, detailBlock string) {
 	name := stepDisplayName(sr.StepName)
 	buildDetail := func(line string) (string, string) {
-		return line, buildStepDetails(line, sr, rounds, flavor, final, ciPassed)
+		return line, buildStepDetails(line, sr, rounds, flavor, final, ciPassed, covers)
 	}
 
 	switch sr.Status {
@@ -1567,10 +1602,10 @@ func buildFixResultText(rounds []*db.StepRound) string {
 // round is shown as the review state observed at its end; a fix round is
 // prefixed with its recorded outcome so a reader can follow the result without
 // mentally replaying rounds.
-func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool) string {
+func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool, covers testingCoverage) string {
 	var inner strings.Builder
 	exception, accepted := testExceptionFor(sr, rounds)
-	if accepted {
+	if accepted && !(covers.Verdict && sr.StepName == types.StepTest) {
 		inner.WriteString(testExceptionNote(exception, ciPassed, flavor))
 		inner.WriteString("\n\n")
 	}
@@ -1627,7 +1662,7 @@ func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRo
 			} else {
 				inner.WriteString("✅ No issues found.\n")
 			}
-			writeTestedDetails(&inner, sr, &findings, flavor)
+			writeTestedDetails(&inner, sr, &findings, flavor, covers)
 			inner.WriteString("\n")
 			continue
 		}
@@ -1640,7 +1675,7 @@ func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRo
 		if isFixRound && !acceptedRound {
 			inner.WriteString(fmt.Sprintf("%s still open:\n\n", countFindingsBySeverity(&findings)))
 		}
-		writeFindingItems(&inner, sr, &findings, flavor, acceptedRound)
+		writeFindingItems(&inner, sr, &findings, flavor, acceptedRound, covers)
 		inner.WriteString("\n")
 	}
 
@@ -1732,7 +1767,13 @@ func fixRoundLine(r *db.StepRound) string {
 //
 // accepted renders the findings of a Test step's accepted exception: the
 // failure is listed without the severity emoji that would read as unresolved.
-func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor, accepted bool) {
+func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor, accepted bool, covers testingCoverage) {
+	// The accepted exception's own finding is the failure the Testing section's
+	// exception note already names; listing it again says nothing new.
+	if accepted && covers.Verdict && sr.StepName == types.StepTest {
+		writeTestedDetails(b, sr, findings, flavor, covers)
+		return
+	}
 	for _, f := range findings.Items {
 		emoji := severityEmoji(f.Severity) + " "
 		if accepted {
@@ -1748,7 +1789,7 @@ func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Fi
 		}
 		b.WriteString(fmt.Sprintf("- %s%s%s\n", emoji, loc, escapePRText(f.Description, flavor)))
 	}
-	writeTestedDetails(b, sr, findings, flavor)
+	writeTestedDetails(b, sr, findings, flavor, covers)
 }
 
 // writeTestedDetails lists what the test step exercised: its live-validation
@@ -1759,19 +1800,24 @@ func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Fi
 // because the Pipeline fold is the per-round story: a reader following a
 // fix round wants to see which scenario changed result between rounds, which
 // the single collapsed Testing section cannot show.
-func writeTestedDetails(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor) {
+func writeTestedDetails(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor, covers testingCoverage) {
 	if sr.StepName != types.StepTest {
 		return
 	}
-	if line := renderLiveValidationLine(findings.Scenarios, findings.Verdict); line != "" {
-		b.WriteString("- ")
-		b.WriteString(line)
-		b.WriteString("\n")
+	if !covers.Verdict {
+		if line := renderLiveValidationLine(findings.Scenarios, findings.Verdict); line != "" {
+			b.WriteString("- ")
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+		if table := renderScenarioTable(findings.Scenarios, flavor); table != "" {
+			b.WriteString("\n")
+			b.WriteString(table)
+			b.WriteString("\n")
+		}
 	}
-	if table := renderScenarioTable(findings.Scenarios, flavor); table != "" {
-		b.WriteString("\n")
-		b.WriteString(table)
-		b.WriteString("\n")
+	if covers.Commands {
+		return
 	}
 	for _, detail := range findings.Tested {
 		b.WriteString(renderTestedDetailBullet(detail, flavor))

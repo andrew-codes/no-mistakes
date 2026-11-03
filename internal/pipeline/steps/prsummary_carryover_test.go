@@ -61,7 +61,8 @@ func acceptedExceptionFindings(t *testing.T, head string) string {
 
 const carryPRURL = "https://bitbucket.org/test/repo/pull-requests/42"
 
-// carryContext is a PR step whose run already owns Bitbucket PR 42.
+// carryContext is a PR step whose run already owns Bitbucket PR 42 and keeps
+// PRs draft until they are ready.
 func carryContext(t *testing.T, api *fakeBitbucketAPI) *pipeline.StepContext {
 	t.Helper()
 	dir, baseSHA, headSHA := setupGitRepo(t)
@@ -70,6 +71,7 @@ func carryContext(t *testing.T, api *fakeBitbucketAPI) *pipeline.StepContext {
 	sctx.Env = api.Env()
 	owned := carryPRURL
 	sctx.Run.PRURL = &owned
+	sctx.Config.Providers.Bitbucket.DraftPullRequests = true
 	return sctx
 }
 

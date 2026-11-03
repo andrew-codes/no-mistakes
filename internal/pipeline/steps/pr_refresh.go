@@ -34,6 +34,10 @@ func (s *PRStep) FinalizeRun(sctx *pipeline.StepContext) error {
 		return err
 	}
 	refreshErr := s.refreshDescription(sctx, host, pr)
+	if headAlreadyPublishedToPR(sctx, pr) {
+		// A rerun that adds nothing to the PR never changes its draft state.
+		return refreshErr
+	}
 	// Readiness is decided last, after the description is current: a PR whose
 	// description could not be refreshed is not published as ready.
 	return errors.Join(refreshErr, syncPRDraftState(sctx, host, pr, refreshErr == nil))

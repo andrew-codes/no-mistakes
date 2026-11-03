@@ -208,6 +208,22 @@ func fakeRecordSuccessHandler() {
 	os.Exit(0)
 }
 
+// fakeGHListMerged answers a `gh pr list --state merged` call and exits. Open
+// and merged listings are separate, as on a real forge: the merged listing
+// holds only FAKE_CLI_MERGED_PR_LIST_JSON (default none), so a test can tell an
+// open-only lookup from a merged one. A call for any other state falls through.
+func fakeGHListMerged(args []string) {
+	if state, ok := fakeCLIFlagValue(args, "--state"); !ok || state != "merged" {
+		return
+	}
+	if merged := os.Getenv("FAKE_CLI_MERGED_PR_LIST_JSON"); merged != "" {
+		fmt.Print(merged)
+	} else {
+		fmt.Println("[]")
+	}
+	os.Exit(0)
+}
+
 func fakeGHHandler(args []string) {
 	fakeGHHandlePRContentCommands(args, strings.Join(args, " "))
 	prURL := os.Getenv("FAKE_CLI_PR_URL")
@@ -217,6 +233,7 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+		fakeGHListMerged(args)
 		if hasPRListJSON {
 			fmt.Print(prListJSON)
 			os.Exit(0)
@@ -505,6 +522,16 @@ func fakeGlabHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "mr" && args[1] == "list" {
+		// Open and merged listings are separate, as on a real forge: `--merged`
+		// reads only FAKE_CLI_MERGED_MR_LIST_JSON (default none).
+		if fakeCLIArgsHaveFlag(args, "--merged") {
+			if merged := os.Getenv("FAKE_CLI_MERGED_MR_LIST_JSON"); merged != "" {
+				fmt.Print(merged)
+			} else {
+				fmt.Println("[]")
+			}
+			os.Exit(0)
+		}
 		if mrViewJSON == "" {
 			fmt.Println("[]")
 			os.Exit(0)
@@ -731,6 +758,7 @@ func fakeCIGHHandler(args []string) {
 	}
 	fakeGHHandlePRContentCommands(args, joined)
 	if strings.Contains(joined, "pr list") {
+		fakeGHListMerged(args)
 		if prListJSON := os.Getenv("FAKE_CLI_PR_LIST_JSON"); prListJSON != "" {
 			fmt.Print(prListJSON)
 		} else {
@@ -1450,4 +1478,13 @@ func fakeGraphQLRepo(args []string) string {
 		return ""
 	}
 	return owner + "/" + name
+}
+
+func fakeCLIArgsHaveFlag(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == flag {
+			return true
+		}
+	}
+	return false
 }

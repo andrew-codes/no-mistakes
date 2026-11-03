@@ -2,11 +2,10 @@ package steps
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/config"
-	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm/bitbucket"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -20,7 +19,9 @@ import (
 
 const (
 	bbRunningStatuses = `[{"name":"build","state":"INPROGRESS"}]`
+	bbGreenStatuses   = `[{"name":"build","state":"SUCCESSFUL"}]`
 	bbNoStatuses      = `[]`
+	bbPassedGitCheck  = `[{"type":"git_mergeability_check","status":"PASSED","blocking":false}]`
 
 	// One request from a person, one notice the monitor must ignore.
 	bbOneRequestAndANotice = `[
@@ -55,61 +56,41 @@ func commentFindingIDs(t *testing.T, findings string) []string {
 	return ids
 }
 
-// bbWaitingContext is a CI step context for an open Bitbucket PR whose
-// statuses are the given JSON and whose comments are the given thread list.
-func bbWaitingContext(t *testing.T, statuses, comments string) *pipeline.StepContext {
-	t.Helper()
-	api := newFakeBitbucketAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42").
-		withPRState("OPEN").
-		withStatuses(statuses).
-		withComments(comments)
-	dir, baseSHA, headSHA := setupGitRepo(t)
-	prURL := "https://bitbucket.org/test/repo/pull-requests/42"
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
-	sctx.Env = api.Env()
-	sctx.Run.PRURL = &prURL
-	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
-	sctx.Config.CITimeout = 30 * time.Second
-	return sctx
-}
-
-// onePollThenCancel lets the monitor poll once and then end the step with the
-// context error, so a monitor that would otherwise wait forever fails the test
-// instead of hanging it.
-func onePollThenCancel(sctx *pipeline.StepContext) *CIStep {
-	ctx, cancel := context.WithCancel(sctx.Ctx)
-	sctx.Ctx = ctx
-	return &CIStep{waitForNextPoll: func(ctx context.Context, _ time.Duration) error {
-		cancel()
-		return ctx.Err()
-	}}
-}
-
 // A comment that arrives while the monitor is waiting becomes an auto-fix
-// finding on the next poll, whatever the wait is for.
+// finding on the next poll, whatever the wait is for and whether or not the PR
+// is a draft.
 func TestCIStep_BitbucketRaisesCommentsWhileWaiting(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name     string
-		statuses string
+		name         string
+		draft        bool
+		statuses     string
+		mergeability string
 	}{
-		{"checks still running", bbRunningStatuses},
-		{"no checks registered yet", bbNoStatuses},
+		{"checks still running", false, bbRunningStatuses, bbPassedGitCheck},
+		{"draft with checks still running", true, bbRunningStatuses, bbDraftPendingGitCheck},
+		{"mergeability still pending on a ready PR", false, bbGreenStatuses, bbDraftPendingGitCheck},
+		{"draft with no checks registered yet", true, bbNoStatuses, bbDraftPendingGitCheck},
+		{"ready PR with no checks registered yet", false, bbNoStatuses, bbPassedGitCheck},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			sctx := bbWaitingContext(t, tc.statuses, bbOneRequestAndANotice)
+			api := bbDraftAPI(t, tc.mergeability).withStatuses(tc.statuses).withComments(bbOneRequestAndANotice)
+			sctx, logs := bbCIDraftContext(t, api, tc.draft)
 			step := onePollThenCancel(sctx)
 
 			outcome, err := driveCI(t, step, sctx)
 			if err != nil {
-				t.Fatalf("CI step error = %v", err)
+				t.Fatalf("CI step error = %v\nlogs:\n%s", err, strings.Join(*logs, "\n"))
 			}
 			if outcome == nil || outcome.CIReadyNoCI != nil || outcome.Findings == "" {
-				t.Fatalf("outcome = %#v, want the comment raised while waiting", outcome)
+				t.Fatalf("outcome = %#v, want the comment raised while waiting\nlogs:\n%s", outcome, strings.Join(*logs, "\n"))
 			}
 			if ids := commentFindingIDs(t, outcome.Findings); len(ids) != 1 || ids[0] != "2002" {
 				t.Fatalf("raised comments = %v, want only the request (2002), never the notice", ids)
+			}
+			if state := api.readState(t).Draft; state != tc.draft {
+				t.Fatalf("draft = %v after the poll, want it untouched (%v): publication is the end of the run", state, tc.draft)
 			}
 		})
 	}
@@ -131,12 +112,75 @@ func TestCIStep_BitbucketWaitingIgnoresWhatIsNotFeedback(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			sctx := bbWaitingContext(t, bbRunningStatuses, tc.comments)
+			api := bbDraftAPI(t, bbDraftPendingGitCheck).withStatuses(bbRunningStatuses).withComments(tc.comments)
+			sctx, _ := bbCIDraftContext(t, api, true)
 			step := onePollThenCancel(sctx)
 
 			outcome, err := driveCI(t, step, sctx)
 			if err != context.Canceled {
 				t.Fatalf("outcome = %#v, err = %v, want the monitor to keep waiting", outcome, err)
+			}
+		})
+	}
+}
+
+// The whole round while checks are still running, on a draft: the fixer is
+// asked once, the thread is answered once, the draft stays a draft, and the
+// monitor's later polls do not raise or answer it again.
+func TestCIStep_BitbucketAnswersACommentOnceWhileChecksRun(t *testing.T) {
+	for _, draft := range []bool{false, true} {
+		name := "ready PR"
+		if draft {
+			name = "draft PR"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newBBCommentRepairFixture(t, false, bbOneRequestAndANotice, `{"summary":"cover the empty account","code_change_needed":true,"comment_replies":[
+				{"comment_id":"2002","action":"addressed","reply":"Covered the empty-account case."}]}`, true)
+			f.api.withStatuses(bbRunningStatuses).withMergeability(bbDraftPendingGitCheck)
+			f.api.updateState(func(s *bbFakeStateForTest) { s.Draft = draft })
+			f.sctx.Env = f.api.Env() // the fake's statuses and merge checks ride the environment
+			f.sctx.Config.Providers.Bitbucket.DraftPullRequests = draft
+
+			// Poll until the round has run and a few quiet polls have followed.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f.sctx.Ctx = ctx
+			polls := 0
+			step := &CIStep{waitForNextPoll: func(ctx context.Context, _ time.Duration) error {
+				polls++
+				if polls >= 4 {
+					cancel()
+				}
+				return ctx.Err()
+			}}
+			if _, err := driveCI(t, step, f.sctx); err != nil && err != context.Canceled {
+				t.Fatalf("CI step error = %v\nlog:\n%s", err, f.log())
+			}
+
+			if *f.calls != 1 {
+				t.Fatalf("fix agent ran %d times, want exactly one round\nlog:\n%s", *f.calls, f.log())
+			}
+			if f.remoteHead(t) == f.headSHA {
+				t.Fatalf("the repair was not published while checks were running\nlog:\n%s", f.log())
+			}
+			reply := f.reply(t, 2002)
+			if reply == nil || !strings.Contains(reply.Content.Raw, bitbucket.ReplyMarker) {
+				t.Fatalf("reply to 2002 = %+v, want one marked reply", reply)
+			}
+			if got := f.api.logCount("comment create"); got != 1 {
+				t.Fatalf("posted %d replies, want exactly one for the thread", got)
+			}
+			if !f.resolved(2002) {
+				t.Fatal("the addressed thread was not resolved")
+			}
+			if f.reply(t, 2000) != nil {
+				t.Fatal("a notice must never be answered")
+			}
+			if got := f.api.readState(t).Draft; got != draft {
+				t.Fatalf("draft = %v after the round, want it unchanged (%v)", got, draft)
+			}
+			if agentPrompt := *f.prompt; !strings.Contains(agentPrompt, "empty-account") {
+				t.Fatalf("fix prompt lacks the comment:\n%s", agentPrompt)
 			}
 		})
 	}

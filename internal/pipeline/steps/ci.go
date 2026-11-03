@@ -1109,7 +1109,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		// Reaching this point means the poll is about to wait: it neither
 		// settled on issues nor reported a verdict. Feedback left on the PR
 		// meanwhile is still a request, so it is raised now, on the same
-		// cadence as the checks, instead of after they settle.
+		// cadence as the checks, instead of after they settle. That holds
+		// for a draft awaiting publication too: the draft is never touched
+		// here, only the comments on it are answered.
 		if !commentsRead {
 			if comments := s.bestEffortReviewComments(sctx, host, pr); len(comments) > 0 {
 				if err := clearCIMonitorReady(sctx); err != nil {

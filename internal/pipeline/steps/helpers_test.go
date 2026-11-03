@@ -425,6 +425,30 @@ type bbFakePRForTest struct {
 	SourceCommit string `json:"source_commit"`
 }
 
+// withOtherPR adds a sibling PR that `pull-requests query` lists (subject to
+// its --state, --source and --dest filters) but `get` never reads.
+func (api *fakeBitbucketAPI) withOtherPR(pr bbFakePRForTest) *fakeBitbucketAPI {
+	api.updateState(func(s *bbFakeStateForTest) { s.Others = append(s.Others, pr) })
+	return api
+}
+
+// withPrimaryPR makes the primary PR (the one `get` reads) a PR in the given
+// state, so a merged PR can also be read back by the CI step.
+func (api *fakeBitbucketAPI) withPrimaryPR(pr bbFakePRForTest) *fakeBitbucketAPI {
+	api.updateState(func(s *bbFakeStateForTest) {
+		s.Exists = true
+		s.ID = pr.ID
+		s.URL = pr.URL
+		s.State = pr.State
+		s.Source = pr.Source
+		s.Dest = pr.Dest
+		s.SourceCommit = pr.SourceCommit
+		s.Title = "Merged title"
+		s.Description = "Merged description"
+	})
+	return api
+}
+
 func (api *fakeBitbucketAPI) updateState(mutate func(*bbFakeStateForTest)) {
 	api.t.Helper()
 	data, err := os.ReadFile(api.statePath)

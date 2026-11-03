@@ -170,6 +170,7 @@ twg whoami
 - PR creation and update
 - CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed pipeline step log fetching for the CI auto-fix step
+- Merged-PR lookup before a PR is created (`twg bb pull-requests query --state MERGED`), so a branch whose PR was already merged on green does not get a duplicate PR (see the [PR step](/no-mistakes/reference/pipeline-steps/#pr))
 
 
 **What you don't get (yet):**

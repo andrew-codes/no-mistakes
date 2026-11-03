@@ -274,8 +274,14 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			return nil, err
 		}
 		// A new run restarts validation, so a PR an earlier run published as
-		// ready is not ready any more. The run's end decides again.
-		holdPRAsDraft(sctx, host, updated)
+		// ready is not ready any more. The run's end decides again - unless
+		// this run pushed nothing the PR does not already have, in which case
+		// there is nothing to revalidate and the PR keeps its state.
+		if headAlreadyPublishedToPR(sctx, updated) {
+			sctx.Log("this head is already on the pull request; leaving its draft or ready state as it is")
+		} else {
+			holdPRAsDraft(sctx, host, updated)
+		}
 		if updated != nil && updated.URL != "" {
 			if err := sctx.DB.UpdateRunPRURL(sctx.Run.ID, updated.URL); err != nil {
 				slog.Warn("failed to persist PR URL", "run", sctx.Run.ID, "url", updated.URL, "err", err)

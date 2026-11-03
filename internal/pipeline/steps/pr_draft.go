@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -13,16 +14,22 @@ import (
 )
 
 // A PR is opened as a draft and is published as ready only when the run that
-// owns it has actually finished the job: every step passed on the final head,
+// opened it has actually finished the job: every step passed on the final head,
 // the checks are green, no review comment is waiting for a reply, and the
 // description was regenerated for that final state. Anything else, including
 // an answer the forge could not give, leaves it a draft.
 //
 // Two places apply it. The PR step puts an existing PR back to draft when a
-// new run starts validating it (a new push, a rerun). FinalizeRun marks it
+// new run starts validating NEW content (a new push). FinalizeRun marks it
 // ready, or leaves it draft, when the run ends. In between, the CI step never
 // publishes: a red check or unreplied feedback can only find a PR that is
 // still a draft.
+//
+// A run that adds nothing to the PR - a rerun at a head an earlier run already
+// pushed to it, typically to refresh the description - leaves the draft state
+// exactly as it found it, in both directions. It would otherwise flip a PR its
+// owner already marked ready, and publish one its owner chose to keep as a
+// draft; publishing belongs to the run that opened the PR.
 
 func draftController(host scm.Host) (scm.PRDraftController, bool) {
 	controller, ok := host.(scm.PRDraftController)
@@ -46,6 +53,26 @@ func draftAwaitsPublication(ctx context.Context, host scm.Host, pr *scm.PR) bool
 	}
 	draft, err := controller.GetPRDraft(ctx, pr)
 	return err == nil && draft
+}
+
+// headAlreadyPublishedToPR reports whether an earlier run on this branch already
+// pushed this run's head to this very PR, so the run changes none of the PR's
+// content and has no say in its draft state. Anything it cannot establish reads
+// as false, which keeps the draft lifecycle.
+func headAlreadyPublishedToPR(sctx *pipeline.StepContext, pr *scm.PR) bool {
+	if pr == nil {
+		return false
+	}
+	head := strings.TrimSpace(sctx.Run.HeadSHA)
+	for _, earlier := range earlierSameHeadRuns(sctx) {
+		if earlier.LastPushedSHA == nil || strings.TrimSpace(*earlier.LastPushedSHA) != head || earlier.PRURL == nil {
+			continue
+		}
+		if samePRIdentity(*earlier.PRURL, pr) {
+			return true
+		}
+	}
+	return false
 }
 
 // holdPRAsDraft puts the PR into draft. Best effort: the run's end converges

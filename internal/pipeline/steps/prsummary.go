@@ -108,6 +108,9 @@ type testingSummaryOptions struct {
 	// uploaded at PR render time. Nil means nothing was uploaded; the renderer
 	// then keeps today's local-path or commit-pinned link.
 	attachments map[string]string
+	// carried maps a skipped Test step's ID to the earlier same-head run's
+	// recorded result, rendered in its place and labelled as carried over.
+	carried map[string]*carriedStep
 }
 
 // BuildPipelineSummary produces a deterministic markdown section from step results and rounds.
@@ -137,6 +140,10 @@ type pipelineAttestationPolicy struct {
 	// TestingCovers names what the same description's Testing section already
 	// says about the Test step, so its Pipeline group does not repeat it.
 	TestingCovers testingCoverage
+	// Carried maps a skipped step's ID to the earlier same-head run's recorded
+	// result for it, rendered in the step's place and labelled as carried over.
+	// The attestation never reads it: it keeps this run's own statuses.
+	Carried map[string]*carriedStep
 }
 
 // testingCoverage records which Test-step facts the description's Testing
@@ -168,8 +175,8 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 		if shouldOmitPipelineStep(sr) {
 			continue
 		}
-		stepRounds := rounds[sr.ID]
-		line, detail := buildStepEntryFor(sr, stepRounds, flavor, policy.Final, policy.CIPassed, policy.TestingCovers)
+		entry, stepRounds, note := policy.Carried[sr.ID].viewOf(sr, rounds[sr.ID])
+		line, detail := buildStepEntryNoted(entry, stepRounds, flavor, policy.Final, policy.CIPassed, policy.TestingCovers, note)
 		if line != "" && detail != "" {
 			// Step details quote agent text (findings, fix summaries, tested
 			// commands). A foreign attestation comment in one lands after the
@@ -403,6 +410,12 @@ func BuildTestingSummaryForPRWithProvider(steps []*db.StepResult, rounds map[str
 }
 
 func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact, ciPassed bool) string {
+	return buildPRTestingSummaryCarried(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, attachments, compact, ciPassed, nil)
+}
+
+// buildPRTestingSummaryCarried is buildPRTestingSummary with the skipped steps
+// whose earlier same-head result is shown in their place.
+func buildPRTestingSummaryCarried(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact, ciPassed bool, carried map[string]*carriedStep) string {
 	opts := testingSummaryOptionsForGitHub(upstreamURL, ref)
 	opts.flavor = prBodyFlavorFor(provider)
 	opts.compactArtifacts = compact
@@ -414,6 +427,7 @@ func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepR
 	opts.evidence = links
 	opts.attachments = attachments
 	opts.ciPassed = ciPassed
+	opts.carried = carried
 	return buildTestingSummary(steps, rounds, opts)
 }
 
@@ -423,8 +437,8 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 			continue
 		}
 
-		stepRounds := rounds[sr.ID]
-		line, _ := buildStepEntry(sr, stepRounds, opts.flavor)
+		sr, stepRounds, note := opts.carried[sr.ID].viewOf(sr, rounds[sr.ID])
+		line, _ := buildStepEntryNoted(sr, stepRounds, opts.flavor, false, false, testingCoverage{}, note)
 		if line == "" {
 			return ""
 		}
@@ -1340,8 +1354,17 @@ func buildStepEntry(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlav
 // buildStepEntryFor renders a step's status line and detail fold. ciPassed is
 // the finished run's known CI result, shown beside a Test exception.
 func buildStepEntryFor(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool, covers testingCoverage) (statusLine, detailBlock string) {
+	return buildStepEntryNoted(sr, rounds, flavor, final, ciPassed, covers, "")
+}
+
+// buildStepEntryNoted is buildStepEntryFor with a parenthesised note after the
+// status, used to say a step's result is carried over from an earlier run.
+func buildStepEntryNoted(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool, covers testingCoverage, note string) (statusLine, detailBlock string) {
 	name := stepDisplayName(sr.StepName)
 	buildDetail := func(line string) (string, string) {
+		if note != "" {
+			line += " (" + note + ")"
+		}
 		return line, buildStepDetails(line, sr, rounds, flavor, final, ciPassed, covers)
 	}
 

@@ -876,14 +876,18 @@ func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider s
 		rounds[sr.ID] = r
 	}
 
-	policy := pipelineAttestationPolicy{}
+	// A refresh run skips what an earlier run on this head already passed; the
+	// description keeps showing that result, labelled, instead of "skipped".
+	// The attestation below still reads this run's own rows.
+	carried := carriedSkippedSteps(sctx, steps)
+	policy := pipelineAttestationPolicy{Carried: carried}
 	if sctx.Config != nil {
 		policy.AllowTestCommandOverride = strings.TrimSpace(sctx.Config.Test.AllowApproveOverFailure)
 	}
 	ciPassed := false
 	if final {
 		policy.Final = true
-		policy.Outcome = finalRunOutcomeLine(sctx.Run, steps)
+		policy.Outcome = finalRunOutcomeLine(sctx.Run, carriedView(steps, carried))
 		ciPassed = finalCIPassed(sctx.Run, steps)
 		policy.CIPassed = ciPassed
 	}
@@ -893,11 +897,12 @@ func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider s
 	}
 	// The Testing section is rendered first because the Pipeline's Test group
 	// must know what it already says (see testingCoverage).
-	testingMD = buildPRTestingSummary(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir, testEvidenceDir(sctx), publishRunEvidence(sctx), provider, s.attachRunEvidenceMedia(sctx, provider, steps, rounds), compact, ciPassed)
+	testingMD = buildPRTestingSummaryCarried(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir, testEvidenceDir(sctx), publishRunEvidence(sctx), provider, s.attachRunEvidenceMedia(sctx, provider, steps, rounds), compact, ciPassed, carried)
 	if testingMD != "" && prBodyFlavorFor(provider) == prBodyMarkdown {
 		policy.TestingCovers = testingCoverage{Verdict: true, Commands: !compact}
 	}
 	pipelineMD, riskLine = buildPipelineSummaryFor(steps, rounds, sctx.Run.HeadSHA, provider, policy)
+	riskLine = carriedRiskLine(sctx, steps, rounds, riskLine)
 	// The review conversation rides inside the Pipeline section as an ordinary
 	// `### ` group, so the existing body-budget logic can drop it whole rather
 	// than competing with the attestation it must never displace.

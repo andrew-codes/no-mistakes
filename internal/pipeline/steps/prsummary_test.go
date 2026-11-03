@@ -150,9 +150,17 @@ func TestBuildPipelineSummary_FindingCannotSpoofFoldBoundary(t *testing.T) {
 					}
 
 					_, updates := splitPipelineSectionHeader(md)
-					groups := parsePipelineUpdateGroups(updates)
-					if len(groups) != 1 {
-						t.Fatalf("expected exactly 1 step group, got %d - embedded finding %s was mistaken for a fold boundary:\n%s", len(groups), field.name, md)
+					// The Bitbucket flavor leads with a headerless overview list, so
+					// count the groups that open with a fold: a spoofed boundary
+					// would add one.
+					folds := 0
+					for _, group := range parsePipelineUpdateGroups(updates) {
+						if group.header != "" {
+							folds++
+						}
+					}
+					if folds != 1 {
+						t.Fatalf("expected exactly 1 step group, got %d - embedded finding %s was mistaken for a fold boundary:\n%s", folds, field.name, md)
 					}
 				})
 			}
@@ -1155,7 +1163,7 @@ func TestBuildPRTestingSummary_PutsEachAttachmentInItsOwnParagraph(t *testing.T)
 				"rec.mp4":   "https://github.com/user-attachments/assets/rec",
 			}
 
-			md := buildPRTestingSummary(steps, rounds, tt.upstreamURL, "abc123", t.TempDir(), "", nil, scm.ProviderUnknown, attachments, true)
+			md := buildPRTestingSummary(steps, rounds, tt.upstreamURL, "abc123", t.TempDir(), "", nil, scm.ProviderUnknown, attachments, true, false)
 
 			lines := strings.Split(md, "\n")
 			found := 0
@@ -1232,7 +1240,7 @@ func TestBuildPRTestingSummary_SeparatesDetailsFromAdjacentAttachments(t *testin
 				"rec.mp4":  "https://github.com/user-attachments/assets/rec",
 			}
 
-			md := buildPRTestingSummary(steps, rounds, "git@github.com:example/widgets.git", "abc123", t.TempDir(), "", nil, scm.ProviderUnknown, attachments, true)
+			md := buildPRTestingSummary(steps, rounds, "git@github.com:example/widgets.git", "abc123", t.TempDir(), "", nil, scm.ProviderUnknown, attachments, true, false)
 
 			if !strings.Contains(md, tt.want) {
 				t.Errorf("expected %q, got:\n%s", tt.want, md)

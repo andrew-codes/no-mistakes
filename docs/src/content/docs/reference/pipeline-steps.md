@@ -334,6 +334,12 @@ Creates or updates a pull request.
 
 Stores the PR URL in the database and streams it to the TUI.
 
+### Final description refresh
+
+The PR step writes the description once, before the CI step and any CI repair rounds, so what it says about the run is a snapshot. When the run ends (completed, `checks_passed`, or failed, not cancelled or superseded), the executor asks the PR step to refresh the description from the final state: the Risk, Testing and Pipeline sections are recomposed, the Pipeline section opens with the run outcome, and each step shows only its latest round's findings (earlier rounds collapse to a one-line count). The narrative is not redrafted and no agent runs. Only a PR whose body this run's PR step wrote is touched, and a refresh failure never changes the run's result.
+
+A Test step that finished over an approved exception (see the Test exception definition in the [CLI reference](/no-mistakes/reference/cli/)) is never shown as an unexplained error. Its status reads `passed with an accepted exception`, and a note in the Testing and Pipeline sections says what failed, that the failure was reviewed and accepted, and the recorded reason, flattened to one bounded line. The final description adds that CI on the PR head passed when the run already knows it (a completed CI step that was not approved over failing checks, on a repository that has checks) and never asks the forge, and the run outcome reads `passed ... with an accepted Test exception`. A Test failure with no approved exception keeps its error rendering. A configured test command that is a multi-line script is shown as its first meaningful line and its length, never the script itself.
+
 ### Pipeline step attestation
 
 Immediately after the existing `Updates from [git push no-mistakes](https://github.com/kunchenguid/no-mistakes)` signature, no-mistakes writes one stable HTML comment:

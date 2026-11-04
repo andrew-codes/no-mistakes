@@ -1676,6 +1676,9 @@ func runToInfo(d *db.DB, r *db.Run, steps []*db.StepResult) *ipc.RunInfo {
 	if link, err := d.GetRunRetryBySource(r.ID); err == nil && link != nil {
 		info.RetriedBy = link.RunID
 	}
+	if r.PRState != nil {
+		info.PRState = *r.PRState
+	}
 	if len(steps) > 0 {
 		info.Steps = make([]ipc.StepResultInfo, 0, len(steps))
 		for _, s := range steps {

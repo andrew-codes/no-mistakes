@@ -98,6 +98,8 @@ func handleFakeCLI(mode string) {
 		fakeCIGlabSequenceHandler(args)
 	case "ci-gh-reconcile":
 		fakeCIGHReconcileHandler(args)
+	case "twg":
+		fakeTWGHandler(args)
 	case "ci-gh-with-intervening-push":
 		// A single step invocation can need both a faked gh (for the PR
 		// attestation write) and a faked git (to inject a push-time race) in
@@ -208,6 +210,22 @@ func fakeRecordSuccessHandler() {
 	os.Exit(0)
 }
 
+// fakeGHListMerged answers a `gh pr list --state merged` call and exits. Open
+// and merged listings are separate, as on a real forge: the merged listing
+// holds only FAKE_CLI_MERGED_PR_LIST_JSON (default none), so a test can tell an
+// open-only lookup from a merged one. A call for any other state falls through.
+func fakeGHListMerged(args []string) {
+	if state, ok := fakeCLIFlagValue(args, "--state"); !ok || state != "merged" {
+		return
+	}
+	if merged := os.Getenv("FAKE_CLI_MERGED_PR_LIST_JSON"); merged != "" {
+		fmt.Print(merged)
+	} else {
+		fmt.Println("[]")
+	}
+	os.Exit(0)
+}
+
 func fakeGHHandler(args []string) {
 	fakeGHHandlePRContentCommands(args, strings.Join(args, " "))
 	prURL := os.Getenv("FAKE_CLI_PR_URL")
@@ -217,6 +235,7 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+		fakeGHListMerged(args)
 		if hasPRListJSON {
 			fmt.Print(prListJSON)
 			os.Exit(0)
@@ -505,6 +524,16 @@ func fakeGlabHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "mr" && args[1] == "list" {
+		// Open and merged listings are separate, as on a real forge: `--merged`
+		// reads only FAKE_CLI_MERGED_MR_LIST_JSON (default none).
+		if fakeCLIArgsHaveFlag(args, "--merged") {
+			if merged := os.Getenv("FAKE_CLI_MERGED_MR_LIST_JSON"); merged != "" {
+				fmt.Print(merged)
+			} else {
+				fmt.Println("[]")
+			}
+			os.Exit(0)
+		}
 		if mrViewJSON == "" {
 			fmt.Println("[]")
 			os.Exit(0)
@@ -591,6 +620,15 @@ func fakeCLIFlagValue(args []string, flag string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func fakeCLIHasFlag(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == flag {
+			return true
+		}
+	}
+	return false
 }
 
 func extractTrailingNumber(rawURL string) int {
@@ -731,6 +769,7 @@ func fakeCIGHHandler(args []string) {
 	}
 	fakeGHHandlePRContentCommands(args, joined)
 	if strings.Contains(joined, "pr list") {
+		fakeGHListMerged(args)
 		if prListJSON := os.Getenv("FAKE_CLI_PR_LIST_JSON"); prListJSON != "" {
 			fmt.Print(prListJSON)
 		} else {
@@ -1436,6 +1475,471 @@ func printFakeReviewThreads(raw string) {
 	fmt.Println(string(encoded))
 }
 
+// bbFakeState is the on-disk state a fake `twg bb pull-requests` invocation
+// reads and mutates. It is a file (path from FAKE_CLI_BB_STATE_FILE) rather
+// than in-memory state because each fake invocation is a fresh subprocess,
+// mirroring how the ci-gh-seq/ci-glab-seq fakes track a cursor through a file.
+type bbFakeState struct {
+	Exists      bool   `json:"exists"`
+	ID          int    `json:"id"`
+	URL         string `json:"url"`
+	State       string `json:"state"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Puts        int    `json:"puts"`
+	// Draft is the PR's draft state; DraftToggles counts `update --draft` and
+	// `update --ready` calls.
+	Draft        bool `json:"draft,omitempty"`
+	DraftToggles int  `json:"draft_toggles,omitempty"`
+	// DestUpdates counts `update --dest` retargets.
+	DestUpdates int `json:"dest_updates,omitempty"`
+	// Source, Dest and SourceCommit describe the primary PR for `query`
+	// filtering and output. Empty Source/Dest match any filter, so a state file
+	// that never set them behaves as before.
+	Source       string `json:"source,omitempty"`
+	Dest         string `json:"dest,omitempty"`
+	SourceCommit string `json:"source_commit,omitempty"`
+	// Others are further PRs `query` lists (a merged or declined sibling, for
+	// example). `get`, `create` and `update` only ever act on the primary PR.
+	Others []bbFakePR `json:"others,omitempty"`
+}
+
+// bbFakePR is one extra PR the fake `twg bb pull-requests query` can list.
+type bbFakePR struct {
+	ID           int    `json:"id"`
+	URL          string `json:"url"`
+	State        string `json:"state"`
+	Source       string `json:"source"`
+	Dest         string `json:"dest"`
+	SourceCommit string `json:"source_commit"`
+}
+
+func loadBBState() bbFakeState {
+	path := os.Getenv("FAKE_CLI_BB_STATE_FILE")
+	if path == "" {
+		return bbFakeState{}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return bbFakeState{}
+	}
+	var state bbFakeState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return bbFakeState{}
+	}
+	return state
+}
+
+func saveBBState(state bbFakeState) {
+	path := os.Getenv("FAKE_CLI_BB_STATE_FILE")
+	if path == "" {
+		return
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func fakeTWGHandler(args []string) {
+	if len(args) >= 1 && args[0] == "whoami" {
+		if authErr := os.Getenv("FAKE_CLI_AUTH_ERR"); authErr != "" {
+			fmt.Fprintln(os.Stderr, authErr)
+			os.Exit(1)
+		}
+		if v, ok := fakeCLIFlagValue(args, "-o"); ok && v == "json" {
+			// `twg whoami -o json`: the account id the adapter compares comment
+			// authors against.
+			account := os.Getenv("FAKE_CLI_BB_ACCOUNT_ID")
+			if account == "" {
+				account = "712020:fake-self"
+			}
+			fmt.Printf("{\"apiVersion\":\"v2\",\"data\":{\"accountId\":%q,\"name\":\"Fake User\"}}\n", account)
+			os.Exit(0)
+		}
+		fmt.Println("Fake User")
+		os.Exit(0)
+	}
+	if len(args) < 2 || args[0] != "bb" {
+		fmt.Fprintln(os.Stderr, "unsupported twg argv:", strings.Join(args, " "))
+		os.Exit(1)
+	}
+	if !fakeTWGOutputSummaryNone(args) {
+		// Real twg defaults to `--output-summary auto` and wraps large
+		// results in a YAML envelope pointing at a file. Emit one whenever the
+		// caller did not opt out, so a call that forgets the flag fails.
+		fmt.Println("summary: output too large to print inline")
+		fmt.Println("file: /tmp/twg-output-summary-fake.json")
+		os.Exit(0)
+	}
+	switch args[1] {
+	case "pull-requests":
+		fakeTWGPullRequests(args[2:])
+	case "pipeline":
+		fakeTWGPipeline(args[2:])
+	default:
+		fmt.Fprintln(os.Stderr, "unsupported twg bb argv:", strings.Join(args, " "))
+		os.Exit(1)
+	}
+}
+
+// fakeTWGOutputSummaryNone reports whether the invocation carries
+// `--output-summary none`.
+func fakeTWGOutputSummaryNone(args []string) bool {
+	v, ok := fakeCLIFlagValue(args, "--output-summary")
+	return ok && v == "none"
+}
+
+func fakeTWGPRJSON(state bbFakeState) string {
+	return fakeTWGPRPayloadJSON(bbFakePR{
+		ID: state.ID, URL: state.URL, State: state.State,
+		Source: state.Source, Dest: state.Dest, SourceCommit: state.SourceCommit,
+	})
+}
+
+// fakeTWGWithSourceRepo stamps source.repository.full_name onto a PR payload,
+// as the real query listing does.
+func fakeTWGWithSourceRepo(payload, fullName string) string {
+	var pr map[string]any
+	if err := json.Unmarshal([]byte(payload), &pr); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	source, _ := pr["source"].(map[string]any)
+	if source == nil {
+		source = map[string]any{}
+	}
+	source["repository"] = map[string]string{"full_name": fullName}
+	pr["source"] = source
+	encoded, err := json.Marshal(pr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	return string(encoded)
+}
+
+func fakeTWGPRPayloadJSON(pr bbFakePR) string {
+	prState := pr.State
+	if prState == "" {
+		prState = "OPEN"
+	}
+	payload := map[string]any{
+		"id":    pr.ID,
+		"state": prState,
+		"links": map[string]any{"html": map[string]string{"href": pr.URL}},
+	}
+	source := map[string]any{}
+	if pr.Source != "" {
+		source["branch"] = map[string]string{"name": pr.Source}
+	}
+	if pr.SourceCommit != "" {
+		source["commit"] = map[string]string{"hash": pr.SourceCommit}
+	}
+	if len(source) > 0 {
+		payload["source"] = source
+	}
+	if pr.Dest != "" {
+		payload["destination"] = map[string]any{"branch": map[string]string{"name": pr.Dest}}
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	return string(encoded)
+}
+
+func fakeTWGPullRequests(args []string) {
+	if len(args) == 0 {
+		os.Exit(1)
+	}
+	sub, rest := args[0], args[1:]
+	state := loadBBState()
+
+	switch sub {
+	case "query":
+		// Like the real command: --state defaults to OPEN, and --source and
+		// --dest narrow the listing. A PR with no recorded branch matches any
+		// branch filter.
+		wantState, ok := fakeCLIFlagValue(rest, "--state")
+		if !ok {
+			wantState = "OPEN"
+		}
+		if raw := os.Getenv("FAKE_CLI_BB_QUERY_MERGED_RAW"); raw != "" && strings.EqualFold(wantState, "MERGED") {
+			// An unreadable merged listing, for tests of the fail-closed lookup.
+			fmt.Println(raw)
+			os.Exit(0)
+		}
+		// Real twg reports each PR's source repository; the adapter requires it
+		// to match the queried repository, so mirror the --workspace/--repo flags.
+		workspace, _ := fakeCLIFlagValue(rest, "--workspace")
+		repoSlug, _ := fakeCLIFlagValue(rest, "--repo")
+		source, _ := fakeCLIFlagValue(rest, "--source")
+		dest, _ := fakeCLIFlagValue(rest, "--dest")
+		var listed []string
+		match := func(pr bbFakePR) {
+			prState := pr.State
+			if prState == "" {
+				prState = "OPEN"
+			}
+			if !strings.EqualFold(prState, wantState) {
+				return
+			}
+			if source != "" && pr.Source != "" && pr.Source != source {
+				return
+			}
+			if dest != "" && pr.Dest != "" && pr.Dest != dest {
+				return
+			}
+			listed = append(listed, fakeTWGWithSourceRepo(fakeTWGPRPayloadJSON(pr), workspace+"/"+repoSlug))
+		}
+		if state.Exists {
+			match(bbFakePR{
+				ID: state.ID, URL: state.URL, State: state.State,
+				Source: state.Source, Dest: state.Dest, SourceCommit: state.SourceCommit,
+			})
+		}
+		for _, other := range state.Others {
+			match(other)
+		}
+		fmt.Println("[" + strings.Join(listed, ",") + "]")
+		os.Exit(0)
+	case "get":
+		if len(rest) == 0 {
+			fmt.Fprintln(os.Stderr, "twg bb pull-requests get: missing id")
+			os.Exit(1)
+		}
+		payload := map[string]any{
+			"id":          state.ID,
+			"title":       state.Title,
+			"description": state.Description,
+			"state":       state.State,
+			"draft":       state.Draft,
+			"links":       map[string]any{"html": map[string]string{"href": state.URL}},
+		}
+		if payload["state"] == "" {
+			payload["state"] = "OPEN"
+		}
+		if sourceCommit := os.Getenv("FAKE_CLI_BB_SOURCE_COMMIT"); sourceCommit != "" {
+			payload["source"] = map[string]any{"commit": map[string]string{"hash": sourceCommit}}
+		}
+		if state.Dest != "" {
+			payload["destination"] = map[string]any{"branch": map[string]string{"name": state.Dest}}
+		}
+		if fakeCLIHasFlag(rest, "--statuses") {
+			statuses := os.Getenv("FAKE_CLI_BB_STATUSES_JSON")
+			if statuses == "" {
+				statuses = "[]"
+			}
+			payload["_statuses"] = json.RawMessage(statuses)
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(string(encoded))
+		os.Exit(0)
+	case "mergeability":
+		// FAKE_CLI_BB_MERGEABILITY_JSON overrides the merge-check listing; the
+		// default is a PR whose git and commits-behind checks both pass.
+		checks := os.Getenv("FAKE_CLI_BB_MERGEABILITY_JSON")
+		if checks == "" {
+			checks = `[{"type":"git_mergeability_check","status":"PASSED","blocking":false},{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"PASSED","blocking":false}]`
+		}
+		fmt.Println(checks)
+		os.Exit(0)
+	case "create":
+		title, _ := fakeCLIFlagValue(rest, "--title")
+		descFile, _ := fakeCLIFlagValue(rest, "--description-file")
+		description := fakeReadDescriptionFile(descFile)
+		state.Exists = true
+		if state.ID == 0 {
+			state.ID = 99
+		}
+		if state.URL == "" {
+			state.URL = fmt.Sprintf("https://bitbucket.org/test/repo/pull-requests/%d", state.ID)
+		}
+		state.Title = title
+		state.Description = description
+		state.Draft = fakeCLIHasFlag(rest, "--draft")
+		saveBBState(state)
+		fmt.Println(fakeTWGPRJSON(state))
+		os.Exit(0)
+	case "update":
+		if fakeCLIHasFlag(rest, "--draft") || fakeCLIHasFlag(rest, "--ready") {
+			// A draft toggle changes only the draft state.
+			if msg := os.Getenv("FAKE_CLI_BB_REJECT_DRAFT_TOGGLE"); msg != "" {
+				fmt.Fprintln(os.Stderr, msg)
+				os.Exit(1)
+			}
+			state.Draft = fakeCLIHasFlag(rest, "--draft")
+			state.DraftToggles++
+			saveBBState(state)
+			fmt.Println(fakeTWGPRJSON(state))
+			os.Exit(0)
+		}
+		if dest, ok := fakeCLIFlagValue(rest, "--dest"); ok {
+			// A retarget: like the real command it changes only the destination
+			// and leaves the title and description alone.
+			if msg := os.Getenv("FAKE_CLI_BB_REJECT_DEST_ON_UPDATE"); msg != "" {
+				fmt.Fprintln(os.Stderr, msg)
+				os.Exit(1)
+			}
+			if os.Getenv("FAKE_CLI_BB_IGNORE_DEST_ON_UPDATE") == "" {
+				state.Dest = dest
+			}
+			state.DestUpdates++
+			saveBBState(state)
+			fmt.Println(fakeTWGPRJSON(state))
+			os.Exit(0)
+		}
+		if title, ok := fakeCLIFlagValue(rest, "--title"); ok {
+			if os.Getenv("FAKE_CLI_BB_REJECT_TITLE_ON_UPDATE") != "" {
+				fmt.Fprintln(os.Stderr, "author title would be overwritten")
+				os.Exit(1)
+			}
+			state.Title = title
+		}
+		descFile, _ := fakeCLIFlagValue(rest, "--description-file")
+		state.Description = fakeReadDescriptionFile(descFile)
+		state.Puts++
+		saveBBState(state)
+		fmt.Println(fakeTWGPRJSON(state))
+		os.Exit(0)
+	case "comment":
+		fakeTWGComment(rest)
+	default:
+		fmt.Fprintln(os.Stderr, "unsupported twg bb pull-requests argv:", strings.Join(args, " "))
+		os.Exit(1)
+	}
+}
+
+// fakeTWGComment serves `twg bb pull-requests comment query|create|resolve`
+// from the JSON array in FAKE_CLI_BB_COMMENTS_FILE, so a test seeds the
+// comments a pull request carries and reads back what the pipeline wrote:
+// create appends a reply (with its parent, as Bitbucket reports it) and
+// resolve stamps the comment's resolution.
+func fakeTWGComment(args []string) {
+	if os.Getenv("FAKE_CLI_BB_COMMENTS_FAIL") != "" {
+		fmt.Fprintln(os.Stderr, "twg bb pull-requests comment: the comment API is down")
+		os.Exit(1)
+	}
+	path := os.Getenv("FAKE_CLI_BB_COMMENTS_FILE")
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "unsupported twg bb pull-requests comment argv:", strings.Join(args, " "))
+		os.Exit(1)
+	}
+	if path == "" {
+		// No comments seeded: a PR with none. Writes have nowhere to land.
+		if args[0] != "query" {
+			fmt.Fprintln(os.Stderr, "twg bb pull-requests comment: no comment store seeded for", args[0])
+			os.Exit(1)
+		}
+		fmt.Println("[]")
+		os.Exit(0)
+	}
+	var comments []map[string]any
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &comments); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	save := func() {
+		data, err := json.Marshal(comments)
+		if err == nil {
+			err = os.WriteFile(path, data, 0o644)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "query":
+		data, err := json.Marshal(comments)
+		if err != nil || comments == nil {
+			data = []byte("[]")
+		}
+		fmt.Println(string(data))
+	case "create":
+		text, _ := fakeCLIFlagValue(rest, "--text")
+		replyTo, _ := fakeCLIFlagValue(rest, "--reply-to")
+		account := os.Getenv("FAKE_CLI_BB_ACCOUNT_ID")
+		if account == "" {
+			account = "712020:fake-self"
+		}
+		next := 9000 + len(comments)
+		comment := map[string]any{
+			"id":      next,
+			"content": map[string]any{"raw": text},
+			"user":    map[string]any{"type": "user", "display_name": "Fake User", "account_id": account},
+		}
+		if replyTo != "" {
+			var parent int
+			fmt.Sscanf(replyTo, "%d", &parent)
+			comment["parent"] = map[string]any{"id": parent}
+		}
+		comments = append(comments, comment)
+		save()
+		fmt.Printf("{\"id\":%d}\n", next)
+	case "resolve":
+		id, _ := fakeCLIFlagValue(rest, "--comment")
+		found := false
+		for _, comment := range comments {
+			if fmt.Sprint(comment["id"]) == id {
+				comment["resolution"] = map[string]any{"type": "comment_resolution"}
+				found = true
+			}
+		}
+		if !found {
+			fmt.Fprintln(os.Stderr, "twg bb pull-requests comment resolve: no such comment", id)
+			os.Exit(1)
+		}
+		save()
+		fmt.Println("{}")
+	default:
+		fmt.Fprintln(os.Stderr, "unsupported twg bb pull-requests comment argv:", strings.Join(args, " "))
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func fakeReadDescriptionFile(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	return string(data)
+}
+
+func fakeTWGPipeline(args []string) {
+	if len(args) == 0 || args[0] != "get" {
+		fmt.Fprintln(os.Stderr, "unsupported twg bb pipeline argv:", strings.Join(args, " "))
+		os.Exit(1)
+	}
+	rest := args[1:]
+	build, _ := fakeCLIFlagValue(rest, "--pipeline")
+	log := os.Getenv("FAKE_CLI_BB_PIPELINE_LOG_" + build)
+	if log == "" {
+		log = os.Getenv("FAKE_CLI_BB_PIPELINE_LOG")
+	}
+	fmt.Println(log)
+	os.Exit(0)
+}
+
 func fakeGraphQLRepo(args []string) string {
 	var owner, name string
 	for _, arg := range args {
@@ -1450,4 +1954,13 @@ func fakeGraphQLRepo(args []string) string {
 		return ""
 	}
 	return owner + "/" + name
+}
+
+func fakeCLIArgsHaveFlag(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == flag {
+			return true
+		}
+	}
+	return false
 }

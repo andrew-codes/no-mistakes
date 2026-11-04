@@ -679,6 +679,10 @@ func TestEveryJSONCallPassesOutputSummaryNone(t *testing.T) {
 			"bb pull-requests get 42 --statuses --workspace ws --repo repo " + flags},
 		{"GetMergeableState", "[]", func(h *Host) error { _, err := h.GetMergeableState(context.Background(), pr); return err },
 			"bb pull-requests mergeability 42 --workspace ws --repo repo " + flags},
+		{"GetPRBaseBranch", `{"id":42,"destination":{"branch":{"name":"main"}}}`, func(h *Host) error { _, err := h.GetPRBaseBranch(context.Background(), pr); return err },
+			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
+		{"SetPRBaseBranch", prJSON, func(h *Host) error { return h.SetPRBaseBranch(context.Background(), pr, "main") },
+			"bb pull-requests update --pull-request 42 --dest main --workspace ws --repo repo " + flags},
 		{"GetPRContent", prJSON, func(h *Host) error { _, err := h.GetPRContent(context.Background(), pr); return err },
 			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
 	}
@@ -747,5 +751,58 @@ func TestFindPRRejectsSummaryEnvelope(t *testing.T) {
 	h := New(capturingCmdFactory(new([]capturedCmd), bbTestResponse{stdout: "summary: output too large\nfile: /tmp/x.json\n"}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, false)
 	if _, err := h.FindPR(context.Background(), "feature", ""); err == nil {
 		t.Fatal("expected an error for a YAML summary envelope")
+	}
+}
+
+func TestSetPRDraftTogglesWithDraftAndReadyFlags(t *testing.T) {
+	for _, tc := range []struct {
+		draft    bool
+		wantFlag string
+		notFlag  string
+	}{
+		{true, "--draft", "--ready"},
+		{false, "--ready", "--draft"},
+	} {
+		var rec []capturedCmd
+		h := New(capturingCmdFactory(&rec, bbTestResponse{stdout: `{"id":42,"state":"OPEN"}`}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, true)
+		if err := h.SetPRDraft(context.Background(), &scm.PR{Number: "42"}, tc.draft); err != nil {
+			t.Fatalf("SetPRDraft(%v) error = %v", tc.draft, err)
+		}
+		got := strings.Join(append([]string{rec[0].name}, rec[0].args...), " ")
+		if !strings.Contains(got, "pull-requests update --pull-request 42 "+tc.wantFlag) || strings.Contains(got, tc.notFlag) {
+			t.Fatalf("SetPRDraft(%v) command = %q", tc.draft, got)
+		}
+		if strings.Contains(got, "--description") || strings.Contains(got, "--title") {
+			t.Fatalf("a draft toggle must not rewrite the title or description: %q", got)
+		}
+	}
+}
+
+func TestGetPRDraftReadsTheDraftFieldAndFailsClosedWithoutIt(t *testing.T) {
+	get := "twg bb pull-requests get 42 --workspace ws --repo repo -o json --output-summary none"
+	for _, tc := range []struct {
+		name    string
+		stdout  string
+		want    bool
+		wantErr bool
+	}{
+		{name: "draft", stdout: `{"id":42,"state":"OPEN","draft":true}`, want: true},
+		{name: "ready", stdout: `{"id":42,"state":"OPEN","draft":false}`},
+		{name: "missing field is not read as ready", stdout: `{"id":42,"state":"OPEN"}`, wantErr: true},
+	} {
+		h := New(bbTestCmdFactory(map[string]bbTestResponse{get: {stdout: tc.stdout}}), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, true)
+		got, err := h.GetPRDraft(context.Background(), &scm.PR{Number: "42"})
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("%s: GetPRDraft = %v, %v; want %v (err %v)", tc.name, got, err, tc.want, tc.wantErr)
+		}
+	}
+}
+
+func TestDraftLifecycleFollowsTheDraftSetting(t *testing.T) {
+	for _, draft := range []bool{true, false} {
+		h := New(bbTestCmdFactory(nil), func() bool { return true }, RepoRef{Workspace: "ws", RepoSlug: "repo"}, draft)
+		if h.DraftLifecycle() != draft {
+			t.Errorf("DraftLifecycle() = %v, want %v", h.DraftLifecycle(), draft)
+		}
 	}
 }

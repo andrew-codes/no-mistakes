@@ -642,7 +642,7 @@ Accepts any Go `time.ParseDuration` string: `30m`, `2h`, `4h30m`, etc.
 
 This is an idle timeout, not an absolute deadline: every time the base branch advances, the monitor re-arms it.
 So an actively-updated green PR keeps its monitor no matter how long it stays open; under [`ci.release_after_checks_pass`](#cirelease_after_checks_pass) that watch ends at the checks verdict instead.
-If it later develops an actual merge conflict (on GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, or a provider plugin declaring `mergeable_state`), the CI auto-fix path rebases it, revalidates from Review because rebasing cannot prove continuity with the reviewed head, and publishes it through Push.
+If it later develops an actual merge conflict (on GitHub, GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, Cursor Origin, or a provider plugin declaring `mergeable_state`), the CI auto-fix path rebases it, revalidates from Review because rebasing cannot prove continuity with the reviewed head, and publishes it through Push.
 A clean behind PR needs no command, except on GitHub when the base requires up-to-date branches (`mergeStateStatus: BEHIND`): that PR waits for a human to bring it up to date, unless [`ci.rebase_behind`](#cirebase_behind) is on.
 A genuinely idle/abandoned PR still parks at an approval gate after the timeout elapses.
 While that CI gate is parked, the daemon continues bounded read-only PR-state checks.
@@ -1022,7 +1022,7 @@ For empty `commands.lint`, the document step's combined housekeeping pass also a
 | `auto_fix.test`     | `int` | `3`     | Test failure auto-fix attempts                                                              |
 | `auto_fix.document` | `int` | `3`     | Not used by the automatic document pass                                                     |
 | `auto_fix.lint`     | `int` | `3`     | Lint issue auto-fix attempts                                                                |
-| `auto_fix.ci`       | `int` | `3`     | CI auto-fix attempts for CI failures, plus merge conflicts on GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, and provider plugins declaring `mergeable_state` |
+| `auto_fix.ci`       | `int` | `3`     | CI auto-fix attempts for CI failures, plus merge conflicts on GitHub, GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, Cursor Origin, and provider plugins declaring `mergeable_state` |
 
 Legacy alias: `auto_fix.babysit`.
 
@@ -1620,14 +1620,14 @@ This is a global default. Per-repo config can override it via `providers.gitlab.
 
 ### providers.bitbucket.draft_pull_requests
 
-Open pull requests created on Bitbucket Cloud as drafts (`"draft": true` in the create-PR API request).
+Keep Bitbucket Cloud pull requests as drafts until the run has proved them ready. The PR step opens a new PR as a draft (`twg bb pull-requests create --draft`) and puts an existing one back to draft when a new run starts validating new content (`twg bb pull-requests update --draft`). A rerun at a head an earlier run already pushed to that same PR, such as a description refresh, adds nothing to validate: it leaves the PR's draft or ready state exactly as it found it, at the start and at the end of the run, so it neither flips a ready PR to draft nor publishes a draft. When a run that changed the PR ends, the PR is marked ready (`update --ready`) only if the run completed (or ended at `checks_passed`) with every step passed (no approval override), every check is green, no review comment is waiting for a reply, Bitbucket reports no merge conflict, and the description was regenerated for the final state. Bitbucket does not evaluate a draft's mergeability, so the CI monitor does not wait for it while the PR is a draft; a draft whose checks are green and whose comments are answered ends the CI step at the checks verdict, since only the run's end can publish it. Otherwise it stays a draft.
 
 | | |
 |---|---|
 | Type | `bool` |
-| Default | `false` |
+| Default | `true` |
 
-Only affects PR creation; existing PRs are not toggled between draft and ready. Bitbucket only — ignored for other providers.
+Set it to `false` to open PRs ready for review and never toggle draft state. Bitbucket only - ignored for other providers.
 This is a global default. Per-repo config can override it via `providers.bitbucket.draft_pull_requests`.
 
 ### providers.azuredevops.draft_pull_requests

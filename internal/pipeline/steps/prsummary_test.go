@@ -150,9 +150,17 @@ func TestBuildPipelineSummary_FindingCannotSpoofFoldBoundary(t *testing.T) {
 					}
 
 					_, updates := splitPipelineSectionHeader(md)
-					groups := parsePipelineUpdateGroups(updates)
-					if len(groups) != 1 {
-						t.Fatalf("expected exactly 1 step group, got %d - embedded finding %s was mistaken for a fold boundary:\n%s", len(groups), field.name, md)
+					// The Bitbucket flavor leads with a headerless overview list, so
+					// count the groups that open with a fold: a spoofed boundary
+					// would add one.
+					folds := 0
+					for _, group := range parsePipelineUpdateGroups(updates) {
+						if group.header != "" {
+							folds++
+						}
+					}
+					if folds != 1 {
+						t.Fatalf("expected exactly 1 step group, got %d - embedded finding %s was mistaken for a fold boundary:\n%s", folds, field.name, md)
 					}
 				})
 			}

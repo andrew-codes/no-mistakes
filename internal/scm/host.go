@@ -349,6 +349,13 @@ type Capabilities struct {
 	FailedCheckLogs bool
 	MergedProof     bool
 	ReviewComments  bool
+	// ReviewCommentReplies declares that the provider's ReviewCommentsHost
+	// reads EVERY unresolved human and bot comment (not only review-bot
+	// ones) and that the host implements ReviewCommentResponder. The CI step
+	// then turns each comment into an auto-fix finding, has the fix agent
+	// address it, and replies on the thread afterwards. Providers without it
+	// keep the review-bot-only, ask-user behavior.
+	ReviewCommentReplies bool
 	// ClosingReferences declares that the provider closes issues from a
 	// closing keyword in the pull request body ("Closes #42"), which is what
 	// makes an explicitly requested --closes reference render and verify. False
@@ -422,6 +429,34 @@ type ReviewComment struct {
 // unresolved review comments on a pull request.
 type ReviewCommentsHost interface {
 	GetReviewComments(ctx context.Context, pr *PR) ([]ReviewComment, error)
+}
+
+// ReviewCommentResponder is implemented by hosts that can answer a review
+// comment: a reply on its thread, and resolving the thread. A host that
+// declares Capabilities().ReviewCommentReplies implements it, and its
+// GetReviewComments must stop returning a comment once a reply from
+// ReplyToReviewComment exists on its thread, so a handled comment is never
+// raised, or answered, twice.
+type ReviewCommentResponder interface {
+	// ReplyToReviewComment posts body as a reply to the comment.
+	ReplyToReviewComment(ctx context.Context, pr *PR, commentID, body string) error
+	// ResolveReviewComment resolves the comment's thread. A provider without
+	// resolvable threads returns ErrUnsupported.
+	ResolveReviewComment(ctx context.Context, pr *PR, commentID string) error
+}
+
+// PRDraftController is implemented by hosts that can read and toggle a PR's
+// draft state. A PR is opened as a draft and published as ready only once its
+// run has passed, so the PR step and the end-of-run finalizer drive this to
+// keep a PR from claiming ready while it is not.
+type PRDraftController interface {
+	// DraftLifecycle reports whether the host is configured to keep PRs in
+	// draft until they are ready. False leaves draft state entirely alone.
+	DraftLifecycle() bool
+	// GetPRDraft reports whether the PR is currently a draft.
+	GetPRDraft(ctx context.Context, pr *PR) (bool, error)
+	// SetPRDraft converts the PR to a draft (true) or marks it ready (false).
+	SetPRDraft(ctx context.Context, pr *PR, draft bool) error
 }
 
 // PRContentReader is an optional interface for hosts that can read the current

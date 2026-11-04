@@ -85,6 +85,10 @@ type CIStep struct {
 	// set only for the duration of that repair's recording. recordRepair
 	// proves a pure replay against exactly this commit and nothing else.
 	replayBase string
+	// answeredComments are the review comments this step has already replied
+	// to, so a provider listing that lags its own thread never gets a second
+	// reply.
+	answeredComments map[string]bool
 }
 
 // SetPollIntervalOverride is a test hook; production leaves the override unset.
@@ -528,6 +532,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 	// rebase and a full revalidation on a head that is stale again at once.
 	behindBaseTip := ""
 	mergeabilityBlockedReason := ""
+	draftMergeabilityLogged := false
 	var timeoutFailingChecks []scm.CheckTarget
 	lastCheckHeadSHA := sctx.Run.HeadSHA
 	var timeoutExternalReviews []scm.Check
@@ -599,6 +604,10 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		pollBaseTip := ""
 		botCommentReadFailed := false
 		behindObserved := false
+		// commentsRead is set once this poll has already read the review
+		// comments (the green path does, before it reports anything), so the
+		// wait below does not read them a second time.
+		commentsRead := false
 
 		if !unlimited && now().Sub(timeoutAnchor) >= timeout {
 			return timeoutOutcome()
@@ -687,6 +696,17 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 				// the green PR reports checks-passed and waits for a human.
 				mergeBehind = mergeState.Behind() && sctx.Config != nil && sctx.Config.CI.RebaseBehind
 				mergeabilityKnown = mergeState.Resolved()
+				if !mergeabilityKnown && mergeState == scm.MergeablePending && draftAwaitsPublication(ctx, host, pr) {
+					// Nothing is known about conflicts, and nothing can be until
+					// the PR leaves draft, which only this run's end does. The
+					// verdict rests on what is provable: checks, review
+					// comments, and any merge check the forge did report failed.
+					mergeabilityKnown = true
+					if !draftMergeabilityLogged {
+						draftMergeabilityLogged = true
+						sctx.Log("pull request is a draft and its mergeability is not reported until it is published; judging it on checks and comments")
+					}
+				}
 				if !mergeabilityKnown {
 					sctx.Log(fmt.Sprintf("mergeable state still pending: %s", mergeState))
 					mergeabilityBlockedReason = fmt.Sprintf("PR mergeability remained unresolved before timeout: %s", mergeState)
@@ -929,6 +949,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 						mergeConflict:       mergeConflict,
 						reruns:              s.transientReruns.used,
 						botComments:         reviewBotComments(sctx, host, pr, checks),
+						reviewComments:      s.bestEffortReviewComments(sctx, host, pr),
 						greenBots:           reviewBotCommentsAlways(sctx),
 					})
 					if hold := humanHoldMessage(checks); hold != "" {
@@ -988,6 +1009,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 							return nil, err
 						}
 						lastMonitorLog = ciMonitorStatus{}
+						commentsRead = true
 						botCommentReadFailed = true
 						consecutiveBotCommentErrs++
 						sctx.Log(fmt.Sprintf("warning: could not read review bot comments: %v", botErr))
@@ -997,6 +1019,7 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 						}
 						break
 					}
+					commentsRead = true
 					if len(botFindings.Items) > 0 {
 						if err := clearCIMonitorReady(sctx); err != nil {
 							return nil, err
@@ -1040,7 +1063,17 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 					// ci.release_after_checks_pass opts into finishing here
 					// instead, which records the checks verdict and releases the
 					// run's worktree and lane.
-					if releaseAfterChecksPass {
+					release := releaseAfterChecksPass
+					if !release && draftAwaitsPublication(ctx, host, pr) {
+						// A draft cannot be merged, and the run's end is what
+						// publishes it (the draft lifecycle's ready rule). Watching
+						// it until it merges would wait for the very step this wait
+						// holds back, so green checks end the monitor the way
+						// ci.release_after_checks_pass does.
+						release = true
+						sctx.Log("pull request is a draft awaiting this run's verdict: releasing the run to publish it")
+					}
+					if release {
 						completeMsg := ciChecksPassedCompleteMsg
 						if declaredNoCI {
 							completeMsg = ciNoChecksPassedCompleteMsg
@@ -1072,6 +1105,28 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (outcome *pipeline.StepOutc
 		}
 		if !behindObserved {
 			behindBaseTip = ""
+		}
+		// Reaching this point means the poll is about to wait: it neither
+		// settled on issues nor reported a verdict. Feedback left on the PR
+		// meanwhile is still a request, so it is raised now, on the same
+		// cadence as the checks, instead of after they settle. That holds
+		// for a draft awaiting publication too: the draft is never touched
+		// here, only the comments on it are answered.
+		if !commentsRead {
+			if comments := s.bestEffortReviewComments(sctx, host, pr); len(comments) > 0 {
+				if err := clearCIMonitorReady(sctx); err != nil {
+					return nil, err
+				}
+				sctx.DeferredFindings = ""
+				findings := ciObservationFindings(ciIssues{
+					provider:        host.Provider(),
+					requiredReviews: requiredReviews(sctx),
+					checks:          checks,
+					reviewComments:  comments,
+				})
+				sctx.Log(fmt.Sprintf("review feedback arrived while waiting: %s", findings.Summary))
+				return ciObservationOutcome(findings), nil
+			}
 		}
 		woken, err := waitForPoll()
 		if err != nil {

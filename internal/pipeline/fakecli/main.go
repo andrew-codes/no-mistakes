@@ -1487,6 +1487,12 @@ type bbFakeState struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Puts        int    `json:"puts"`
+	// Draft is the PR's draft state; DraftToggles counts `update --draft` and
+	// `update --ready` calls.
+	Draft        bool `json:"draft,omitempty"`
+	DraftToggles int  `json:"draft_toggles,omitempty"`
+	// DestUpdates counts `update --dest` retargets.
+	DestUpdates int `json:"dest_updates,omitempty"`
 	// Source, Dest and SourceCommit describe the primary PR for `query`
 	// filtering and output. Empty Source/Dest match any filter, so a state file
 	// that never set them behaves as before.
@@ -1545,6 +1551,16 @@ func fakeTWGHandler(args []string) {
 		if authErr := os.Getenv("FAKE_CLI_AUTH_ERR"); authErr != "" {
 			fmt.Fprintln(os.Stderr, authErr)
 			os.Exit(1)
+		}
+		if v, ok := fakeCLIFlagValue(args, "-o"); ok && v == "json" {
+			// `twg whoami -o json`: the account id the adapter compares comment
+			// authors against.
+			account := os.Getenv("FAKE_CLI_BB_ACCOUNT_ID")
+			if account == "" {
+				account = "712020:fake-self"
+			}
+			fmt.Printf("{\"apiVersion\":\"v2\",\"data\":{\"accountId\":%q,\"name\":\"Fake User\"}}\n", account)
+			os.Exit(0)
 		}
 		fmt.Println("Fake User")
 		os.Exit(0)
@@ -1704,6 +1720,7 @@ func fakeTWGPullRequests(args []string) {
 			"title":       state.Title,
 			"description": state.Description,
 			"state":       state.State,
+			"draft":       state.Draft,
 			"links":       map[string]any{"html": map[string]string{"href": state.URL}},
 		}
 		if payload["state"] == "" {
@@ -1711,6 +1728,9 @@ func fakeTWGPullRequests(args []string) {
 		}
 		if sourceCommit := os.Getenv("FAKE_CLI_BB_SOURCE_COMMIT"); sourceCommit != "" {
 			payload["source"] = map[string]any{"commit": map[string]string{"hash": sourceCommit}}
+		}
+		if state.Dest != "" {
+			payload["destination"] = map[string]any{"branch": map[string]string{"name": state.Dest}}
 		}
 		if fakeCLIHasFlag(rest, "--statuses") {
 			statuses := os.Getenv("FAKE_CLI_BB_STATUSES_JSON")
@@ -1748,10 +1768,38 @@ func fakeTWGPullRequests(args []string) {
 		}
 		state.Title = title
 		state.Description = description
+		state.Draft = fakeCLIHasFlag(rest, "--draft")
 		saveBBState(state)
 		fmt.Println(fakeTWGPRJSON(state))
 		os.Exit(0)
 	case "update":
+		if fakeCLIHasFlag(rest, "--draft") || fakeCLIHasFlag(rest, "--ready") {
+			// A draft toggle changes only the draft state.
+			if msg := os.Getenv("FAKE_CLI_BB_REJECT_DRAFT_TOGGLE"); msg != "" {
+				fmt.Fprintln(os.Stderr, msg)
+				os.Exit(1)
+			}
+			state.Draft = fakeCLIHasFlag(rest, "--draft")
+			state.DraftToggles++
+			saveBBState(state)
+			fmt.Println(fakeTWGPRJSON(state))
+			os.Exit(0)
+		}
+		if dest, ok := fakeCLIFlagValue(rest, "--dest"); ok {
+			// A retarget: like the real command it changes only the destination
+			// and leaves the title and description alone.
+			if msg := os.Getenv("FAKE_CLI_BB_REJECT_DEST_ON_UPDATE"); msg != "" {
+				fmt.Fprintln(os.Stderr, msg)
+				os.Exit(1)
+			}
+			if os.Getenv("FAKE_CLI_BB_IGNORE_DEST_ON_UPDATE") == "" {
+				state.Dest = dest
+			}
+			state.DestUpdates++
+			saveBBState(state)
+			fmt.Println(fakeTWGPRJSON(state))
+			os.Exit(0)
+		}
 		if title, ok := fakeCLIFlagValue(rest, "--title"); ok {
 			if os.Getenv("FAKE_CLI_BB_REJECT_TITLE_ON_UPDATE") != "" {
 				fmt.Fprintln(os.Stderr, "author title would be overwritten")
@@ -1765,10 +1813,104 @@ func fakeTWGPullRequests(args []string) {
 		saveBBState(state)
 		fmt.Println(fakeTWGPRJSON(state))
 		os.Exit(0)
+	case "comment":
+		fakeTWGComment(rest)
 	default:
 		fmt.Fprintln(os.Stderr, "unsupported twg bb pull-requests argv:", strings.Join(args, " "))
 		os.Exit(1)
 	}
+}
+
+// fakeTWGComment serves `twg bb pull-requests comment query|create|resolve`
+// from the JSON array in FAKE_CLI_BB_COMMENTS_FILE, so a test seeds the
+// comments a pull request carries and reads back what the pipeline wrote:
+// create appends a reply (with its parent, as Bitbucket reports it) and
+// resolve stamps the comment's resolution.
+func fakeTWGComment(args []string) {
+	if os.Getenv("FAKE_CLI_BB_COMMENTS_FAIL") != "" {
+		fmt.Fprintln(os.Stderr, "twg bb pull-requests comment: the comment API is down")
+		os.Exit(1)
+	}
+	path := os.Getenv("FAKE_CLI_BB_COMMENTS_FILE")
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "unsupported twg bb pull-requests comment argv:", strings.Join(args, " "))
+		os.Exit(1)
+	}
+	if path == "" {
+		// No comments seeded: a PR with none. Writes have nowhere to land.
+		if args[0] != "query" {
+			fmt.Fprintln(os.Stderr, "twg bb pull-requests comment: no comment store seeded for", args[0])
+			os.Exit(1)
+		}
+		fmt.Println("[]")
+		os.Exit(0)
+	}
+	var comments []map[string]any
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &comments); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	save := func() {
+		data, err := json.Marshal(comments)
+		if err == nil {
+			err = os.WriteFile(path, data, 0o644)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "query":
+		data, err := json.Marshal(comments)
+		if err != nil || comments == nil {
+			data = []byte("[]")
+		}
+		fmt.Println(string(data))
+	case "create":
+		text, _ := fakeCLIFlagValue(rest, "--text")
+		replyTo, _ := fakeCLIFlagValue(rest, "--reply-to")
+		account := os.Getenv("FAKE_CLI_BB_ACCOUNT_ID")
+		if account == "" {
+			account = "712020:fake-self"
+		}
+		next := 9000 + len(comments)
+		comment := map[string]any{
+			"id":      next,
+			"content": map[string]any{"raw": text},
+			"user":    map[string]any{"type": "user", "display_name": "Fake User", "account_id": account},
+		}
+		if replyTo != "" {
+			var parent int
+			fmt.Sscanf(replyTo, "%d", &parent)
+			comment["parent"] = map[string]any{"id": parent}
+		}
+		comments = append(comments, comment)
+		save()
+		fmt.Printf("{\"id\":%d}\n", next)
+	case "resolve":
+		id, _ := fakeCLIFlagValue(rest, "--comment")
+		found := false
+		for _, comment := range comments {
+			if fmt.Sprint(comment["id"]) == id {
+				comment["resolution"] = map[string]any{"type": "comment_resolution"}
+				found = true
+			}
+		}
+		if !found {
+			fmt.Fprintln(os.Stderr, "twg bb pull-requests comment resolve: no such comment", id)
+			os.Exit(1)
+		}
+		save()
+		fmt.Println("{}")
+	default:
+		fmt.Fprintln(os.Stderr, "unsupported twg bb pull-requests comment argv:", strings.Join(args, " "))
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 func fakeReadDescriptionFile(path string) string {

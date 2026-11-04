@@ -108,9 +108,11 @@ func (h *Host) Provider() scm.Provider { return scm.ProviderBitbucket }
 
 // Capabilities reports Bitbucket's feature matrix. MergeableState is read from
 // the PR's merge checks (`twg bb pull-requests mergeability`), not from a
-// merge-conflict probe of its own.
+// merge-conflict probe of its own. ReviewComments and ReviewCommentReplies
+// declare the comment thread support in review_comments.go: every unresolved
+// human and bot comment is readable and each can be answered.
 func (h *Host) Capabilities() scm.Capabilities {
-	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true}
+	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true, ReviewComments: true, ReviewCommentReplies: true}
 }
 
 func (h *Host) Available(ctx context.Context) error {
@@ -135,6 +137,7 @@ func (h *Host) repoArgs() []string {
 type bitbucketPullRequest struct {
 	ID    int    `json:"id"`
 	State string `json:"state"`
+	Draft bool   `json:"draft"`
 	Links struct {
 		HTML struct {
 			Href string `json:"href"`
@@ -173,7 +176,56 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 	if len(items) == 0 {
 		return nil, nil
 	}
-	return items[0].toPR(h.repo), nil
+	// The listing carries the destination, so an existing PR's live base is
+	// known without a second read.
+	pr := items[0].toPR(h.repo)
+	pr.BaseBranch = strings.TrimSpace(items[0].Destination.Branch.Name)
+	return pr, nil
+}
+
+// GetPRBaseBranch implements scm.PRBaseBranchReader: the PR's destination
+// branch, read from `twg bb pull-requests get`. A response without one is an
+// error, never an empty base the caller could mistake for "unset".
+func (h *Host) GetPRBaseBranch(ctx context.Context, pr *scm.PR) (string, error) {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return "", errors.New("twg bb pull-requests get: missing pull request number")
+	}
+	view, _, err := h.getPR(ctx, strings.TrimSpace(pr.Number))
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSpace(view.Destination.Branch.Name)
+	if base == "" {
+		return "", fmt.Errorf("twg bb pull-requests get: pull request %s has no destination branch", pr.Number)
+	}
+	return base, nil
+}
+
+// SetPRBaseBranch implements scm.PRBaseRetargeter with `twg bb pull-requests
+// update --dest`. twg echoes the updated PR; when that echo names a
+// destination it must be the requested one, so a silently ignored flag cannot
+// read as a successful retarget.
+func (h *Host) SetPRBaseBranch(ctx context.Context, pr *scm.PR, baseBranch string) error {
+	baseBranch = strings.TrimSpace(baseBranch)
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return errors.New("twg bb pull-requests update: missing pull request number")
+	}
+	if baseBranch == "" {
+		return errors.New("twg bb pull-requests update: missing destination branch")
+	}
+	args := []string{"bb", "pull-requests", "update", "--pull-request", strings.TrimSpace(pr.Number), "--dest", baseBranch}
+	args = append(args, h.repoArgs()...)
+	out, err := h.runJSON(ctx, args)
+	if err != nil {
+		return fmt.Errorf("twg bb pull-requests update: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var updated bitbucketPullRequest
+	if trimmed := bytesTrimToJSON(out); len(trimmed) > 0 && json.Unmarshal(trimmed, &updated) == nil {
+		if got := strings.TrimSpace(updated.Destination.Branch.Name); got != "" && got != baseBranch {
+			return fmt.Errorf("twg bb pull-requests update: pull request %s still targets %s, not %s", pr.Number, got, baseBranch)
+		}
+	}
+	return nil
 }
 
 // queryPRs lists PRs from branch in one state. It returns an error for any
@@ -343,6 +395,48 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 		return nil, fmt.Errorf("twg bb pull-requests update: invalid JSON output: %s", strings.TrimSpace(string(out)))
 	}
 	return updated.toPR(h.repo), nil
+}
+
+// DraftLifecycle reports whether PRs are opened as drafts and kept there until
+// the run proves them ready (providers.bitbucket.draft_pull_requests).
+func (h *Host) DraftLifecycle() bool { return h.draft }
+
+func (h *Host) GetPRDraft(ctx context.Context, pr *scm.PR) (bool, error) {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return false, errors.New("twg bb pull-requests get: missing pull request number")
+	}
+	view, trimmed, err := h.getPR(ctx, pr.Number)
+	if err != nil {
+		return false, err
+	}
+	// A response without the field would read as "ready" and let a draft be
+	// published by mistake, so absence is an error rather than false.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return false, fmt.Errorf("twg bb pull-requests get: invalid JSON output: %s", strings.TrimSpace(string(trimmed)))
+	}
+	if _, ok := raw["draft"]; !ok {
+		return false, errors.New("twg bb pull-requests get: response does not report the draft state")
+	}
+	return view.Draft, nil
+}
+
+// SetPRDraft toggles draft state with `twg bb pull-requests update --draft` or
+// `--ready`, without touching the title or description.
+func (h *Host) SetPRDraft(ctx context.Context, pr *scm.PR, draft bool) error {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return errors.New("twg bb pull-requests update: missing pull request number")
+	}
+	flag := "--ready"
+	if draft {
+		flag = "--draft"
+	}
+	args := []string{"bb", "pull-requests", "update", "--pull-request", pr.Number, flag}
+	args = append(args, h.repoArgs()...)
+	if out, err := h.runJSON(ctx, args); err != nil {
+		return fmt.Errorf("twg bb pull-requests update %s: %s: %w", flag, strings.TrimSpace(string(out)), err)
+	}
+	return nil
 }
 
 func (h *Host) getPR(ctx context.Context, number string, extraArgs ...string) (bitbucketPullRequest, []byte, error) {
@@ -823,3 +917,8 @@ func bytesTrimToJSON(out []byte) []byte {
 	}
 	return out[idx:]
 }
+
+var (
+	_ scm.PRBaseBranchReader = (*Host)(nil)
+	_ scm.PRBaseRetargeter   = (*Host)(nil)
+)

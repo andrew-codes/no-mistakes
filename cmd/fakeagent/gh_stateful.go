@@ -95,12 +95,18 @@ func runGhStatefulPRStub(args []string) int {
 	case "list":
 		head := argAfter(args, "--head")
 		out := []map[string]any{}
-		if pr := state.PRs[head]; pr != nil && pr.State == "OPEN" {
+		// Like gh, list the open PRs unless --state names another one.
+		wantState := strings.ToUpper(argAfter(args, "--state"))
+		if wantState == "" {
+			wantState = "OPEN"
+		}
+		if pr := state.PRs[head]; pr != nil && pr.State == wantState {
 			out = append(out, map[string]any{
 				"number":              pr.Number,
 				"url":                 pr.URL,
 				"baseRefName":         pr.Base,
 				"headRefName":         pr.Head,
+				"headRefOid":          ghStatefulHeadOID(repo, pr.Head),
 				"headRepositoryOwner": map[string]string{"login": strings.Split(repo, "/")[0]},
 			})
 		}

@@ -92,7 +92,9 @@ type testingSummaryOptions struct {
 	compactArtifacts     bool
 	summaryParagraph     bool
 	omitOutcome          bool
-	repoRoot             string
+	// ciPassed is the finished run's known CI result for a Test exception note.
+	ciPassed bool
+	repoRoot string
 	// evidenceRoot is the run's evidence directory. Together with repoRoot it
 	// is the allowlist for absolute artifact paths an agent reported: a path
 	// under neither is dropped rather than rendered into the PR body. Empty
@@ -106,6 +108,9 @@ type testingSummaryOptions struct {
 	// uploaded at PR render time. Nil means nothing was uploaded; the renderer
 	// then keeps today's local-path or commit-pinned link.
 	attachments map[string]string
+	// carried maps a skipped Test step's ID to the earlier same-head run's
+	// recorded result, rendered in its place and labelled as carried over.
+	carried map[string]*carriedStep
 }
 
 // BuildPipelineSummary produces a deterministic markdown section from step results and rounds.
@@ -122,6 +127,37 @@ func BuildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 
 type pipelineAttestationPolicy struct {
 	AllowTestCommandOverride string
+	// Final renders the end-of-run description: every step's detail shows only
+	// its latest round's findings (earlier rounds collapse to a one-line count,
+	// since whatever they raised was either fixed or is repeated by the latest
+	// round), and the section opens with the run's outcome.
+	Final bool
+	// Outcome is the one-line run outcome shown when Final is set.
+	Outcome string
+	// CIPassed is set only when the finished run already knows CI passed on
+	// the PR head, so a Test exception can name the real gate beside it.
+	CIPassed bool
+	// TestingCovers names what the same description's Testing section already
+	// says about the Test step, so its Pipeline group does not repeat it.
+	TestingCovers testingCoverage
+	// Carried maps a skipped step's ID to the earlier same-head run's recorded
+	// result for it, rendered in the step's place and labelled as carried over.
+	// The attestation never reads it: it keeps this run's own statuses.
+	Carried map[string]*carriedStep
+}
+
+// testingCoverage records which Test-step facts the description's Testing
+// section already carries. It is set only for the no-HTML Bitbucket flavor,
+// whose Pipeline groups cannot fold the repeat away. When the body budget later
+// drops the Testing section, the facts it covered are shed with it, exactly as
+// the Testing section's own content already is.
+type testingCoverage struct {
+	// Verdict covers the accepted-exception note, the live-validation line and
+	// the scenario table.
+	Verdict bool
+	// Commands covers the tested commands, which the Testing section lists only
+	// outside compact mode.
+	Commands bool
 }
 
 func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.StepRound, headSHA string, provider scm.Provider, policy pipelineAttestationPolicy) (string, string) {
@@ -130,14 +166,17 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 	}
 
 	flavor := prBodyFlavorFor(provider)
-	var detailBlocks []string
+	// overview is the no-HTML flavor's one-line-per-step list. A step's own
+	// group follows it under a heading only when it has something to say, so a
+	// run of clean steps never reads as part of the heading above it.
+	var overview, detailBlocks []string
 
 	for _, sr := range steps {
 		if shouldOmitPipelineStep(sr) {
 			continue
 		}
-		stepRounds := rounds[sr.ID]
-		line, detail := buildStepEntry(sr, stepRounds, flavor)
+		entry, stepRounds, note := policy.Carried[sr.ID].viewOf(sr, rounds[sr.ID])
+		line, detail := buildStepEntryNoted(entry, stepRounds, flavor, policy.Final, policy.CIPassed, policy.TestingCovers, note)
 		if line != "" && detail != "" {
 			// Step details quote agent text (findings, fix summaries, tested
 			// commands). A foreign attestation comment in one lands after the
@@ -146,11 +185,18 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 			// worth holding: it survives any future reordering of this section
 			// and is what the regression asserts. The real attestation is
 			// emitted separately by buildPipelineAttestation and is untouched.
+			if flavor == prBodyMarkdown {
+				overview = append(overview, "- "+neutralizeAttestationMarkers(provider, line))
+				if strings.HasPrefix(detail, "### ") {
+					detailBlocks = append(detailBlocks, neutralizeAttestationMarkers(provider, detail))
+				}
+				continue
+			}
 			detailBlocks = append(detailBlocks, neutralizeAttestationMarkers(provider, detail))
 		}
 	}
 
-	if len(detailBlocks) == 0 {
+	if len(detailBlocks) == 0 && len(overview) == 0 {
 		return "", ""
 	}
 
@@ -158,9 +204,20 @@ func buildPipelineSummaryFor(steps []*db.StepResult, rounds map[string][]*db.Ste
 	b.WriteString("## Pipeline\n\n")
 	b.WriteString(noMistakesPRSignature)
 	b.WriteString("\n\n")
+	if policy.Final && policy.Outcome != "" {
+		b.WriteString(policy.Outcome)
+		b.WriteString("\n\n")
+	}
 	if flavor == prBodyHTML {
 		b.WriteString(buildPipelineAttestationWithPolicy(steps, rounds, headSHA, policy))
 		b.WriteString("\n\n")
+	}
+	if len(overview) > 0 {
+		b.WriteString(strings.Join(overview, "\n"))
+		b.WriteString("\n")
+		if len(detailBlocks) > 0 {
+			b.WriteString("\n")
+		}
 	}
 	for i, detail := range detailBlocks {
 		if i > 0 {
@@ -349,10 +406,16 @@ func BuildTestingSummaryForPR(steps []*db.StepResult, rounds map[string][]*db.St
 }
 
 func BuildTestingSummaryForPRWithProvider(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider) string {
-	return buildPRTestingSummary(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, nil, true)
+	return buildPRTestingSummary(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, nil, true, false)
 }
 
-func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact bool) string {
+func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact, ciPassed bool) string {
+	return buildPRTestingSummaryCarried(steps, rounds, upstreamURL, ref, repoRoot, evidenceRoot, links, provider, attachments, compact, ciPassed, nil)
+}
+
+// buildPRTestingSummaryCarried is buildPRTestingSummary with the skipped steps
+// whose earlier same-head result is shown in their place.
+func buildPRTestingSummaryCarried(steps []*db.StepResult, rounds map[string][]*db.StepRound, upstreamURL, ref, repoRoot, evidenceRoot string, links *evidenceLinks, provider scm.Provider, attachments map[string]string, compact, ciPassed bool, carried map[string]*carriedStep) string {
 	opts := testingSummaryOptionsForGitHub(upstreamURL, ref)
 	opts.flavor = prBodyFlavorFor(provider)
 	opts.compactArtifacts = compact
@@ -363,6 +426,8 @@ func buildPRTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepR
 	opts.evidenceRoot = evidenceRoot
 	opts.evidence = links
 	opts.attachments = attachments
+	opts.ciPassed = ciPassed
+	opts.carried = carried
 	return buildTestingSummary(steps, rounds, opts)
 }
 
@@ -372,18 +437,25 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 			continue
 		}
 
-		stepRounds := rounds[sr.ID]
-		line, _ := buildStepEntry(sr, stepRounds, opts.flavor)
+		sr, stepRounds, note := opts.carried[sr.ID].viewOf(sr, rounds[sr.ID])
+		line, _ := buildStepEntryNoted(sr, stepRounds, opts.flavor, false, false, testingCoverage{}, note)
 		if line == "" {
 			return ""
 		}
 
+		exceptionNote := ""
+		if ex, ok := testExceptionFor(sr, stepRounds); ok {
+			exceptionNote = testExceptionNote(ex, opts.ciPassed, opts.flavor)
+		}
 		testingSummary := collectTestingSummary(sr, stepRounds)
 		tested := collectTestingDetails(sr, stepRounds)
 		artifacts := collectTestingArtifacts(sr, stepRounds, opts)
 		scenarios := collectTestingScenarios(sr, stepRounds)
 		liveValidation := renderLiveValidationLine(scenarios, collectTestingVerdict(sr, stepRounds))
 		if testingSummary == "" && len(tested) == 0 && len(artifacts) == 0 && liveValidation == "" {
+			if exceptionNote != "" {
+				return "## Testing\n\n- " + line + "\n- " + exceptionNote
+			}
 			return "## Testing\n\n- " + line
 		}
 
@@ -400,6 +472,11 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 			writeTestingSummary(&b, compactTestedSummary(len(tested)), opts)
 			wroteSummary = true
 		}
+		if exceptionNote != "" {
+			b.WriteString("- ")
+			b.WriteString(exceptionNote)
+			b.WriteString("\n")
+		}
 		// The verdict and the scenario table come before the tested commands
 		// and the artifacts: they are the step's answer, and the commands and
 		// artifacts underneath are what it is based on.
@@ -415,13 +492,7 @@ func buildTestingSummary(steps []*db.StepResult, rounds map[string][]*db.StepRou
 		}
 		if opts.includeTestedDetails {
 			for _, detail := range tested {
-				rendered := renderTestedDetailFor(detail, opts.flavor)
-				if rendered == "" {
-					continue
-				}
-				b.WriteString("- ")
-				b.WriteString(rendered)
-				b.WriteString("\n")
+				b.WriteString(renderTestedDetailBullet(detail, opts.flavor))
 			}
 		}
 		renderState := testingArtifactRenderState{remainingEmbeddedBytes: maxEmbeddedArtifactsTotalBytes}
@@ -634,7 +705,7 @@ func appendTestingDetails(details []string, seen map[string]bool, raw *string) [
 		return details
 	}
 	for _, detail := range findings.Tested {
-		clean := sanitizePromptText(detail)
+		clean := sanitizeTestedDetail(detail)
 		if clean == "" || seen[clean] {
 			continue
 		}
@@ -644,23 +715,120 @@ func appendTestingDetails(details []string, seen map[string]bool, raw *string) [
 	return details
 }
 
-func renderTestedDetailFor(detail string, flavor prBodyFlavor) string {
-	clean := sanitizePromptMultilineText(detail)
-	if clean == "" {
-		return ""
+// sanitizeTestedDetail cleans a tested-command detail without destroying its
+// layout. A detail is often a whole script (a heredoc with nested blocks), so
+// unlike sanitizePromptMultilineText it keeps each line's leading indentation
+// and never joins lines: a flattened heredoc is no longer the command that ran.
+func sanitizeTestedDetail(text string) string {
+	text = strings.NewReplacer("<<<<<<<", " ", "=======", " ", ">>>>>>>", " ").Replace(text)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = strings.ReplaceAll(text, "\t", "    ")
+	lines := strings.Split(text, "\n")
+	for i := range lines {
+		lines[i] = strings.TrimRight(lines[i], " ")
 	}
+	return strings.Trim(strings.Join(lines, "\n"), "\n")
+}
+
+// testedDetailInline reports the one-line code span form of a detail, if it has one.
+func testedDetailInline(clean string) (string, bool) {
 	if strings.HasPrefix(clean, "`") && strings.HasSuffix(clean, "`") && strings.Count(clean, "`") == 2 && !strings.Contains(clean[1:len(clean)-1], "\n") {
-		return clean
+		return clean, true
 	}
 	if !strings.Contains(clean, "`") && !strings.Contains(clean, "\n") {
-		return fmt.Sprintf("`%s`", clean)
+		return fmt.Sprintf("`%s`", strings.TrimSpace(clean)), true
+	}
+	return "", false
+}
+
+// testedDetailLanguage picks the fence language for a command or script.
+// Shell is by far the common case for a tested detail, and a language tag is
+// what makes Bitbucket render the block as code; anything else stays "text".
+func testedDetailLanguage(clean string) string {
+	first := strings.TrimSpace(strings.SplitN(clean, "\n", 2)[0])
+	switch {
+	case strings.HasPrefix(first, "#!"), strings.HasPrefix(first, "$ "),
+		strings.Contains(clean, "<<'"), strings.Contains(clean, "<<\""), strings.Contains(clean, "<<-"),
+		strings.HasPrefix(first, "set -"), strings.Contains(clean, "\nset -"):
+		return "bash"
+	}
+	switch strings.Fields(first + " x")[0] {
+	case "bash", "sh", "zsh", "yarn", "npm", "npx", "pnpm", "make", "go", "git", "cd", "export", "echo", "node", "python", "python3", "pytest", "cargo", "docker", "nx":
+		return "bash"
+	}
+	return "text"
+}
+
+// markdownCodeBlock renders a fenced block whose every line is prefixed with
+// indent, so the block can sit inside a list item. The fence is always
+// preceded by a blank line when the caller places it after prose.
+func markdownCodeBlock(lang, content, indent string) string {
+	var b strings.Builder
+	b.WriteString(indent + "```" + lang + "\n")
+	for _, line := range strings.Split(content, "\n") {
+		if line == "" {
+			b.WriteString("\n")
+			continue
+		}
+		b.WriteString(indent + line + "\n")
+	}
+	b.WriteString(indent + "```")
+	return b.String()
+}
+
+// testedDetailScriptSummary reduces a script (a detail with several lines, such
+// as a configured test command that is a whole heredoc) to the line that says
+// what ran plus its length. The body never carries the script itself.
+func testedDetailScriptSummary(clean string) (string, bool) {
+	if !strings.Contains(clean, "\n") {
+		return "", false
+	}
+	label, lines := testedDetailLabel(clean)
+	return fmt.Sprintf("`%s` (%d-line script)", escapePipelineFoldMarkers(label), lines), true
+}
+
+// renderTestedDetailFor renders any recorded detail (a tested command, a
+// summary, an artifact caption) in full. Tested commands go through
+// renderTestedDetailBullet, which reduces a script to a label.
+func renderTestedDetailFor(detail string, flavor prBodyFlavor) string {
+	clean := sanitizeTestedDetail(detail)
+	if strings.TrimSpace(clean) == "" {
+		return ""
+	}
+	if inline, ok := testedDetailInline(clean); ok {
+		return inline
 	}
 	if flavor == prBodyMarkdown {
-		return fmt.Sprintf("```text\n%s\n```", escapeMarkdownFence(escapePipelineFoldMarkers(clean)))
+		return markdownCodeBlock(testedDetailLanguage(clean), escapeMarkdownFence(escapePipelineFoldMarkers(clean)), "")
 	}
 	escaped := html.EscapeString(clean)
 	escaped = strings.ReplaceAll(escaped, "\n", "&#10;")
 	return fmt.Sprintf("<code>%s</code>", escaped)
+}
+
+// renderTestedDetailBullet renders a tested detail as a list item, ending in a
+// newline. A script (several lines) is reduced to a label. A single line that
+// mixes prose with code spans, such as "`yarn test` (7 suites, all passing)",
+// is already inline markdown and stays a plain bullet: Bitbucket Cloud only
+// recognizes a fence that starts in column 0, so a fenced block nested under a
+// bullet comes out as a broken inline code span and the backticks of the
+// command inside it are printed literally.
+func renderTestedDetailBullet(detail string, flavor prBodyFlavor) string {
+	clean := sanitizeTestedDetail(detail)
+	if strings.TrimSpace(clean) == "" {
+		return ""
+	}
+	if summary, ok := testedDetailScriptSummary(clean); ok {
+		return "- Ran " + summary + "\n"
+	}
+	if flavor != prBodyMarkdown {
+		return "- " + renderTestedDetailFor(detail, flavor) + "\n"
+	}
+	if inline, ok := testedDetailInline(clean); ok {
+		return "- " + inline + "\n"
+	}
+	return "- " + escapeMarkdownFence(escapePipelineFoldMarkers(strings.TrimSpace(clean))) + "\n"
 }
 
 func renderTestingSummaryFor(summary string, flavor prBodyFlavor) string {
@@ -1180,9 +1348,24 @@ func formatTestingDuration(ms int64) string {
 }
 
 func buildStepEntry(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor) (statusLine, detailBlock string) {
+	return buildStepEntryFor(sr, rounds, flavor, false, false, testingCoverage{})
+}
+
+// buildStepEntryFor renders a step's status line and detail fold. ciPassed is
+// the finished run's known CI result, shown beside a Test exception.
+func buildStepEntryFor(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool, covers testingCoverage) (statusLine, detailBlock string) {
+	return buildStepEntryNoted(sr, rounds, flavor, final, ciPassed, covers, "")
+}
+
+// buildStepEntryNoted is buildStepEntryFor with a parenthesised note after the
+// status, used to say a step's result is carried over from an earlier run.
+func buildStepEntryNoted(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool, covers testingCoverage, note string) (statusLine, detailBlock string) {
 	name := stepDisplayName(sr.StepName)
 	buildDetail := func(line string) (string, string) {
-		return line, buildStepDetails(line, sr, rounds, flavor)
+		if note != "" {
+			line += " (" + note + ")"
+		}
+		return line, buildStepDetails(line, sr, rounds, flavor, final, ciPassed, covers)
 	}
 
 	switch sr.Status {
@@ -1202,6 +1385,13 @@ func buildStepEntry(sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlav
 
 	if sr.Status == types.StepStatusSkipped {
 		return buildDetail(fmt.Sprintf("⏭️ **%s** - skipped", name))
+	}
+
+	// A Test step approved over a failure is a pass with an accepted
+	// exception, not an error: the findings below still describe the failure,
+	// and the detail fold says why it was accepted.
+	if _, ok := testExceptionFor(sr, rounds); ok {
+		return buildDetail(testExceptionStatusLine(name))
 	}
 
 	// Parse the final findings on the step result (last state).
@@ -1435,8 +1625,13 @@ func buildFixResultText(rounds []*db.StepRound) string {
 // round is shown as the review state observed at its end; a fix round is
 // prefixed with its recorded outcome so a reader can follow the result without
 // mentally replaying rounds.
-func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor) string {
+func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRound, flavor prBodyFlavor, final, ciPassed bool, covers testingCoverage) string {
 	var inner strings.Builder
+	exception, accepted := testExceptionFor(sr, rounds)
+	if accepted && !(covers.Verdict && sr.StepName == types.StepTest) {
+		inner.WriteString(testExceptionNote(exception, ciPassed, flavor))
+		inner.WriteString("\n\n")
+	}
 	// A skipped step whose rounds recorded no findings never checked
 	// anything, so "No issues found" under a "skipped" summary would
 	// claim a pass.
@@ -1449,11 +1644,21 @@ func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRo
 	// them - a data gap we must not paper over as "no issues found".
 	missingRoundFindingsData := sr.FindingsJSON != nil && !roundsHaveFindings(rounds) && !roundsHaveParseFailure(rounds)
 
-	for _, r := range rounds {
+	for ri, r := range rounds {
 		isFixRound := r.IsFixRound()
 		if isFixRound {
 			inner.WriteString(fixRoundLine(r))
 			inner.WriteString("\n")
+		}
+		if final && ri < len(rounds)-1 {
+			// A superseded round's findings are history, not state: the
+			// reader of a finished run needs what is still open, which the
+			// latest round reports.
+			if line := supersededRoundLine(r); line != "" {
+				inner.WriteString(line)
+				inner.WriteString("\n\n")
+			}
+			continue
 		}
 
 		if r.FindingsJSON == nil {
@@ -1480,21 +1685,37 @@ func buildStepDetails(summaryLine string, sr *db.StepResult, rounds []*db.StepRo
 			} else {
 				inner.WriteString("✅ No issues found.\n")
 			}
-			writeTestedDetails(&inner, sr, &findings, flavor)
+			writeTestedDetails(&inner, sr, &findings, flavor, covers)
 			inner.WriteString("\n")
 			continue
 		}
 
 		// A fix round that still has findings means the fix did not fully
 		// land; label what remained so the chain reads as fix -> still open.
-		if isFixRound {
+		// An accepted exception's last round is the failure that was accepted,
+		// not one that is still open.
+		acceptedRound := accepted && ri == len(rounds)-1
+		if isFixRound && !acceptedRound {
 			inner.WriteString(fmt.Sprintf("%s still open:\n\n", countFindingsBySeverity(&findings)))
 		}
-		writeFindingItems(&inner, sr, &findings, flavor)
+		writeFindingItems(&inner, sr, &findings, flavor, acceptedRound, covers)
 		inner.WriteString("\n")
 	}
 
 	return foldPRBlock(summaryLine, inner.String(), flavor)
+}
+
+// supersededRoundLine summarises an earlier round for the end-of-run
+// description without repeating its findings.
+func supersededRoundLine(r *db.StepRound) string {
+	if r.FindingsJSON == nil {
+		return ""
+	}
+	findings, err := types.ParseFindingsJSON(*r.FindingsJSON)
+	if err != nil || len(findings.Items) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("Round %d raised %s; superseded by a later round.", r.Round, countFindingsBySeverity(&findings))
 }
 
 func foldPRBlock(summaryLine, inner string, flavor prBodyFlavor) string {
@@ -1566,9 +1787,21 @@ func fixRoundLine(r *db.StepRound) string {
 
 // writeFindingItems renders each finding as a `file:line - description` bullet,
 // followed by any test command details for the test step.
-func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor) {
+//
+// accepted renders the findings of a Test step's accepted exception: the
+// failure is listed without the severity emoji that would read as unresolved.
+func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor, accepted bool, covers testingCoverage) {
+	// The accepted exception's own finding is the failure the Testing section's
+	// exception note already names; listing it again says nothing new.
+	if accepted && covers.Verdict && sr.StepName == types.StepTest {
+		writeTestedDetails(b, sr, findings, flavor, covers)
+		return
+	}
 	for _, f := range findings.Items {
-		emoji := severityEmoji(f.Severity)
+		emoji := severityEmoji(f.Severity) + " "
+		if accepted {
+			emoji = ""
+		}
 		loc := ""
 		if f.File != "" {
 			loc = fmt.Sprintf("`%s", escapePRText(f.File, flavor))
@@ -1577,9 +1810,9 @@ func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Fi
 			}
 			loc += "` - "
 		}
-		b.WriteString(fmt.Sprintf("- %s %s%s\n", emoji, loc, escapePRText(f.Description, flavor)))
+		b.WriteString(fmt.Sprintf("- %s%s%s\n", emoji, loc, escapePRText(f.Description, flavor)))
 	}
-	writeTestedDetails(b, sr, findings, flavor)
+	writeTestedDetails(b, sr, findings, flavor, covers)
 }
 
 // writeTestedDetails lists what the test step exercised: its live-validation
@@ -1590,26 +1823,27 @@ func writeFindingItems(b *strings.Builder, sr *db.StepResult, findings *types.Fi
 // because the Pipeline fold is the per-round story: a reader following a
 // fix round wants to see which scenario changed result between rounds, which
 // the single collapsed Testing section cannot show.
-func writeTestedDetails(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor) {
+func writeTestedDetails(b *strings.Builder, sr *db.StepResult, findings *types.Findings, flavor prBodyFlavor, covers testingCoverage) {
 	if sr.StepName != types.StepTest {
 		return
 	}
-	if line := renderLiveValidationLine(findings.Scenarios, findings.Verdict); line != "" {
-		b.WriteString("- ")
-		b.WriteString(line)
-		b.WriteString("\n")
+	if !covers.Verdict {
+		if line := renderLiveValidationLine(findings.Scenarios, findings.Verdict); line != "" {
+			b.WriteString("- ")
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+		if table := renderScenarioTable(findings.Scenarios, flavor); table != "" {
+			b.WriteString("\n")
+			b.WriteString(table)
+			b.WriteString("\n")
+		}
 	}
-	if table := renderScenarioTable(findings.Scenarios, flavor); table != "" {
-		b.WriteString("\n")
-		b.WriteString(table)
-		b.WriteString("\n")
+	if covers.Commands {
+		return
 	}
 	for _, detail := range findings.Tested {
-		rendered := renderTestedDetailFor(detail, flavor)
-		if rendered == "" {
-			continue
-		}
-		b.WriteString(fmt.Sprintf("- %s\n", rendered))
+		b.WriteString(renderTestedDetailBullet(detail, flavor))
 	}
 }
 

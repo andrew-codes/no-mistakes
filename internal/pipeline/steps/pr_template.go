@@ -227,15 +227,19 @@ func templateStructureLines(text string) []string {
 }
 
 func (s *PRStep) buildPRAppendix(sctx *pipeline.StepContext, provider scm.Provider) (string, error) {
+	return s.buildPRAppendixWith(sctx, provider, false)
+}
+
+func (s *PRStep) buildPRAppendixWith(sctx *pipeline.StepContext, provider scm.Provider, final bool) (string, error) {
 	if needsPRIntentBrief(sctx) && strings.TrimSpace(sctx.PublicIntentBrief) == "" {
 		return "", fmt.Errorf("cannot publish configured public Intent brief without a valid draft")
 	}
-	evidence, err := s.recordedPREvidence(sctx, provider)
+	evidence, err := s.recordedPREvidence(sctx, provider, final)
 	if err != nil {
 		return "", err
 	}
 	parts := []string{}
-	if intent := publicPRIntent(sctx); intent != "" {
+	if intent := publicPRIntentFor(sctx, provider); intent != "" {
 		parts = append(parts, "## Intent\n\n"+neutralizeAttestationMarkers(provider, intent))
 	}
 	if evidence != "" {
@@ -244,8 +248,8 @@ func (s *PRStep) buildPRAppendix(sctx *pipeline.StepContext, provider scm.Provid
 	return strings.Join(parts, "\n\n"), nil
 }
 
-func (s *PRStep) recordedPREvidence(sctx *pipeline.StepContext, provider scm.Provider) (string, error) {
-	pipelineMD, risk, testing := s.buildPipelineSectionFor(sctx, provider, true)
+func (s *PRStep) recordedPREvidence(sctx *pipeline.StepContext, provider scm.Provider, final bool) (string, error) {
+	pipelineMD, risk, testing := s.buildPipelineSectionWith(sctx, provider, true, final)
 	if strings.Count(pipelineMD, pipelineAttestationCommentPrefix) != 1 {
 		return "", fmt.Errorf("cannot publish template narrative without recorded pipeline evidence and attestation")
 	}

@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
 
 // publicPRIntent returns the intent text published on the PR body, or "" when
@@ -30,7 +31,15 @@ import (
 // Review, test, document, lint, and CI-fix prompts keep the full intent
 // under either signal.
 func publicPRIntent(sctx *pipeline.StepContext) string {
-	source := publicPRIntentSource(sctx)
+	return publicPRIntentFor(sctx, resolvedProviderForBody(sctx))
+}
+
+// publicPRIntentFor is publicPRIntent rendered for provider. A configured
+// brief replaces the cleaned intent outright; otherwise Bitbucket Cloud gets
+// the intent restructured into scannable points (structureIntent) and every
+// other host publishes the cleaned intent as written.
+func publicPRIntentFor(sctx *pipeline.StepContext, provider scm.Provider) string {
+	source := publicPRIntentSource(sctx, provider)
 	if source == "" {
 		return ""
 	}
@@ -40,14 +49,18 @@ func publicPRIntent(sctx *pipeline.StepContext) string {
 	return source
 }
 
-func publicPRIntentSource(sctx *pipeline.StepContext) string {
+func publicPRIntentSource(sctx *pipeline.StepContext, provider scm.Provider) string {
 	if sctx != nil && sctx.Config != nil && !sctx.Config.PR.PublishesIntent() {
 		return ""
 	}
 	if runOmitsIntent(sctx) {
 		return ""
 	}
-	return cleanedUserIntent(sctx)
+	cleaned := cleanedUserIntent(sctx)
+	if prBodyFlavorFor(provider) == prBodyMarkdown {
+		return structureIntent(cleaned)
+	}
+	return cleaned
 }
 
 // runOmitsIntent reports whether this run was started with the caller-side,

@@ -349,6 +349,13 @@ type Capabilities struct {
 	FailedCheckLogs bool
 	MergedProof     bool
 	ReviewComments  bool
+	// ReviewCommentReplies declares that the provider's ReviewCommentsHost
+	// reads EVERY unresolved human and bot comment (not only review-bot
+	// ones) and that the host implements ReviewCommentResponder. The CI step
+	// then turns each comment into an auto-fix finding, has the fix agent
+	// address it, and replies on the thread afterwards. Providers without it
+	// keep the review-bot-only, ask-user behavior.
+	ReviewCommentReplies bool
 	// ClosingReferences declares that the provider closes issues from a
 	// closing keyword in the pull request body ("Closes #42"), which is what
 	// makes an explicitly requested --closes reference render and verify. False
@@ -424,6 +431,34 @@ type ReviewCommentsHost interface {
 	GetReviewComments(ctx context.Context, pr *PR) ([]ReviewComment, error)
 }
 
+// ReviewCommentResponder is implemented by hosts that can answer a review
+// comment: a reply on its thread, and resolving the thread. A host that
+// declares Capabilities().ReviewCommentReplies implements it, and its
+// GetReviewComments must stop returning a comment once a reply from
+// ReplyToReviewComment exists on its thread, so a handled comment is never
+// raised, or answered, twice.
+type ReviewCommentResponder interface {
+	// ReplyToReviewComment posts body as a reply to the comment.
+	ReplyToReviewComment(ctx context.Context, pr *PR, commentID, body string) error
+	// ResolveReviewComment resolves the comment's thread. A provider without
+	// resolvable threads returns ErrUnsupported.
+	ResolveReviewComment(ctx context.Context, pr *PR, commentID string) error
+}
+
+// PRDraftController is implemented by hosts that can read and toggle a PR's
+// draft state. A PR is opened as a draft and published as ready only once its
+// run has passed, so the PR step and the end-of-run finalizer drive this to
+// keep a PR from claiming ready while it is not.
+type PRDraftController interface {
+	// DraftLifecycle reports whether the host is configured to keep PRs in
+	// draft until they are ready. False leaves draft state entirely alone.
+	DraftLifecycle() bool
+	// GetPRDraft reports whether the PR is currently a draft.
+	GetPRDraft(ctx context.Context, pr *PR) (bool, error)
+	// SetPRDraft converts the PR to a draft (true) or marks it ready (false).
+	SetPRDraft(ctx context.Context, pr *PR, draft bool) error
+}
+
 // PRContentReader is an optional interface for hosts that can read the current
 // title and raw body of an existing PR. Readers must distinguish an explicitly
 // empty body from missing, null, or malformed content and reject the latter.
@@ -449,6 +484,24 @@ type MergedProof struct {
 // merged, because merge and monitor polling can race.
 type MergedProofHost interface {
 	GetMergedProof(ctx context.Context, pr *PR, expectedHead string) (MergedProof, error)
+}
+
+// MergedPRFinder is implemented by hosts that can list the PRs of a branch
+// that were already merged. Host.FindPR sees open PRs only, so without this a
+// forge that merges a PR the moment its build is green (before the pipeline's
+// PR or CI step runs) leaves the PR step blind to it, and it opens a second PR
+// for work that is already on the target branch.
+//
+// FindMergedPRs returns the merged PRs opened from branch, newest first. Each
+// entry carries Number, URL, BaseBranch (the target it merged into) and
+// HeadSHA (the source commit the forge recorded); a field the forge did not
+// report is left empty and the caller must treat that as "cannot compare". A
+// nil error with an empty list means a successfully decoded listing held no
+// merged PR. Declined, closed and superseded PRs are never returned, and any
+// lookup, decoding or validation failure is an error rather than an empty
+// list, so a caller can never read an indeterminate answer as absence.
+type MergedPRFinder interface {
+	FindMergedPRs(ctx context.Context, branch string) ([]*PR, error)
 }
 
 // Host is the provider-agnostic interface to a PR-hosting service.

@@ -228,6 +228,30 @@ func (h *Host) SetPRBaseBranch(ctx context.Context, pr *scm.PR, baseBranch strin
 	return nil
 }
 
+// FindMergedPRs lists the merged PRs opened from branch, newest first. Only
+// the MERGED state is requested, so a DECLINED or SUPERSEDED PR is never
+// returned. Every PR carries the target branch and the source commit the forge
+// recorded for it, which the caller compares against the commit it is about to
+// publish.
+func (h *Host) FindMergedPRs(ctx context.Context, branch string) ([]*scm.PR, error) {
+	items, err := h.queryPRs(ctx, "MERGED", branch, "")
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].ID > items[j].ID })
+	merged := make([]*scm.PR, 0, len(items))
+	for _, item := range items {
+		if name := strings.TrimSpace(item.Source.Branch.Name); name != "" && name != branch {
+			continue
+		}
+		pr := item.toPR(h.repo)
+		pr.BaseBranch = strings.TrimSpace(item.Destination.Branch.Name)
+		pr.HeadSHA = strings.TrimSpace(item.Source.Commit.Hash)
+		merged = append(merged, pr)
+	}
+	return merged, nil
+}
+
 // queryPRs lists PRs from branch in one state. It returns an error for any
 // lookup, decoding or validation failure so no caller can read an
 // indeterminate answer as "there is no such PR".
@@ -919,6 +943,7 @@ func bytesTrimToJSON(out []byte) []byte {
 }
 
 var (
+	_ scm.MergedPRFinder     = (*Host)(nil)
 	_ scm.PRBaseBranchReader = (*Host)(nil)
 	_ scm.PRBaseRetargeter   = (*Host)(nil)
 )

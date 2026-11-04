@@ -273,6 +273,15 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		if err := verifyClosingIssues(ctx, host, updated, sctx); err != nil {
 			return nil, err
 		}
+		// A new run restarts validation, so a PR an earlier run published as
+		// ready is not ready any more. The run's end decides again - unless
+		// this run pushed nothing the PR does not already have, in which case
+		// there is nothing to revalidate and the PR keeps its state.
+		if headAlreadyPublishedToPR(sctx, updated) {
+			sctx.Log("this head is already on the pull request; leaving its draft or ready state as it is")
+		} else {
+			holdPRAsDraft(sctx, host, updated)
+		}
 		if updated != nil && updated.URL != "" {
 			if err := sctx.DB.UpdateRunPRURL(sctx.Run.ID, updated.URL); err != nil {
 				slog.Warn("failed to persist PR URL", "run", sctx.Run.ID, "url", updated.URL, "err", err)
@@ -422,6 +431,16 @@ func bindExistingPR(sctx *pipeline.StepContext, host scm.Host, discovered *scm.P
 	}
 	base, err := reader.GetPRBaseBranch(ctx, existing)
 	if err != nil {
+		// The base is only needed to compare against a per-run --base-branch
+		// override. With none requested, a provider that merely could not read
+		// it must not fail the step; the CI monitor re-reads the live base
+		// itself. A broken provider-plugin contract still fails closed.
+		if runPRBaseBranch(sctx) == "" && !pluginContractBroken(err) {
+			if sctx != nil && sctx.Log != nil {
+				sctx.Log(fmt.Sprintf("warning: could not read the base branch of pull request %s, and no base was requested: %v", owned, err))
+			}
+			return existing, nil
+		}
 		return nil, fmt.Errorf("read persisted pull request %s: %w", owned, err)
 	}
 	existing.BaseBranch = strings.TrimSpace(base)
@@ -864,6 +883,12 @@ func (s *PRStep) buildPipelineSection(sctx *pipeline.StepContext, provider scm.P
 }
 
 func (s *PRStep) buildPipelineSectionFor(sctx *pipeline.StepContext, provider scm.Provider, owned bool) (pipelineMD, riskLine, testingMD string) {
+	return s.buildPipelineSectionWith(sctx, provider, owned, false)
+}
+
+// buildPipelineSectionWith is buildPipelineSectionFor with the end-of-run
+// rendering switched on by final: see pipelineAttestationPolicy.Final.
+func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider scm.Provider, owned, final bool) (pipelineMD, riskLine, testingMD string) {
 	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
 	if err != nil {
 		slog.Warn("failed to query step results for pipeline summary", "error", err)
@@ -880,11 +905,33 @@ func (s *PRStep) buildPipelineSectionFor(sctx *pipeline.StepContext, provider sc
 		rounds[sr.ID] = r
 	}
 
-	policy := pipelineAttestationPolicy{}
+	// A refresh run skips what an earlier run on this head already passed; the
+	// description keeps showing that result, labelled, instead of "skipped".
+	// The attestation below still reads this run's own rows.
+	carried := carriedSkippedSteps(sctx, steps)
+	policy := pipelineAttestationPolicy{Carried: carried}
 	if sctx.Config != nil {
 		policy.AllowTestCommandOverride = strings.TrimSpace(sctx.Config.Test.AllowApproveOverFailure)
 	}
+	ciPassed := false
+	if final {
+		policy.Final = true
+		policy.Outcome = finalRunOutcomeLine(sctx.Run, carriedView(steps, carried))
+		ciPassed = finalCIPassed(sctx.Run, steps)
+		policy.CIPassed = ciPassed
+	}
+	compact := true
+	if sctx.Config != nil {
+		compact = sctx.Config.Test.Evidence.Compact
+	}
+	// The Testing section is rendered first because the Pipeline's Test group
+	// must know what it already says (see testingCoverage).
+	testingMD = buildPRTestingSummaryCarried(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir, testEvidenceDir(sctx), publishRunEvidence(sctx), provider, s.attachRunEvidenceMedia(sctx, provider, steps, rounds), compact, ciPassed, carried)
+	if testingMD != "" && prBodyFlavorFor(provider) == prBodyMarkdown {
+		policy.TestingCovers = testingCoverage{Verdict: true, Commands: !compact}
+	}
 	pipelineMD, riskLine = buildPipelineSummaryFor(steps, rounds, sctx.Run.HeadSHA, provider, policy)
+	riskLine = carriedRiskLine(sctx, steps, rounds, riskLine)
 	// The review conversation rides inside the Pipeline section as an ordinary
 	// `### ` group, so the existing body-budget logic can drop it whole rather
 	// than competing with the attestation it must never displace.
@@ -897,11 +944,6 @@ func (s *PRStep) buildPipelineSectionFor(sctx *pipeline.StepContext, provider sc
 	if owned && provider == scm.ProviderBitbucket && pipelineMD != "" {
 		pipelineMD += "\n\n```text\n" + buildPipelineAttestationWithPolicy(steps, rounds, sctx.Run.HeadSHA, policy) + "\n```"
 	}
-	compact := true
-	if sctx.Config != nil {
-		compact = sctx.Config.Test.Evidence.Compact
-	}
-	testingMD = buildPRTestingSummary(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir, testEvidenceDir(sctx), publishRunEvidence(sctx), provider, s.attachRunEvidenceMedia(sctx, provider, steps, rounds), compact)
 	return pipelineMD, riskLine, testingMD
 }
 
@@ -1015,7 +1057,7 @@ func buildPRBodyFull(body, riskLine, testingMD, pipelineMD string, sctx *pipelin
 	sections := appendGeneratedSectionsToCleanBodyWithinLimit(body, riskLine, testingMD, pipelineMD, maxBytes, provider)
 	// Neutralized for the same reason as in prependIntentSection: intent is
 	// agent-extracted text placed ahead of the pipeline section.
-	cleaned := neutralizeAttestationMarkers(provider, publicPRIntent(sctx))
+	cleaned := neutralizeAttestationMarkers(provider, publicPRIntentFor(sctx, provider))
 	if cleaned == "" {
 		return sections
 	}
@@ -1765,15 +1807,17 @@ func isGeneratedSectionHeading(line string) bool {
 }
 
 // prependIntentSection prepends a "## Intent" section sourced from the
-// already-extracted user intent. The intent text is reused verbatim (after
-// the same secret/adversarial scrubbing the agent prompt path applies)
-// rather than being paraphrased by the agent. Returns body unchanged when
-// no intent is available or publication is disabled.
+// already-extracted user intent. The intent text is reused (after the same
+// secret/adversarial scrubbing the agent prompt path applies) rather than being
+// paraphrased by the agent; on Bitbucket Cloud it is restructured
+// deterministically into scannable points (see structureIntent). Returns body
+// unchanged when no intent is available or publication is disabled.
 func prependIntentSection(body string, sctx *pipeline.StepContext) string {
 	// Intent is agent-extracted text that lands ahead of the pipeline section,
 	// so it can shadow the real attestation the same way the Testing section
 	// can. See appendGeneratedSectionsToCleanBodyWithinLimit.
-	cleaned := neutralizeAttestationMarkers(resolvedProviderForBody(sctx), publicPRIntent(sctx))
+	provider := resolvedProviderForBody(sctx)
+	cleaned := neutralizeAttestationMarkers(provider, publicPRIntentFor(sctx, provider))
 	if cleaned == "" {
 		return body
 	}

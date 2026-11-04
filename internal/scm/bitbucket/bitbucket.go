@@ -106,10 +106,13 @@ func New(cmd CmdFactory, cliAvailable func() bool, repo RepoRef, draft bool) *Ho
 
 func (h *Host) Provider() scm.Provider { return scm.ProviderBitbucket }
 
-// Capabilities reports Bitbucket's feature matrix. Bitbucket's REST API does
-// not expose a reliable merge-conflict probe, so MergeableState is off.
+// Capabilities reports Bitbucket's feature matrix. MergeableState is read from
+// the PR's merge checks (`twg bb pull-requests mergeability`), not from a
+// merge-conflict probe of its own. ReviewComments and ReviewCommentReplies
+// declare the comment thread support in review_comments.go: every unresolved
+// human and bot comment is readable and each can be answered.
 func (h *Host) Capabilities() scm.Capabilities {
-	return scm.Capabilities{MergeableState: false, FailedCheckLogs: true}
+	return scm.Capabilities{MergeableState: true, FailedCheckLogs: true, ReviewComments: true, ReviewCommentReplies: true}
 }
 
 func (h *Host) Available(ctx context.Context) error {
@@ -134,6 +137,7 @@ func (h *Host) repoArgs() []string {
 type bitbucketPullRequest struct {
 	ID    int    `json:"id"`
 	State string `json:"state"`
+	Draft bool   `json:"draft"`
 	Links struct {
 		HTML struct {
 			Href string `json:"href"`
@@ -172,7 +176,56 @@ func (h *Host) FindPR(ctx context.Context, branch, base string) (*scm.PR, error)
 	if len(items) == 0 {
 		return nil, nil
 	}
-	return items[0].toPR(h.repo), nil
+	// The listing carries the destination, so an existing PR's live base is
+	// known without a second read.
+	pr := items[0].toPR(h.repo)
+	pr.BaseBranch = strings.TrimSpace(items[0].Destination.Branch.Name)
+	return pr, nil
+}
+
+// GetPRBaseBranch implements scm.PRBaseBranchReader: the PR's destination
+// branch, read from `twg bb pull-requests get`. A response without one is an
+// error, never an empty base the caller could mistake for "unset".
+func (h *Host) GetPRBaseBranch(ctx context.Context, pr *scm.PR) (string, error) {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return "", errors.New("twg bb pull-requests get: missing pull request number")
+	}
+	view, _, err := h.getPR(ctx, strings.TrimSpace(pr.Number))
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSpace(view.Destination.Branch.Name)
+	if base == "" {
+		return "", fmt.Errorf("twg bb pull-requests get: pull request %s has no destination branch", pr.Number)
+	}
+	return base, nil
+}
+
+// SetPRBaseBranch implements scm.PRBaseRetargeter with `twg bb pull-requests
+// update --dest`. twg echoes the updated PR; when that echo names a
+// destination it must be the requested one, so a silently ignored flag cannot
+// read as a successful retarget.
+func (h *Host) SetPRBaseBranch(ctx context.Context, pr *scm.PR, baseBranch string) error {
+	baseBranch = strings.TrimSpace(baseBranch)
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return errors.New("twg bb pull-requests update: missing pull request number")
+	}
+	if baseBranch == "" {
+		return errors.New("twg bb pull-requests update: missing destination branch")
+	}
+	args := []string{"bb", "pull-requests", "update", "--pull-request", strings.TrimSpace(pr.Number), "--dest", baseBranch}
+	args = append(args, h.repoArgs()...)
+	out, err := h.runJSON(ctx, args)
+	if err != nil {
+		return fmt.Errorf("twg bb pull-requests update: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	var updated bitbucketPullRequest
+	if trimmed := bytesTrimToJSON(out); len(trimmed) > 0 && json.Unmarshal(trimmed, &updated) == nil {
+		if got := strings.TrimSpace(updated.Destination.Branch.Name); got != "" && got != baseBranch {
+			return fmt.Errorf("twg bb pull-requests update: pull request %s still targets %s, not %s", pr.Number, got, baseBranch)
+		}
+	}
+	return nil
 }
 
 // FindMergedPRs lists the merged PRs opened from branch, newest first. Only
@@ -368,6 +421,48 @@ func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) 
 	return updated.toPR(h.repo), nil
 }
 
+// DraftLifecycle reports whether PRs are opened as drafts and kept there until
+// the run proves them ready (providers.bitbucket.draft_pull_requests).
+func (h *Host) DraftLifecycle() bool { return h.draft }
+
+func (h *Host) GetPRDraft(ctx context.Context, pr *scm.PR) (bool, error) {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return false, errors.New("twg bb pull-requests get: missing pull request number")
+	}
+	view, trimmed, err := h.getPR(ctx, pr.Number)
+	if err != nil {
+		return false, err
+	}
+	// A response without the field would read as "ready" and let a draft be
+	// published by mistake, so absence is an error rather than false.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return false, fmt.Errorf("twg bb pull-requests get: invalid JSON output: %s", strings.TrimSpace(string(trimmed)))
+	}
+	if _, ok := raw["draft"]; !ok {
+		return false, errors.New("twg bb pull-requests get: response does not report the draft state")
+	}
+	return view.Draft, nil
+}
+
+// SetPRDraft toggles draft state with `twg bb pull-requests update --draft` or
+// `--ready`, without touching the title or description.
+func (h *Host) SetPRDraft(ctx context.Context, pr *scm.PR, draft bool) error {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return errors.New("twg bb pull-requests update: missing pull request number")
+	}
+	flag := "--ready"
+	if draft {
+		flag = "--draft"
+	}
+	args := []string{"bb", "pull-requests", "update", "--pull-request", pr.Number, flag}
+	args = append(args, h.repoArgs()...)
+	if out, err := h.runJSON(ctx, args); err != nil {
+		return fmt.Errorf("twg bb pull-requests update %s: %s: %w", flag, strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}
+
 func (h *Host) getPR(ctx context.Context, number string, extraArgs ...string) (bitbucketPullRequest, []byte, error) {
 	args := append([]string{"bb", "pull-requests", "get", number}, extraArgs...)
 	args = append(args, h.repoArgs()...)
@@ -431,8 +526,99 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 	return checks, nil
 }
 
-func (h *Host) GetMergeableState(_ context.Context, _ *scm.PR) (scm.MergeableState, error) {
-	return "", scm.ErrUnsupported
+// Bitbucket merge checks that decide the PR's mergeable state. Both are checks
+// Bitbucket itself evaluates; no-mistakes never counts how far behind a branch
+// is.
+const (
+	mergeCheckGit           = "git_mergeability_check"
+	mergeCheckCommitsBehind = "maximum_commits_behind"
+)
+
+// mergeCheck is one entry of `twg bb pull-requests mergeability`. The git
+// check is identified by its type; the other checks carry their kind under
+// `check.kind`. Blocking is a pointer because twg documents that a FAILED
+// status alone does not say the check blocks the merge.
+type mergeCheck struct {
+	Type     string `json:"type"`
+	Status   string `json:"status"`
+	Blocking *bool  `json:"blocking"`
+	Check    struct {
+		Kind string `json:"kind"`
+	} `json:"check"`
+}
+
+func (c mergeCheck) is(kind string) bool {
+	return strings.EqualFold(strings.TrimSpace(c.Type), kind) || strings.EqualFold(strings.TrimSpace(c.Check.Kind), kind)
+}
+
+// GetMergeableState maps Bitbucket's own merge checks onto the shared
+// mergeable state. A failed git mergeability check is a merge conflict. A
+// failed, blocking maximum_commits_behind check means Bitbucket refuses the
+// merge until the branch is rebased onto its destination, which the CI
+// monitor's merge-conflict repair does, so it reads as CONFLICTING too. Any
+// check that is PENDING or UNKNOWN, or a response without the git check, is
+// PENDING: UNKNOWN means the check could not be evaluated, not that it passed.
+// Any other status is a pass, so a status name twg adds later cannot park a
+// green PR until the CI timeout.
+func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.MergeableState, error) {
+	if pr == nil || strings.TrimSpace(pr.Number) == "" {
+		return "", errors.New("twg bb pull-requests mergeability: missing pull request number")
+	}
+	args := append([]string{"bb", "pull-requests", "mergeability", pr.Number}, h.repoArgs()...)
+	out, err := h.runJSON(ctx, args)
+	if err != nil {
+		return "", fmt.Errorf("twg bb pull-requests mergeability: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	checks, err := parseMergeChecks(out)
+	if err != nil {
+		return "", err
+	}
+	gitSeen, pending := false, false
+	for _, check := range checks {
+		isGit, isBehind := check.is(mergeCheckGit), check.is(mergeCheckCommitsBehind)
+		if !isGit && !isBehind {
+			continue
+		}
+		if isGit {
+			gitSeen = true
+		}
+		switch strings.ToUpper(strings.TrimSpace(check.Status)) {
+		case "FAILED":
+			if isGit || check.Blocking == nil || *check.Blocking {
+				return scm.MergeableConflict, nil
+			}
+		case "PENDING", "UNKNOWN", "":
+			pending = true
+		}
+	}
+	if pending || !gitSeen {
+		return scm.MergeablePending, nil
+	}
+	return scm.MergeableOK, nil
+}
+
+// parseMergeChecks decodes the mergeability listing: a bare array, or an
+// object carrying the array under `values`. Anything else is an error so an
+// unreadable answer is never read as "mergeable".
+func parseMergeChecks(out []byte) ([]mergeCheck, error) {
+	trimmed := bytesTrimToJSON(out)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("twg bb pull-requests mergeability: invalid JSON output: %s", strings.TrimSpace(string(out)))
+	}
+	var checks []mergeCheck
+	if trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &checks); err != nil {
+			return nil, fmt.Errorf("twg bb pull-requests mergeability: invalid JSON output: %s", strings.TrimSpace(string(out)))
+		}
+		return checks, nil
+	}
+	var wrapped struct {
+		Values *[]mergeCheck `json:"values"`
+	}
+	if err := json.Unmarshal(trimmed, &wrapped); err != nil || wrapped.Values == nil {
+		return nil, fmt.Errorf("twg bb pull-requests mergeability: invalid JSON output: %s", strings.TrimSpace(string(out)))
+	}
+	return *wrapped.Values, nil
 }
 
 func (h *Host) FetchFailedCheckLogs(ctx context.Context, pr *scm.PR, branch, headSHA string, failingNames []string) (string, error) {
@@ -756,4 +942,8 @@ func bytesTrimToJSON(out []byte) []byte {
 	return out[idx:]
 }
 
-var _ scm.MergedPRFinder = (*Host)(nil)
+var (
+	_ scm.MergedPRFinder     = (*Host)(nil)
+	_ scm.PRBaseBranchReader = (*Host)(nil)
+	_ scm.PRBaseRetargeter   = (*Host)(nil)
+)

@@ -31,10 +31,11 @@ What you do not get is PR automation and CI monitoring.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | **PR** (create/update) | `gh` CLI, authenticated | `glab` CLI, authenticated | `forgejo-axi`, authenticated | `twg` CLI, authenticated | `az` CLI + `azure-devops` extension, authenticated | `tea` CLI, authenticated | `origin` CLI, authenticated | configured plugin CLI (`status`, `pr create`/`update`) |
 | **CI** (polling, auto-fix) | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | `tea` CLI | `origin` CLI | configured plugin CLI (`status`, `pr checks`) |
-| **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
-| **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | not supported | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
+| **Merge conflict auto-fix** | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
+| **Mergeability polling** | `gh` CLI | `glab` CLI | `forgejo-axi` | `twg` CLI | `az` CLI | not supported | `origin` CLI | supported when plugin declares `mergeable_state` |
 | **Failed check log fetching** | `gh` CLI | `glab` CLI | `forgejo-axi` when runtime routes are available | supported | not yet | supported | not yet | supported when plugin declares `failed_check_logs` |
 | **Review-bot findings and comments at the CI gate** | GitHub via `gh` CLI (check identity by app slug, comments from review threads) | GitLab via `glab` CLI (comments from unresolved discussion notes, matched by the bot's login; no check identity) | not supported | not supported | not supported | not supported | not supported | not supported |
+| **Review comments answered by the CI fix agent** (every unresolved human and bot comment becomes a finding; the step replies and resolves threads) | not supported | not supported | not supported | `twg` CLI | not supported | not supported | not supported | not supported |
 | **[Explicit issue closure](/no-mistakes/reference/cli/#closing-issues)** (`axi run --closes`) | `gh` CLI | `glab` CLI | not supported | not supported | not supported | not supported | not supported | not supported |
 | **[Transient-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)** (cancellations and pre-run infra failures) | `gh` CLI | not supported | not supported | not supported | not supported | not supported | not supported | not supported |
 
@@ -46,7 +47,7 @@ pushes to the configured target:
 - create or update the PR automatically
 - poll hosted CI according to the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - fetch failing job logs for the CI auto-fix loop when the provider exposes them
-- on GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, and provider plugins that declare `mergeable_state`, watch mergeability and fix merge conflicts when possible
+- on GitHub, GitLab, Forgejo, Bitbucket Cloud, Azure DevOps, Cursor Origin, and provider plugins that declare `mergeable_state`, watch mergeability and fix merge conflicts when possible
 
 Draft PR and MR creation is configurable for supported providers. The [global](/no-mistakes/reference/global-config/#providersgithubdraft_pull_requests) and [per-repo](/no-mistakes/reference/repo-config/#providersgithubdraft_pull_requests) config references own provider support and behavior.
 
@@ -171,14 +172,13 @@ twg whoami
 - CI polling follows the [CI step lifecycle](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed pipeline step log fetching for the CI auto-fix step
 - Merged-PR lookup before a PR is created (`twg bb pull-requests query --state MERGED`), so a branch whose PR was already merged on green does not get a duplicate PR (see the [PR step](/no-mistakes/reference/pipeline-steps/#pr))
-
+- Reading and changing an existing PR's destination branch (`twg bb pull-requests get`, `twg bb pull-requests update --dest`), so a per-run `--base-branch` retargets the open PR instead of failing the PR step. When no base was requested and Bitbucket does not report one, the PR step updates the PR in place and logs that it could not read the base
+- Mergeability polling and merge-conflict auto-fix, read from Bitbucket's own merge checks (`twg bb pull-requests mergeability`). A failed `git_mergeability_check` is a merge conflict. A failing, blocking `maximum_commits_behind` check means Bitbucket will not merge the branch until it is rebased onto its destination, so it takes the same rebase and revalidate repair; no-mistakes does not count commits behind itself. Checks that are `PENDING` or `UNKNOWN` keep the monitor waiting, and other merge checks (approvals, tasks, builds) are not read.
+- Review comments, human and bot, inline and general: each unresolved comment (read with `twg bb pull-requests comment query`) becomes a finding the CI fix agent addresses. After the fix the step replies on the comment (`twg bb pull-requests comment create --reply-to`) and resolves the thread where it changed the code; a comment the agent decides not to change gets a reply saying why and stays open. Notices such as a merge-on-green message, a review bot's summary, the pipeline's own attestation, and comments written by the authenticated `twg` user are ignored, and a thread is never answered twice. See the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
 
 **What you don't get (yet):**
 
-- PR mergeability polling
-- Merge-conflict auto-fix
-
-These are GitHub, GitLab, Forgejo, Azure DevOps, Cursor Origin, and provider plugins (declaring `mergeable_state`) only right now.
+- Review-bot check findings (Bitbucket build statuses carry no app identity), explicit issue closure, and transient-check reruns, which are GitHub (and, for review-bot checks, GitLab) only right now.
 
 ## Azure DevOps
 

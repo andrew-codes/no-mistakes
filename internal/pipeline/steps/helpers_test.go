@@ -314,6 +314,9 @@ type fakeBitbucketAPI struct {
 	env         map[string]string
 	existingID  int
 	existingURL string
+	// commentsPath is the JSON array the fake's `comment` subcommands serve
+	// and mutate; empty until withComments.
+	commentsPath string
 }
 
 // newFakeBitbucketAPI wires up a fake `twg` binary on PATH. existingPRID == 0
@@ -372,10 +375,71 @@ func (api *fakeBitbucketAPI) withPRState(state string) *fakeBitbucketAPI {
 	return api
 }
 
+// withDestination sets the PR's destination branch: `get` reports it as
+// destination.branch.name, `query` lists it, and `update --dest` changes it.
+// Without it the fake reports no destination at all.
+func (api *fakeBitbucketAPI) withDestination(branch string) *fakeBitbucketAPI {
+	api.updateState(func(s *bbFakeStateForTest) { s.Dest = branch })
+	return api
+}
+
+// destination reads the PR's current destination branch back.
+func (api *fakeBitbucketAPI) destination(t *testing.T) string { return api.readState(t).Dest }
+
+// destUpdates counts the `update --dest` retargets the fake served.
+func (api *fakeBitbucketAPI) destUpdates(t *testing.T) int { return api.readState(t).DestUpdates }
+
 // withStatuses seeds the `_statuses` array `pull-requests get --statuses` returns.
 func (api *fakeBitbucketAPI) withStatuses(statusesJSON string) *fakeBitbucketAPI {
 	api.env["FAKE_CLI_BB_STATUSES_JSON"] = statusesJSON
 	return api
+}
+
+// withMergeability seeds the merge-check listing `pull-requests mergeability`
+// returns. Without it the fake reports every check passed.
+func (api *fakeBitbucketAPI) withMergeability(checksJSON string) *fakeBitbucketAPI {
+	api.env["FAKE_CLI_BB_MERGEABILITY_JSON"] = checksJSON
+	return api
+}
+
+// withComments seeds the review comments `comment query` returns (a JSON
+// array of Bitbucket comment objects). The fake appends the replies the
+// pipeline posts and stamps a resolution on the threads it resolves, which
+// comments() reads back.
+func (api *fakeBitbucketAPI) withComments(commentsJSON string) *fakeBitbucketAPI {
+	api.t.Helper()
+	api.commentsPath = filepath.Join(api.t.TempDir(), "bb-comments.json")
+	if err := os.WriteFile(api.commentsPath, []byte(commentsJSON), 0o644); err != nil {
+		api.t.Fatal(err)
+	}
+	api.env["FAKE_CLI_BB_COMMENTS_FILE"] = api.commentsPath
+	return api
+}
+
+// bbCommentForTest is the part of a fake comment the tests assert on.
+type bbCommentForTest struct {
+	ID      int `json:"id"`
+	Content struct {
+		Raw string `json:"raw"`
+	} `json:"content"`
+	Parent *struct {
+		ID int `json:"id"`
+	} `json:"parent"`
+	Resolution json.RawMessage `json:"resolution"`
+}
+
+// comments reads the fake's current comment list.
+func (api *fakeBitbucketAPI) comments() []bbCommentForTest {
+	api.t.Helper()
+	data, err := os.ReadFile(api.commentsPath)
+	if err != nil {
+		api.t.Fatal(err)
+	}
+	var out []bbCommentForTest
+	if err := json.Unmarshal(data, &out); err != nil {
+		api.t.Fatal(err)
+	}
+	return out
 }
 
 // withSourceCommit seeds the PR's `source.commit.hash`, which
@@ -409,6 +473,9 @@ type bbFakeStateForTest struct {
 	Title        string            `json:"title"`
 	Description  string            `json:"description"`
 	Puts         int               `json:"puts"`
+	Draft        bool              `json:"draft,omitempty"`
+	DraftToggles int               `json:"draft_toggles,omitempty"`
+	DestUpdates  int               `json:"dest_updates,omitempty"`
 	Source       string            `json:"source,omitempty"`
 	Dest         string            `json:"dest,omitempty"`
 	SourceCommit string            `json:"source_commit,omitempty"`

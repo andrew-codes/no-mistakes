@@ -145,6 +145,7 @@ no-mistakes axi run --intent "the user's goal" --yes
 no-mistakes axi run --intent "the user's goal" --base-branch epic/foo
 no-mistakes axi run --intent "the user's goal" --no-publish-intent
 no-mistakes axi run --intent "the user's goal" --closes 95 --closes owner/repo#12
+no-mistakes axi run --intent "the user's goal" --pr-title "Add widget export" --pr-body-file ./pr.md
 ```
 
 | Flag            | Type     | Default | Description                                                                                          |
@@ -157,6 +158,8 @@ no-mistakes axi run --intent "the user's goal" --closes 95 --closes owner/repo#1
 | `--base-branch` | `string` | (none)  | Integration branch for this run only; overrides [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) |
 | `--no-publish-intent` | `bool` | `false` | Keep the generated `## Intent` section out of the PR body for this run; tighten-only, see below |
 | `--closes` | `string`, repeatable | (none) | Issue the PR fully resolves (`95`, `owner/repo#95`, or a nested GitLab project path); see [Closing issues](#closing-issues) |
+| `--pr-title` | `string` | (none) | PR title used verbatim when this run creates the PR; see [Supplied PR title and description](#supplied-pr-title-and-description) |
+| `--pr-body-file` | `string` | (none) | Read the PR description used verbatim when this run creates the PR; `-` reads stdin to EOF |
 | `--model` | `string` | (none) | Pi provider/model ID for an immutable [per-run profile](/no-mistakes/reference/global-config/#per-run-pi-profiles) |
 | `--effort` | `string` | (none) | Pi reasoning effort for that profile; omitted fields inherit `agent_config.pi` |
 | `--wait`        | `duration` | `8m`    | Maximum time for active-run lookup and run driving before the caller must reattach |
@@ -224,6 +227,14 @@ The same omit-to-reattach rule applies to `--model`/`--effort` against an active
 The references are persisted on the run and survive daemon restarts, fix rounds, rebases, and that run's PR-body refreshes; `no-mistakes rerun` inherits them, and its own `--closes` adds to them. They can also be passed on a plain gate push as repeated `-o no-mistakes.closes=<ref>` push options; a gate push without them starts a run with none, and its PR-body refresh drops the `## Issues` section. Reattaching with `--closes` adds references to the active run until its PR body has been composed; after that the request is refused with an explicit error rather than reported as applied. Before starting a run with `--closes`, `axi run` refuses a running daemon too old to honor it, and rejects `--closes` combined with `--skip pr` as a usage error; a run whose PR step is skipped any other way fails at that step instead (see the [PR step](/no-mistakes/reference/pipeline-steps/#pr)).
 
 `--closes` is supported on providers that close issues from the pull request body: GitHub and GitLab. On another forge the PR step fails rather than publish a PR that silently closes nothing; a GitLab subgroup reference on a non-GitLab provider is refused the same way, since that forge would read it as a different repository's reference. The forge closes the issue only when the PR merges into the repository's default branch (and, on GitLab, unless automatic issue closing is disabled for the project); a PR merged into another branch does not close it.
+
+### Supplied PR title and description
+
+`--pr-title TEXT` and `--pr-body-file PATH` supply the PR's title and description, for teams with a description convention. They are used only when this run **creates** the PR; the PR step then adds the usual appendix (Intent, the evidence in the configured [`pr.appendix`](/no-mistakes/reference/repo-config/#prappendix) mode, the `## Issues` section) and the attestation after the description. Either flag works alone: a run with only `--pr-title` drafts the description as usual, and a run with only `--pr-body-file` drafts the title. Without either flag nothing changes. A supplied description needs a provider that supports [`pr.template`](/no-mistakes/reference/repo-config/#prtemplate); on a host without raw PR-content reads the PR step fails, as template mode does. See the [PR step](/no-mistakes/reference/pipeline-steps/#pr) for how each is published and what later runs keep.
+
+There is no inline description flag, because Markdown with backticks and dollars is exactly the text a caller's shell expands; pass a file or `--pr-body-file -` to read stdin to EOF. `--pr-body-file -` and `--intent -` cannot both read stdin. The title is trimmed and must be one non-empty line of at most 4,096 bytes of valid UTF-8 with no control, bidi, or invisible format characters. The description must be non-blank, valid UTF-8, at most **49,122 bytes** (the same single push-option transport as [intent](#intent-input)), free of control characters other than tab, newline, and carriage return, free of bidi override and isolate characters, and must not contain no-mistakes appendix or attestation markers. Every refusal is a usage error before any push; the daemon re-checks the same rules. A description that is valid but does not fit the provider's body budget together with the appendix fails at the PR step instead of being truncated.
+
+Both values are persisted on the run, survive daemon restarts, and are inherited by `no-mistakes rerun` and [`axi retry`](#no-mistakes-axi-retry); a plain gate push carries neither unless it passes the `-o no-mistakes.pr-title=<base64>` and `-o no-mistakes.pr-body=<base64>` push options. Reattaching with a title or description that differs from the active run's is refused; omit the flags to reattach. Like `--closes`, `axi run` refuses a running daemon too old to honor them and rejects them combined with `--skip pr`. A run whose PR step is skipped any other way, or that finds the PR already open, logs that the supplied text went unused.
 Ordinary reattachment accepts either the run's immutable submitted head or its current pipeline head, so pipeline-created fix commits do not detach an unchanged submitting worktree.
 When neither identity matches, `axi run` keeps the fresh-run path but refuses a gate push while `branch_sync` says the pipeline still owns the branch.
 That refusal returns the complete structured state and its `continue_active_run` or `recover_custody` next action instead of a raw Git non-fast-forward.
@@ -290,6 +301,7 @@ A conflicting submitted head, validation generation, intent, or [pinned Pi profi
 A different nonce creates a distinct run rather than reattaching to a same-head run; both post-receive creation and the up-to-date-push fallback follow this contract.
 The up-to-date-push fallback preserves the latest same-head run's PR URL unless its recorded PR state is closed or merged, including when an explicit `--base-branch` retargets that PR.
 An explicit `--base-branch` is persisted on creation and must match the stored per-run base on replay; omitting it on replay preserves the stored base.
+A supplied `--pr-title` or `--pr-body-file` is bound the same way: a replay must supply the same text as the run, or none when the run has none.
 A replay that adds `--no-publish-intent` against a run bound to publish the section is refused for the same reason; the stored omit decision folds in the global [`intent.publish_intent`](/no-mistakes/reference/global-config/#intent) default at creation, so a replay without the flag still matches a run whose row omits publication.
 Explicit `--model`/`--effort` must match a stored pin the same way; omitting both preserves it.
 A conflicting claim does not consume the first `created` disposition.
@@ -396,7 +408,7 @@ Answering requires an active run, because only its executor can resume the revie
 
 ## no-mistakes axi status
 
-When `--run` is omitted, show this branch's run: its active run, else its most recent one.
+Without `--run` or `--branch`, show the current branch's run: its active run, else its most recent one.
 Resolution is scoped to the current branch and never falls back to another branch's run, because one clone commonly has several worktrees on different branches.
 On a successful status response, when the current branch has no run of its own - including a detached `HEAD`, which owns no branch and so reports `current_branch: unknown` - the output carries no run object at all.
 It reports `current_branch`, `runs_on_current_branch: 0` where a branch is known, and the recent-runs listing, so an unrelated run can never be read as this worktree's.
@@ -408,11 +420,13 @@ An explicit `--run <id>` rendered under `run:` while the current branch is unkno
 ```sh
 no-mistakes axi status
 no-mistakes axi status --run <id>
+no-mistakes axi status --branch feature/example
 ```
 
 | Flag    | Type     | Default            | Description               |
 | ------- | -------- | ------------------ | ------------------------- |
 | `--run` | `string` | current-branch run | Inspect a specific run ID |
+| `--branch` | `string` | (none) | Read a publication snapshot for this exact branch in the invoking registered repository; mutually exclusive with `--run` |
 
 When the resolved run is parked at an `awaiting_approval` or `fix_review` gate, its top-level `run:` or `other_branch_run:` object includes `awaiting_agent: parked <duration>` immediately after `status`.
 The field disappears after that run's gate is answered, on cancel, and on terminal outcomes; use it to distinguish a run waiting for the driving agent from one actively running, fixing, or watching CI.
@@ -427,6 +441,38 @@ For older active runs with no recorded activity timestamp, AXI falls back to the
 Finding descriptions are always rendered in full, so an `ask-user` finding can be relayed verbatim. Gate summaries are bounded in this default status view because a command gate's summary carries its command output; a truncated summary discloses its original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for an implicitly resolved run or `no-mistakes axi logs --run <id> --step <step> --full` for an explicitly selected run.
 Relevant current-branch states also include a cached `branch_sync` object with full SHAs, the run's status, the persisted pipeline push binding, target kind and ref, relation, safety result, PR lifecycle, and a structured next action.
 Cached home and status rendering performs no network read and labels the remote observation `pipeline_push`; only explicit sync check or apply reports `live` freshness.
+
+### Branch publication snapshot
+
+`axi status --branch <name>` is a separate, read-only TOON surface (`schema: branch-publication.v1`) for a user or an automation that merges pull requests. It selects the **newest-created** run, not the active-run-preferred selection used by ordinary status. The exact branch need not be checked out or even exist as a local ref. Linked worktrees resolve to their registered repository. This mode reads existing storage without creating or migrating it, contacting the daemon or forge, fetching, updating refs, or advancing the pipeline. It emits no telemetry and successful snapshots offer no mutation commands. An unregistered-repository error may suggest `no-mistakes init`; the query itself never initializes it.
+
+The complete branch inventory, selected run, pinned plan and step states come from **one database read transaction**. Gate pins are read with the inventory, and step records are read in one batch for the entire inventory. The snapshot proves recorded state at query time, not live forge state, and is not a lock against a new run or publication after the read. It does not decide whether to merge or whether a published descendant of the reviewed head is acceptable.
+
+| Field | Meaning |
+| --- | --- |
+| `scope.repository_id`, `scope.branch` | Registered local repository identity and exact branch shared by every inventory row. The selected run repeats both. |
+| `inventory_complete` | Always `true` on success; `runs` is uncapped and contains every stored run on that repository and branch. |
+| `creation_order` | `created_at DESC, id DESC`: newest timestamp first, then lexicographically greatest full ID on a timestamp tie. This is a total order, not inferred chronology from the ID. |
+| `newest_run_id` | Full ID of the first inventory row, also selected under `run`; `null` for an empty branch. |
+| `run.created_at`, `runs[].created_at` | Exact stored creation timestamp in Unix seconds, with no display rounding. Together with each full `id`, this is the authoritative creation-order key. |
+| `run.status`, `runs[].status` | Recorded run lifecycle state, including `pending`, `running`, and terminal states. |
+| `run.current_step`, `runs[].current_step` | Active or parked step, otherwise the first recorded pending step for a nonterminal run; `null` for terminal runs or when no phase is recorded. Step states distinguish Review from CI monitoring. |
+| `run.outcome` | Existing terminal outcome vocabulary (including `passed`, qualified passes, failure and cancellation); `null` while nonterminal. |
+| `run.head_sha` | Full mutable run head, **not** publication or Review authority. |
+| `run.reviewed_head_sha` | Full durable Review-approved head, distinct from `head_sha` and `last_pushed_sha`; `null` when approval is unavailable or revoked. |
+| `run.last_pushed_sha`, `run.last_pushed_at`, `run.push_generation` | Exact last durable publication head, publication time in Unix seconds, and monotonically increasing publication generation; never inferred from Git refs or the mutable head. |
+| `run.push_target_kind`, `run.push_target_fingerprint`, `run.push_ref` | Durable target kind (`upstream` or `fork`), credential-free target fingerprint, and full published `refs/heads/<branch>` ref. |
+| `run.push_active` | Durable marker that a pipeline phase currently owns a possible branch-head update. A recorded last publication is not evidence that an active publication has settled. |
+| `run.pr` | Recorded PR URL, or `null`; no live PR lookup is performed. |
+| `run.steps` | Ordered plan through CI, including every pinned repository command gate. Rows have one-based `position`, exact `step`, `recorded`, and `status`. An absent required record is `recorded: false, status: null`, never silently counted as pending or completed. A step not in this plan was not configured for the run. An absent gate pin means the core plan for legacy runs. |
+| `runs` | Complete same-branch inventory with full `id`, `created_at`, `status`, and `current_step`, in creation order. |
+| `other_running_run_ids` | IDs of **all other** same-branch `pending` or `running` runs, including older ones; excludes the selected run. |
+
+Publication fields are unconditional: each appears even when its recorded value is `null`. Legacy or incomplete provenance remains unavailable, never synthesized. If the stored schema predates Review approval or publication columns, their values remain `null` without migrating storage; an absent `push_active` marker reports `false`. Malformed scope, stored identities, SHAs, statuses, timestamps, gate pins or step records, and unreadable or incompatible storage exit nonzero with `error`, not an empty success. A genuinely empty branch succeeds with `newest_run_id: null`, `run: null`, empty `runs` and `other_running_run_ids`, and `inventory_complete: true`.
+
+The target fingerprint uses the existing `branchsync.TargetFingerprint` algorithm: lowercase hexadecimal SHA-256 of the UTF-8 canonical target string. Canonicalization trims surrounding whitespace; for a parseable URL with a nonempty scheme it removes the fragment, and for HTTP(S) also removes user information and lowercases scheme and host; it then removes one trailing `/`. A non-URL target only has whitespace and one trailing `/` removed. SSH and HTTPS spellings are not interchangeable fingerprints. Compare using the exact configured push-target spelling with this normalization, not an unrelated transport URL. The query deliberately does not substitute today's registered target URL for a run's historical publication target.
+
+For example, a merge automation can compare its live PR head with `run.last_pushed_sha`, inspect every required pre-CI step and the CI phase, and check the complete inventory for competing runs. It must handle `null` provenance explicitly; a mutable head, green forge checks, or an older passing run is not a substitute for the newest run's publication record.
 
 ## no-mistakes axi sync
 
@@ -718,6 +764,7 @@ no-mistakes rerun --intent "the revised user goal"
 no-mistakes rerun --model openai-codex/gpt-5.4 --effort high
 no-mistakes rerun --no-publish-intent
 no-mistakes rerun --closes 95
+no-mistakes rerun --pr-body-file ./pr.md
 ```
 
 `--model` and `--effort` opt this new run into a [pinned Pi profile](/no-mistakes/reference/global-config/#per-run-pi-profiles), with the same precedence and validation as `axi run`. Omitting both retains current global-config behavior; a prior run's model pin is not inherited.
@@ -757,6 +804,8 @@ failed step instead of repeating every completed step.
 | `--intent` | `string` | (none) | Explicit intent overriding inherited intent or fresh inference |
 | `--no-publish-intent` | `bool` | `false` | Keep the generated `## Intent` section out of the PR body for this rerun (adds to the inherited decision; tighten-only) |
 | `--closes` | `string`, repeatable | (none) | Issue the PR fully resolves; adds to the [closing references](#closing-issues) inherited from the selected prior run |
+| `--pr-title` | `string` | (none) | Replace the inherited [supplied PR title](#supplied-pr-title-and-description); used only if this rerun creates the PR |
+| `--pr-body-file` | `string` | (none) | Replace the inherited supplied PR description from a file, or `-` for stdin |
 | `--model` | `string` | (none) | Pi provider/model ID for an immutable [per-run profile](/no-mistakes/reference/global-config/#per-run-pi-profiles) |
 | `--effort` | `string` | (none) | Pi reasoning effort for that profile; omitted fields inherit `agent_config.pi` |
 

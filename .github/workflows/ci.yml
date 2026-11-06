@@ -142,9 +142,14 @@ jobs:
             Write-Host "::warning::Defender exclusions unavailable, Windows tests run untuned: $_"
           }
 
+      # internal/pipeline/steps takes 550-610s under -race on the macOS runners,
+      # right at go test's default 10m per-package limit, so the same tree timed
+      # out on one run and passed on the next. The Windows shards already set an
+      # explicit package timeout for the same reason; a real hang still dumps
+      # goroutines well inside timeout-minutes.
       - name: Test on Unix
         if: runner.os != 'Windows'
-        run: go test -race ./...
+        run: go test -race -timeout=20m ./...
 
       # Git-heavy packages are the Windows wall floor. NM_CI_WINDOWS_GIT_EXCLUDE
       # on the core shard is the union of the git, steps, daemon, and gate

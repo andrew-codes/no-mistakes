@@ -164,7 +164,10 @@ func TestPiStrictDeclarationSatisfiesTheStrictFunctionContract(t *testing.T) {
 			}
 			// The run's output validation is irrelevant here: the fake Pi has
 			// already copied the extension the adapter launched it with.
-			_, _ = pi.Run(context.Background(), agent.RunOpts{Prompt: "review", CWD: cwd, JSONSchema: schema})
+			_, runErr := pi.Run(context.Background(), agent.RunOpts{Prompt: "review", CWD: cwd, JSONSchema: schema})
+			if _, err := os.Stat(filepath.Join(cwd, "pi-extension.ts")); err != nil {
+				t.Fatalf("fake Pi never saved its extension (run error: %v)", runErr)
+			}
 			declaration := strictPiDeclaration(t, cwd)
 			if violations := strictSchemaViolations(declaration, "/"); len(violations) > 0 {
 				t.Fatalf("strict declaration violates the function contract: %s", strings.Join(violations, "; "))

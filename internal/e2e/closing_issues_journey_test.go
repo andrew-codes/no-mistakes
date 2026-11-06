@@ -168,13 +168,19 @@ func waitPublished(t *testing.T, h *Harness, branch, prevID, label string) *ipc.
 
 // settlePublished brings a run whose PR step completed to rest from a possibly
 // stale snapshot of it: a live run is cancelled, a terminal one must be a
-// successful outcome.
+// successful outcome. Either way it returns only once the daemon has finished
+// with the run, because a run that ends successfully still refreshes the PR
+// description (PRStep.FinalizeRun) after its status turns terminal. A caller
+// that edits the PR body straight after the run reads as finished races that
+// refresh, which rewrites the generated sections from the body it read before
+// the edit.
 func settlePublished(t *testing.T, h *Harness, run *ipc.RunInfo, branch, label string) *ipc.RunInfo {
 	t.Helper()
 	if !run.Status.Terminal() {
 		err := h.TryCancelRun(run.ID)
 		if err == nil {
 			h.WaitForRun(branch, time.Minute)
+			waitRunForgotten(t, h, run.ID)
 			return run
 		}
 		if !strings.Contains(err.Error(), "no active run") {
@@ -194,7 +200,26 @@ func settlePublished(t *testing.T, h *Harness, run *ipc.RunInfo, branch, label s
 		// validation verdict and released the branch instead of waiting.
 		t.Fatalf("%s: run %s status=%s error=%v", label, run.ID, run.Status, deref(run.Error))
 	}
+	waitRunForgotten(t, h, run.ID)
 	return run
+}
+
+// waitRunForgotten waits out the daemon's post-finish work on runID: it records
+// the terminal status first, then finalizes the PR description, and only then
+// forgets the run, after which a cancel is refused with "no active run".
+func waitRunForgotten(t *testing.T, h *Harness, runID string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		err := h.TryCancelRun(runID)
+		if err != nil && strings.Contains(err.Error(), "no active run") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("run %s still held by the daemon 30s after finishing (err=%v)", runID, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func TestClosingIssueRefsGitHubJourney(t *testing.T) {

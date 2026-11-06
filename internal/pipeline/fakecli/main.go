@@ -1750,6 +1750,13 @@ func fakeTWGPullRequests(args []string) {
 		// FAKE_CLI_BB_MERGEABILITY_JSON overrides the merge-check listing; the
 		// default is a PR whose git and commits-behind checks both pass.
 		checks := os.Getenv("FAKE_CLI_BB_MERGEABILITY_JSON")
+		// FAKE_CLI_BB_MERGEABILITY_FILE wins when its file is readable, so a
+		// test can flip the merge checks between two polls of one monitor.
+		if path := os.Getenv("FAKE_CLI_BB_MERGEABILITY_FILE"); path != "" {
+			if data, err := os.ReadFile(path); err == nil {
+				checks = string(data)
+			}
+		}
 		if checks == "" {
 			checks = `[{"type":"git_mergeability_check","status":"PASSED","blocking":false},{"type":"merge_check","check":{"kind":"maximum_commits_behind"},"status":"PASSED","blocking":false}]`
 		}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -793,7 +794,16 @@ func (s *notifyBlockStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOut
 
 func waitForStartedBranch(t *testing.T, started <-chan string, branch string) {
 	t.Helper()
-	timeout := time.After(3 * time.Second)
+	wait := 3 * time.Second
+	if runtime.GOOS == "windows" {
+		// A run's startup is git-backed (worktree, identity, hooks), which takes
+		// roughly 10x longer on Windows runners; waitForRunTerminalState scales
+		// the same way. A queued run only starts once the run ahead of it has
+		// been cancelled and torn down, so a fixed 3s bound failed this wait on
+		// a loaded runner even though the run did start.
+		wait = time.Minute
+	}
+	timeout := time.After(wait)
 	for {
 		select {
 		case got := <-started:

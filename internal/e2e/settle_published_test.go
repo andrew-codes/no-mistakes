@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"strings"
 	"testing"
 	"time"
 
@@ -31,17 +30,7 @@ func TestSettlePublishedToleratesRunFinishedBeforeCancel(t *testing.T) {
 
 	// Wait out the daemon's post-finish cleanup, after which it refuses to
 	// cancel the run.
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		err := h.TryCancelRun(finished.ID)
-		if err != nil && strings.Contains(err.Error(), "no active run") {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("run %s still cancellable 30s after finishing (err=%v)", finished.ID, err)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+	waitRunForgotten(t, h, finished.ID)
 
 	stale := *finished
 	stale.Status = types.RunRunning

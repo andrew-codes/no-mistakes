@@ -130,7 +130,7 @@ reason about in one long-lived process than inside independent hook invocations.
 
 ## Crash recovery
 
-A clean stop (`SIGTERM`, `daemon stop`, `daemon restart`) leaves a run that is fully recorded as waiting at an approval gate exactly as a crash would, so the next start resumes it at that gate. A clean stop still fails a run that is in the middle of a step.
+A clean stop (`SIGTERM`, `daemon stop`, `daemon restart`) leaves a run that is fully recorded as waiting at an approval gate, or whose CI step is only monitoring an open PR, exactly as a crash would, so the next start resumes it. A clean stop still fails a run that is in the middle of any other step.
 
 On startup, the daemon checks for runs that were left in `pending` or `running` status (which means the daemon stopped while they were active):
 
@@ -140,7 +140,8 @@ On startup, the daemon checks for runs that were left in `pending` or `running` 
 - Re-resolves and validates any configured repository forge profile before rebuilding the recovered run, so resumed provider checks and agents use the same repository-scoped identity model rather than persisted credentials or ambient active accounts
 - Before resuming a parked CI gate, re-checks its persisted PR URL through the configured provider; a currently merged or closed PR completes the stale gate, while an open, unknown, or unreachable PR remains parked. The [`protected_paths` refusal exception](/no-mistakes/reference/repo-config/#protected_paths) prevents automatic reconciliation
 - Finalizes a stale pending or running run as `checks_passed` when CI completion, readiness, and the durable release marker (set only under `ci.release_after_checks_pass`) were recorded while its PR state remained open. A default-mode run is not promoted. Recovery preserves the recorded CI duration and does not resume monitoring
-- Preserves a run that was actively monitoring CI for an already-created PR as `ci_monitor_interrupted` rather than failing it: the PR is still open, so a restart mid-monitor is not a pipeline failure. That run is terminal and never resumed
+- Resumes a run whose CI step was only monitoring an already-created PR (step `running`, no agent recorded, no fix round in flight): the CI step starts again as a fresh observation of the live PR, so conflicts, a failing merge check, review feedback and red checks that arrive after the restart are still repaired until the PR merges or closes. Fix rounds the step already recorded still count against `auto_fix.ci`. It resumes only when the worktree exists and its checked-out commit equals the run's last pushed commit, so an unpushed CI auto-fix commit is never adopted
+- Preserves any other run that was monitoring CI for an already-created PR (a fix round in flight, an agent still recorded, a missing worktree or a worktree head that differs from the pushed one) as `ci_monitor_interrupted` rather than failing it: the PR is still open, so a restart is not a pipeline failure. That run is terminal and is not resumed
 - Before failing any other stale active run, verifies its managed worktree head and pins an unpublished descendant under the run-specific recovery ref so later rerun or guarded custody recovery does not fall back to a stale gate branch
 - Marks every other stale active run as `failed` with the message "daemon crashed during execution"
 - Reaps orphaned managed agent servers left behind by a crashed daemon or setup wizard
@@ -173,6 +174,6 @@ The [starting and stopping](#starting-and-stopping) section owns the active-run
 guard, the top-level `--force` override, and the separate validation-step
 containment rule.
 
-1. Cancels all active runs, except that a run fully recorded as waiting at an approval gate keeps its record and worktree so the next start resumes it (see [Crash recovery](#crash-recovery))
+1. Cancels all active runs, except that a run fully recorded as waiting at an approval gate, or whose CI step is only monitoring an open PR, keeps its record and worktree so the next start resumes it (see [Crash recovery](#crash-recovery))
 2. Waits up to 30 seconds for goroutines to finish
 3. Removes the PID file and socket

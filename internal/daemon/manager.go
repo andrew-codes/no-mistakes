@@ -152,6 +152,10 @@ type recoveredRunPlan struct {
 	agent   agent.Agent
 	steps   []pipeline.Step
 	forge   *forgecontext.Context
+	// ciMonitor marks a run that was not parked at a gate but only watching its
+	// open PR when the daemon stopped. It resumes by monitoring again
+	// (Executor.ResumeCIMonitor), not by answering a recorded gate.
+	ciMonitor bool
 }
 
 func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPlan {
@@ -181,8 +185,15 @@ func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPl
 }
 
 func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*recoveredRunPlan, error) {
-	if run == nil || run.Status != types.RunRunning || run.AwaitingAgentSince == nil || run.Branch == "" {
-		return nil, fmt.Errorf("run is not a parked running run")
+	if run == nil || run.Status != types.RunRunning || run.Branch == "" {
+		return nil, fmt.Errorf("run is not a running run")
+	}
+	// A run that is not parked is resumable only as an idle CI monitor. Checked
+	// from the step records alone, before the config and agent below are built
+	// for every ordinary mid-step run that recovery is about to fail anyway.
+	ciMonitor := run.AwaitingAgentSince == nil
+	if ciMonitor && !m.hasIdleCIMonitor(run) {
+		return nil, fmt.Errorf("run is neither parked nor monitoring CI")
 	}
 	repo, err := m.db.GetRepo(run.RepoID)
 	if err != nil {
@@ -213,7 +224,12 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 		return nil, err
 	}
 	execSteps := steps.WithCustomGates(m.steps(), cfg.Gates)
-	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
+	if ciMonitor {
+		_, err = pipeline.ValidateRecoveredCIMonitor(m.db, run, execSteps)
+	} else {
+		err = pipeline.ValidateRecoveredRun(m.db, run, execSteps)
+	}
+	if err != nil {
 		return nil, err
 	}
 	forgeCtx, err := forgecontext.Resolve(ctx, cfg.ForgeProfiles, repo.UpstreamURL, repo.ForkURL)
@@ -253,7 +269,27 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 		agent:   ag,
 		steps:   execSteps,
 		forge:   forgeCtx,
+
+		ciMonitor: ciMonitor,
 	}, nil
+}
+
+// hasIdleCIMonitor reports whether the run's CI step is running with no agent
+// recorded and a pull request to watch.
+func (m *RunManager) hasIdleCIMonitor(run *db.Run) bool {
+	if run.PRURL == nil || strings.TrimSpace(*run.PRURL) == "" {
+		return false
+	}
+	results, err := m.db.GetStepsByRun(run.ID)
+	if err != nil {
+		return false
+	}
+	for _, result := range results {
+		if result.StepName == types.StepCI {
+			return result.Status == types.StepStatusRunning && result.AgentPID == nil
+		}
+	}
+	return false
 }
 
 func validateRecoveredSessionProviders(database *db.DB, runID string, ag agent.Agent) error {
@@ -581,7 +617,11 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 				m.pumpQueue()
 			}()
 
-			if err := executor.Resume(runCtx, plan.run, plan.repo, plan.workDir); errors.Is(err, pipeline.ErrParkedAtShutdown) {
+			resume := executor.Resume
+			if plan.ciMonitor {
+				resume = executor.ResumeCIMonitor
+			}
+			if err := resume(runCtx, plan.run, plan.repo, plan.workDir); errors.Is(err, pipeline.ErrParkedAtShutdown) {
 				parkedAtShutdown = true
 				slog.Info("recovered run left parked for resume after daemon restart", "run_id", plan.run.ID)
 				return

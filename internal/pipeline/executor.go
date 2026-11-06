@@ -1049,6 +1049,100 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	}
 }
 
+// ciMonitorIdle reports whether the run's CI step is only watching an
+// already-created PR: running, with no agent process, so no fix is half
+// applied. It is the one shape a restart can resume without guessing, shared by
+// the clean-shutdown record and the startup validation.
+func (e *Executor) ciMonitorIdle(run *db.Run, stepResultID string) bool {
+	if run == nil || run.PRURL == nil || strings.TrimSpace(*run.PRURL) == "" {
+		return false
+	}
+	step, err := e.db.GetStepResult(stepResultID)
+	if err != nil || step == nil {
+		return false
+	}
+	return step.Status == types.StepStatusRunning && step.AgentPID == nil
+}
+
+// ValidateRecoveredCIMonitor accepts a run the daemon stopped on while its CI
+// step was only monitoring an open PR, and returns the CI step's index. Anything
+// else - a step mid-fix, an agent still recorded, steps out of order, no PR - is
+// not resumable and is left to the ordinary stale-run recovery.
+func ValidateRecoveredCIMonitor(database *db.DB, run *db.Run, steps []Step) (int, error) {
+	if run == nil || run.Status != types.RunRunning || run.AwaitingAgentSince != nil {
+		return 0, fmt.Errorf("run is not an unparked running run")
+	}
+	if run.PRURL == nil || strings.TrimSpace(*run.PRURL) == "" {
+		return 0, fmt.Errorf("run has no pull request to monitor")
+	}
+	e := &Executor{db: database, steps: steps}
+	results, err := e.db.GetStepsByRun(run.ID)
+	if err != nil {
+		return 0, fmt.Errorf("get recovered steps: %w", err)
+	}
+	if len(results) != len(steps) {
+		return 0, fmt.Errorf("recovered run has %d step records for %d steps", len(results), len(steps))
+	}
+	ciIndex := -1
+	for index, result := range results {
+		if result.StepName != steps[index].Name() {
+			return 0, fmt.Errorf("recovered step %d is %q, want %q", index, result.StepName, steps[index].Name())
+		}
+		switch {
+		case ciIndex < 0 && result.StepName == types.StepCI:
+			if !e.ciMonitorIdle(run, result.ID) {
+				return 0, fmt.Errorf("recovered ci step is %s, not an idle monitor", result.Status)
+			}
+			ciIndex = index
+		case ciIndex < 0:
+			if result.Status != types.StepStatusCompleted && result.Status != types.StepStatusSkipped {
+				return 0, fmt.Errorf("recovered step %s is %s before the ci monitor", result.StepName, result.Status)
+			}
+		default:
+			if result.Status != types.StepStatusPending && result.Status != types.StepStatusSkipped {
+				return 0, fmt.Errorf("recovered step %s is %s after the ci monitor", result.StepName, result.Status)
+			}
+		}
+	}
+	if ciIndex < 0 {
+		return 0, fmt.Errorf("recovered run has no ci step")
+	}
+	return ciIndex, nil
+}
+
+// ResumeCIMonitor restarts the CI step of a run whose daemon stopped while the
+// step was watching an open PR (ValidateRecoveredCIMonitor), so the monitor
+// goes on repairing and answering the PR until it merges or closes instead of
+// ending at ci_monitor_interrupted. Nothing is replayed: the step begins as a
+// fresh observation of the live PR, with the fix-round history it already
+// recorded counting against auto_fix.ci.
+func (e *Executor) ResumeCIMonitor(ctx context.Context, run *db.Run, repo *db.Repo, workDir string) error {
+	e.workDir = workDir
+	ctx = e.runContext(ctx)
+	if repo == nil {
+		return fmt.Errorf("recovered run has no repository")
+	}
+	ciIndex, err := ValidateRecoveredCIMonitor(e.db, run, e.steps)
+	if err != nil {
+		return err
+	}
+	if err := e.validateSkippedReview(run, repo); err != nil {
+		return e.failRun(run, repo, err, ctx)
+	}
+	logDir := e.paths.RunLogDir(run.ID)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return e.failRun(run, repo, fmt.Errorf("create log dir: %w", err))
+	}
+	if err := recordCommandConfiguration(logDir, "resume", e.config); err != nil {
+		return e.failRun(run, repo, err)
+	}
+	e.initializeRunScopes(run.ID)
+	e.crashRetryRecovered = true
+	// revalidating admits the CI step's own `running` record; the steps after
+	// it are still pending.
+	return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, ciIndex, true)
+}
+
 func (e *Executor) runContext(ctx context.Context) context.Context {
 	if e.forge == nil {
 		return ctx
@@ -1622,6 +1716,13 @@ rounds:
 				}
 				e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, stepName, string(types.StepStatusCompleted), "", "", &durationMS)
 				return false, "", ErrHandoff
+			}
+			// A clean daemon stop reaches an idle CI monitor the way a crash
+			// does, and must leave the same record: the PR is still open and
+			// the next start resumes watching it (ResumeCIMonitor). Failing the
+			// step here would end the watch for good.
+			if stepName == types.StepCI && errors.Is(contextCause, ErrDaemonShutdown) && e.ciMonitorIdle(run, sr.ID) {
+				return false, "", ErrParkedAtShutdown
 			}
 			// Persist the failure reason to the step's own log file. The error
 			// often carries the only detail of why the step failed (e.g. git

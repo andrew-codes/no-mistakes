@@ -1,6 +1,7 @@
 package db
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -124,5 +125,72 @@ func TestIntentCache_Cleanup(t *testing.T) {
 	}
 	if got, _ := d.GetIntentCache("new"); got == nil {
 		t.Errorf("expected new entry retained")
+	}
+}
+
+func TestGetOriginalPRIntent(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/tmp/work", "https://github.com/o/r", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := d.InsertRepo("/tmp/other", "https://github.com/o/other", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const url = "https://github.com/o/r/pull/7"
+	recordIn := func(repoID, intent, prURL string) {
+		t.Helper()
+		run, err := d.InsertRun(repoID, "refs/heads/feature", "head", "base")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if intent != "" {
+			if err := d.UpdateRunIntent(run.ID, RunIntent{Summary: intent, Source: RunIntentSourceAgent}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if prURL != "" {
+			if err := d.UpdateRunPRURL(run.ID, prURL); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if got, err := d.GetOriginalPRIntent(repo.ID, url); err != nil || got != nil {
+		t.Fatalf("no runs: got %+v, %v", got, err)
+	}
+	recordIn(repo.ID, "", url)             // no intent recorded: skipped
+	recordIn(repo.ID, "original", url+"/") // first with an intent; trailing slash and
+	recordIn(repo.ID, "correction", url)   // later runs on the same PR do not displace it
+	recordIn(repo.ID, "other pr", url+"0") // a different PR
+	recordIn(other.ID, "other repo", url)  // the same URL in another repo
+	got, err := d.GetOriginalPRIntent(repo.ID, strings.ToUpper(url))
+	if err != nil || got == nil || got.Summary != "original" || got.Source != RunIntentSourceAgent {
+		t.Fatalf("got %+v, %v; want the earliest intent bound to the PR", got, err)
+	}
+	// The most recent replace run becomes the anchor; plain runs after it do not.
+	record := func(intent, source string) {
+		t.Helper()
+		run, err := d.InsertRun(repo.ID, "refs/heads/feature", "head", "base")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d.UpdateRunIntent(run.ID, RunIntent{Summary: intent, Source: source}); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.UpdateRunPRURL(run.ID, url); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record("first replacement", RunIntentSourceReplace)
+	record("plain after replacement", RunIntentSourceAgent)
+	record("second replacement", RunIntentSourceReplace)
+	record("plain after second", RunIntentSourceAgent)
+	if got, err := d.GetOriginalPRIntent(repo.ID, url); err != nil || got == nil || got.Summary != "second replacement" || got.Source != RunIntentSourceReplace {
+		t.Fatalf("got %+v, %v; want the latest replace run", got, err)
+	}
+	if got, err := d.GetOriginalPRIntent(repo.ID, ""); err != nil || got != nil {
+		t.Fatalf("empty URL: got %+v, %v", got, err)
 	}
 }

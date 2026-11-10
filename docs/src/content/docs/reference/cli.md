@@ -157,6 +157,7 @@ no-mistakes axi run --intent "the user's goal" --pr-title "Add widget export" --
 | `--skip`        | `string` | (none)  | Comma-separated pipeline steps to skip                                                               |
 | `--base-branch` | `string` | (none)  | Integration branch for this run only; overrides [`pr.base_branch`](/no-mistakes/reference/repo-config/#prbase_branch) |
 | `--no-publish-intent` | `bool` | `false` | Keep the generated `## Intent` section out of the PR body for this run; tighten-only, see below |
+| `--replace-intent` | `bool` | `false` | Declare `--intent` a deliberate change of direction that replaces the intent the PR description is anchored to; see [Replacing the PR intent](#replacing-the-pr-intent) |
 | `--closes` | `string`, repeatable | (none) | Issue the PR fully resolves (`95`, `owner/repo#95`, or a nested GitLab project path); see [Closing issues](#closing-issues) |
 | `--pr-title` | `string` | (none) | PR title used verbatim when this run creates the PR; see [Supplied PR title and description](#supplied-pr-title-and-description) |
 | `--pr-body-file` | `string` | (none) | Read the PR description used verbatim when this run creates the PR; `-` reads stdin to EOF |
@@ -171,6 +172,14 @@ no-mistakes uses the supplied text instead of transcript inference; see [Intent 
 Err on the side of completeness: include the goal, important decisions and tradeoffs, constraints or approaches ruled in or out, and explicit requests that might otherwise look surprising in the diff.
 When starting a new run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing.
 Ordinary reattachment to an in-flight run does not require intent input and never replaces that run's intent, even if new text is supplied. [Strict launch receipts](#strict-launch-receipts) require the original intent bytes on every retry, using any of the input transports below.
+
+### Replacing the PR intent
+
+The PR description's `## Intent` section stays anchored to the intent the PR was opened with. A later run's `--intent` drives that run's own review, test and fix prompts, but it does not change the description, so a resubmission after a rebase, merge conflict, failing test, CI fix or review feedback keeps the original. Pass the original user intent on those resubmissions.
+
+`--replace-intent` is the only way to change the anchor, for a genuine change of direction the user asked for. Together with the new `--intent` it makes the new text the published Intent, and every later run on that PR (plain `--intent`, rerun inheritance, or inference) keeps the new one until another run passes `--replace-intent`. The decision is recorded on the run as intent source `replace`; a rerun that inherits it records the ordinary `rerun` source, so only the run that made the decision is an anchor, and the anchor is scoped to the PR URL, not the branch. It takes effect when a run publishes the description, so resubmit with the flag if the run did not reach the PR step. `--no-publish-intent` and `pr.publish_intent` still apply to the current run and only ever remove the section.
+
+The flag is refused with `--launch-nonce`, and it does not apply when reattaching to an active run (abort the run first). `no-mistakes rerun --replace-intent --intent TEXT` carries it too. An older daemon ignores the option and keeps the anchored intent; restart the daemon after updating.
 
 ### Intent input
 
@@ -803,6 +812,7 @@ failed step instead of repeating every completed step.
 | ---- | ---- | ------- | ----------- |
 | `--intent` | `string` | (none) | Explicit intent overriding inherited intent or fresh inference |
 | `--no-publish-intent` | `bool` | `false` | Keep the generated `## Intent` section out of the PR body for this rerun (adds to the inherited decision; tighten-only) |
+| `--replace-intent` | `bool` | `false` | Requires `--intent`; declares it a deliberate change of direction that replaces the PR description's anchored intent, see [Replacing the PR intent](/no-mistakes/reference/cli/#replacing-the-pr-intent) |
 | `--closes` | `string`, repeatable | (none) | Issue the PR fully resolves; adds to the [closing references](#closing-issues) inherited from the selected prior run |
 | `--pr-title` | `string` | (none) | Replace the inherited [supplied PR title](#supplied-pr-title-and-description); used only if this rerun creates the PR |
 | `--pr-body-file` | `string` | (none) | Replace the inherited supplied PR description from a file, or `-` for stdin |

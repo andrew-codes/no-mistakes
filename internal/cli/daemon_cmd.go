@@ -134,6 +134,7 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			replaceIntent := parseReplaceIntentPushOptions(pushOptions)
 			piProfile, err := parsePiProfilePushOptions(pushOptions)
 			if err != nil {
 				return err
@@ -184,6 +185,7 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				ValidationGeneration:   validationGeneration,
 				PRBaseBranch:           prBaseBranch,
 				OmitIntent:             omitIntent,
+				ReplaceIntent:          replaceIntent,
 				PiProfile:              piProfile,
 				VerificationPlanID:     verificationPlanID,
 				ReconciledPreviousHead: reconciledPreviousHead,
@@ -385,6 +387,29 @@ func parseOmitIntentPushOptions(options []string) (bool, error) {
 		}
 	}
 	return omit, nil
+}
+
+// replaceIntentPushOption carries axi run --replace-intent through a git push.
+const replaceIntentPushOption = "no-mistakes.replace-intent"
+
+// formatReplaceIntentPushOption encodes the deliberate change-of-direction
+// request as a push option. An absent request formats to no option at all.
+func formatReplaceIntentPushOption(replace bool) string {
+	if !replace {
+		return ""
+	}
+	return replaceIntentPushOption
+}
+
+// parseReplaceIntentPushOptions reports whether the push carried the
+// replace-intent request. Repetition is harmless; the value is boolean.
+func parseReplaceIntentPushOptions(options []string) bool {
+	for _, option := range options {
+		if option == replaceIntentPushOption {
+			return true
+		}
+	}
+	return false
 }
 
 // requireDaemonHonorsOmitIntent probes the running daemon before any RPC

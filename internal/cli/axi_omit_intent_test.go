@@ -276,3 +276,19 @@ func TestAxiRunNoPublishIntentPassesCapableDaemonProbe(t *testing.T) {
 		t.Fatalf("capable daemon was refused:\n%s", out.String())
 	}
 }
+
+func TestReplaceIntentPushOptionRoundTrips(t *testing.T) {
+	t.Parallel()
+	if got := formatReplaceIntentPushOption(true); got != "no-mistakes.replace-intent" {
+		t.Fatalf("formatReplaceIntentPushOption(true) = %q", got)
+	}
+	if got := formatReplaceIntentPushOption(false); got != "" {
+		t.Fatalf("formatReplaceIntentPushOption(false) = %q, want no option", got)
+	}
+	if parseReplaceIntentPushOptions([]string{"no-mistakes.omit-intent"}) {
+		t.Fatal("an unrelated option requested replacement")
+	}
+	if !parseReplaceIntentPushOptions([]string{"no-mistakes.skip=test", formatReplaceIntentPushOption(true)}) {
+		t.Fatal("the replace option was not parsed")
+	}
+}

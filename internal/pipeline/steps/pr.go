@@ -177,6 +177,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		return nil, err
 	}
 	if existing != nil {
+		// The description keeps the intent the PR was opened with, not the
+		// latest run's restatement of a correction. See pinPublishedIntent.
+		defer pinPublishedIntent(sctx, existing)()
 		var live scm.PRContent
 		if reader, ok := host.(scm.PRContentReader); ok {
 			live, err = reader.GetPRContent(ctx, existing)

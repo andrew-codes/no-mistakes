@@ -1084,6 +1084,38 @@ func (d *DB) UpdateRunIntent(id string, intent RunIntent) error {
 	return nil
 }
 
+// GetOriginalPRIntent returns the intent of the first run in a repo that
+// carried a non-empty intent and is bound to the given PR URL, or nil when no
+// such run exists. It is the anchor for the PR body's published Intent
+// section: later runs on the same PR (reruns, resubmissions after a rebase or
+// a failed gate) keep driving their own prompts with their own intent, but
+// the section reviewers read stays the one the PR was opened with.
+//
+// The PR URL, not the branch, scopes the lookup: a branch reused for a new PR
+// after the old one merged or closed starts a new intent.
+func (d *DB) GetOriginalPRIntent(repoID, prURL string) (*RunIntent, error) {
+	prURL = strings.TrimRight(strings.TrimSpace(prURL), "/")
+	if prURL == "" {
+		return nil, nil
+	}
+	var summary string
+	var source sql.NullString
+	err := d.sql.QueryRow(
+		`SELECT intent, intent_source FROM runs
+		 WHERE repo_id = ? AND lower(rtrim(pr_url, '/')) = lower(?)
+		   AND intent IS NOT NULL AND trim(intent) <> ''
+		 ORDER BY created_at ASC, id ASC LIMIT 1`,
+		repoID, prURL,
+	).Scan(&summary, &source)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get original PR intent: %w", err)
+	}
+	return &RunIntent{Summary: summary, Source: source.String}, nil
+}
+
 // ErrClosingIssueRefsLocked reports that a PR body composition already sampled
 // a run's closing issue references, so a later update cannot reach the Issues section. It is
 // the fail-closed half of the claim protocol described on

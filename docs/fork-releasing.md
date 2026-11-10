@@ -56,7 +56,7 @@ Run **Actions > fork-release > Run workflow** to exercise the pipeline without s
 ## One-time repository setup
 
 - Settings > Actions > General > Workflow permissions: allow read and write. The workflows request `contents: write` (and `pull-requests: write` for labelling), which a read-only default would cap.
-- Enable `fork-draft-release`, `fork-pr-release-label` and `fork-release` under the Actions tab. Leave `release.yml`, `publish-channels.yml` and `docs.yml` disabled.
+- Confirm `fork-draft-release`, `fork-pr-release-label` and `fork-release` show as enabled under the Actions tab (new workflow files normally start enabled). Leave `release.yml`, `publish-channels.yml` and `docs.yml` disabled.
 - To make the label check required, add `Require a version-resolvable label` as a required status check on `main`. `fork-pr-release-label` also runs on PRs from forks, so it uses `pull_request_target` and never checks out or runs PR code.
 - No secrets or environments are needed.
 

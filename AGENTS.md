@@ -95,3 +95,7 @@ Keep this file for knowledge useful to almost every future agent session in this
 Do not repeat what the codebase already shows; point to the authoritative file or command instead.
 Prefer rewriting or pruning existing entries over appending new ones.
 When updating this file, preserve this bar for all agents and keep entries concise.
+
+## Fork-only features (andrew-codes fork)
+
+Any fork-only feature change must update `FORK.md` in the same PR. Write it for end users: the capability they gain, in plain language, with no file, package, function, PR or commit references. Document every new flag or setting in its "New configuration" section with what it is, what it controls, and a real config or command example.

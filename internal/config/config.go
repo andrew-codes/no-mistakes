@@ -1378,6 +1378,11 @@ type Evidence struct {
 	// for GitLab so uploading real-data screenshots requires explicit opt-in.
 	GitLabAttachMedia bool
 
+	// BitbucketAttachMedia is the same setting again, off unless set to true,
+	// because uploading screenshots to a Bitbucket repository's Downloads makes
+	// them readable by everyone who can read the repository.
+	BitbucketAttachMedia bool
+
 	Dir    string
 	Branch string
 	// CommitMessage is the configured subject template; empty keeps the
@@ -3777,6 +3782,7 @@ func applyTestOverrides(dst *Test, src *TestRaw) {
 	if src.Evidence.AttachMedia != nil {
 		dst.Evidence.AttachMedia = *src.Evidence.AttachMedia
 		dst.Evidence.GitLabAttachMedia = *src.Evidence.AttachMedia
+		dst.Evidence.BitbucketAttachMedia = *src.Evidence.AttachMedia
 	}
 	if src.Evidence.Dir != nil && strings.TrimSpace(*src.Evidence.Dir) != "" {
 		dst.Evidence.Dir = strings.TrimSpace(*src.Evidence.Dir)

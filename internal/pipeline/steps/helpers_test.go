@@ -481,6 +481,7 @@ type bbFakeStateForTest struct {
 	Source       string            `json:"source,omitempty"`
 	Dest         string            `json:"dest,omitempty"`
 	SourceCommit string            `json:"source_commit,omitempty"`
+	Uploads      []string          `json:"uploads,omitempty"`
 	Others       []bbFakePRForTest `json:"others,omitempty"`
 }
 

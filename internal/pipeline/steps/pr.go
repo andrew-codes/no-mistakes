@@ -1033,7 +1033,7 @@ func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider s
 	if owned && provider == scm.ProviderBitbucket && pipelineMD != "" {
 		pipelineMD += "\n\n```text\n" + buildPipelineAttestationWithPolicy(steps, rounds, sctx.Run.HeadSHA, policy) + "\n```"
 	}
-	evidenceMD = s.gitlabEvidenceSection(sctx, provider)
+	evidenceMD = s.providerEvidenceSection(sctx, provider)
 	return pipelineMD, riskLine, testingMD, evidenceMD
 }
 

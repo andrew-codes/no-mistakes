@@ -1674,6 +1674,9 @@ type bbFakeState struct {
 	Source       string `json:"source,omitempty"`
 	Dest         string `json:"dest,omitempty"`
 	SourceCommit string `json:"source_commit,omitempty"`
+	// Uploads lists the images a write uploaded to Downloads, in order, one entry
+	// per upload (a re-upload of the same name is listed again).
+	Uploads []string `json:"uploads,omitempty"`
 	// Published is set once a `create` or a description `update` was served,
 	// for FAKE_CLI_BB_GET_FAIL_AFTER_PUBLISH.
 	Published bool `json:"published,omitempty"`
@@ -1960,7 +1963,7 @@ func fakeTWGPullRequests(args []string) {
 	case "create":
 		title, _ := fakeCLIFlagValue(rest, "--title")
 		descFile, _ := fakeCLIFlagValue(rest, "--description-file")
-		description := fakeReadDescriptionFile(descFile)
+		description := fakeTWGEmbedImages(&state, rest, fakeReadDescriptionFile(descFile))
 		state.Exists = true
 		if state.ID == 0 {
 			state.ID = 99
@@ -2014,7 +2017,7 @@ func fakeTWGPullRequests(args []string) {
 			state.Title = title
 		}
 		descFile, _ := fakeCLIFlagValue(rest, "--description-file")
-		state.Description = fakeReadDescriptionFile(descFile)
+		state.Description = fakeTWGEmbedImages(&state, rest, fakeReadDescriptionFile(descFile))
 		state.Puts++
 		state.Published = true
 		saveBBState(state)
@@ -2118,6 +2121,74 @@ func fakeTWGComment(args []string) {
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+// fakeCLIFlagValues returns every value of a repeatable flag, in order.
+func fakeCLIFlagValues(args []string, flag string) []string {
+	var values []string
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) {
+			values = append(values, args[i+1])
+		}
+	}
+	return values
+}
+
+// fakeTWGEmbedImages does what `--image` does on a PR write: each image is
+// checked the way twg checks it (type, size, readable), recorded as uploaded,
+// and the description's {{image}} / {{image:N}} placeholder lines become an
+// embed of the uploaded file. FAKE_CLI_BB_REJECT_IMAGES makes Bitbucket refuse
+// every image upload.
+func fakeTWGEmbedImages(state *bbFakeState, args []string, description string) string {
+	paths := fakeCLIFlagValues(args, "--image")
+	if len(paths) == 0 {
+		return description
+	}
+	if msg := os.Getenv("FAKE_CLI_BB_REJECT_IMAGES"); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
+		os.Exit(1)
+	}
+	names := fakeCLIFlagValues(args, "--image-name")
+	workspace, _ := fakeCLIFlagValue(args, "--workspace")
+	repoSlug, _ := fakeCLIFlagValue(args, "--repo")
+	embeds := make([]string, len(paths))
+	for i, path := range paths {
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".png", ".jpg", ".jpeg", ".gif", ".webp":
+		default:
+			fmt.Fprintln(os.Stderr, "unsupported image type:", filepath.Ext(path))
+			os.Exit(1)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cannot read image:", err)
+			os.Exit(1)
+		}
+		if info.Size() > 10<<20 {
+			fmt.Fprintln(os.Stderr, "image is larger than 10 MiB")
+			os.Exit(1)
+		}
+		name := filepath.Base(path)
+		if i < len(names) {
+			name = names[i]
+		}
+		state.Uploads = append(state.Uploads, name)
+		embeds[i] = fmt.Sprintf("![%s](https://bitbucket.org/%s/%s/downloads/%s)", name, workspace, repoSlug, name)
+	}
+	lines := strings.Split(description, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "{{image}}" {
+			lines[i] = embeds[0]
+			continue
+		}
+		if strings.HasPrefix(trimmed, "{{image:") && strings.HasSuffix(trimmed, "}}") {
+			if n, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(trimmed, "{{image:"), "}}")); err == nil && n >= 1 && n <= len(embeds) {
+				lines[i] = embeds[n-1]
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func fakeReadDescriptionFile(path string) string {

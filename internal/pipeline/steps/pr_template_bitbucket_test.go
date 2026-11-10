@@ -33,7 +33,7 @@ func TestPRTemplateBitbucketCreateReadbackUpdateAndPrePush(t *testing.T) {
 
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 	sctx.Env = api.Env()
-	assertNotice := capturePRProofNotice(t, sctx, "bitbucket")
+	assertNotice := captureProvenPRHead(t, sctx)
 	if _, err := (&PRStep{}).Execute(sctx); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestPRTemplateBitbucketCreateReadbackUpdateAndPrePush(t *testing.T) {
 	// human edit is what the next Execute reads back.
 	api.setDescription(t, body)
 	sctx.Config.PR.Template = ""
-	assertNotice = capturePRProofNotice(t, sctx, "bitbucket")
+	assertNotice = captureProvenPRHead(t, sctx)
 	if _, err := (&PRStep{}).Execute(sctx); err != nil {
 		t.Fatal(err)
 	}

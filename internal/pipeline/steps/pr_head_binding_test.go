@@ -58,6 +58,25 @@ func capturePRProofNotice(t *testing.T, sctx *pipeline.StepContext, provider str
 	}
 }
 
+// captureProvenPRHead is capturePRProofNotice's counterpart for a provider that
+// proves the pushed head: neither the run log nor the body may carry the
+// unavailable notice.
+func captureProvenPRHead(t *testing.T, sctx *pipeline.StepContext) func(string) {
+	t.Helper()
+	var logs []string
+	log := sctx.Log
+	sctx.Log = func(line string) {
+		logs = append(logs, line)
+		log(line)
+	}
+	return func(body string) {
+		t.Helper()
+		if strings.Contains(strings.Join(logs, "\n"), "PR head proof unavailable") || strings.Contains(body, "PR head proof unavailable") {
+			t.Fatalf("a proven head must not carry the unavailable notice: logs=%v body=%s", logs, body)
+		}
+	}
+}
+
 func TestPRStep_ProviderWithoutProofPublishesWithNotice(t *testing.T) {
 	t.Parallel()
 	dir, base, head := setupGitRepo(t)

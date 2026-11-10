@@ -38,7 +38,7 @@ func verifyPublishedPR(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR) er
 			return nil
 		}
 		var changed *scm.PRHeadChangedError
-		if previous == "" || strings.EqualFold(previous, *run.LastPushedSHA) || !errors.As(err, &changed) || !strings.EqualFold(changed.HeadSHA, previous) {
+		if previous == "" || strings.EqualFold(previous, *run.LastPushedSHA) || !errors.As(err, &changed) || !sameCommit(changed.HeadSHA, previous) {
 			return fmt.Errorf("verify published PR: %w", err)
 		}
 		if retryUntil.IsZero() {
@@ -89,4 +89,16 @@ func publishedPRPushBinding(sctx *pipeline.StepContext, host scm.Host) (*db.Run,
 		}
 	}
 	return run, nil
+}
+
+// sameCommit reports whether two commit IDs name one commit. Providers that
+// state a head as an abbreviation (Bitbucket Cloud gives a 12-character
+// prefix) are matched against the full ID by prefix; a value shorter than 12
+// characters identifies nothing.
+func sameCommit(a, b string) bool {
+	a, b = strings.ToLower(strings.TrimSpace(a)), strings.ToLower(strings.TrimSpace(b))
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	return a != "" && (a == b || (len(a) >= 12 && strings.HasPrefix(b, a)))
 }

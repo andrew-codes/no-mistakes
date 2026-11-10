@@ -265,7 +265,8 @@ func TestEffectiveRepoConfig_EvidenceBranchTrustedOnly(t *testing.T) {
 }
 
 // The evidence-upload contract keeps GitHub on by default and requires an
-// explicit attach_media opt-in on GitLab, with repository settings taking precedence.
+// explicit attach_media opt-in on GitLab and Bitbucket, with repository settings
+// taking precedence.
 func TestTestEvidenceMerge_ProviderAttachmentDefaults(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -290,8 +291,8 @@ func TestTestEvidenceMerge_ProviderAttachmentDefaults(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := Merge(global, repo).Test.Evidence
-			if got.AttachMedia != tc.github || got.GitLabAttachMedia != tc.gitlab {
-				t.Fatalf("attachment gates = GitHub %v, GitLab %v; want %v, %v", got.AttachMedia, got.GitLabAttachMedia, tc.github, tc.gitlab)
+			if got.AttachMedia != tc.github || got.GitLabAttachMedia != tc.gitlab || got.BitbucketAttachMedia != tc.gitlab {
+				t.Fatalf("attachment gates = GitHub %v, GitLab %v, Bitbucket %v; want %v, %v, %v", got.AttachMedia, got.GitLabAttachMedia, got.BitbucketAttachMedia, tc.github, tc.gitlab, tc.gitlab)
 			}
 		})
 	}

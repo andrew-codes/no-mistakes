@@ -94,6 +94,10 @@ type Host struct {
 	cliAvailable func() bool
 	repo         RepoRef
 	draft        bool // open created PRs as drafts
+
+	// evidence and logf are set by WithEvidenceImages.
+	evidence EvidenceImages
+	logf     func(string)
 }
 
 // New builds a Host. cliAvailable reports whether the twg binary is
@@ -360,7 +364,12 @@ func (h *Host) runWithDescription(ctx context.Context, body string, buildArgs fu
 }
 
 func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PRContent) (*scm.PR, error) {
-	out, err := h.runWithDescription(ctx, content.Body, func(descPath string) []string {
+	// A PR is always created from text alone: a create that failed after it
+	// uploaded images could not be retried without risking a second PR. The
+	// images, when there are any, follow in a description update, and a failed
+	// update leaves the PR with its text-only description.
+	evidence := h.prepareEvidence(content.Body)
+	out, err := h.runWithDescription(ctx, evidence.plain, func(descPath string) []string {
 		args := []string{"bb", "pull-requests", "create",
 			"--title", content.Title,
 			"--source", branch,
@@ -389,36 +398,30 @@ func (h *Host) CreatePR(ctx context.Context, branch, base string, content scm.PR
 	if pr.ID <= 0 {
 		return nil, fmt.Errorf("twg bb pull-requests create: missing positive id: %s", strings.TrimSpace(string(out)))
 	}
-	return pr.toPR(h.repo), nil
+	created := pr.toPR(h.repo)
+	if len(evidence.imageArgs) > 0 {
+		if _, err := h.updateDescription(ctx, created, "", evidence.withImages, evidence.imageArgs); err != nil {
+			h.logEvidence("evidence images were not attached to the new pull request, its description keeps the text only: %v", err)
+		}
+	}
+	return created, nil
 }
 
 func (h *Host) UpdatePR(ctx context.Context, pr *scm.PR, content scm.PRContent) (*scm.PR, error) {
 	if pr == nil || strings.TrimSpace(pr.Number) == "" {
 		return nil, errors.New("twg bb pull-requests update: missing pull request number")
 	}
-	out, err := h.runWithDescription(ctx, content.Body, func(descPath string) []string {
-		args := []string{"bb", "pull-requests", "update",
-			"--pull-request", pr.Number,
-			"--description-file", descPath,
+	evidence := h.prepareEvidence(content.Body)
+	if len(evidence.imageArgs) > 0 {
+		updated, err := h.updateDescription(ctx, pr, content.Title, evidence.withImages, evidence.imageArgs)
+		if err == nil {
+			return updated, nil
 		}
-		if strings.TrimSpace(content.Title) != "" {
-			args = append(args, "--title", content.Title)
-		}
-		args = append(args, h.repoArgs()...)
-		return args
-	})
-	if err != nil {
-		return nil, fmt.Errorf("twg bb pull-requests update: %w", err)
+		// An image upload that Bitbucket refuses must not cost the description:
+		// the same update goes through again without the images.
+		h.logEvidence("evidence images were not attached, updating the description without them: %v", err)
 	}
-	trimmed := bytesTrimToJSON(out)
-	if len(trimmed) == 0 {
-		return nil, fmt.Errorf("twg bb pull-requests update: invalid JSON output: %s", strings.TrimSpace(string(out)))
-	}
-	var updated bitbucketPullRequest
-	if err := json.Unmarshal(trimmed, &updated); err != nil {
-		return nil, fmt.Errorf("twg bb pull-requests update: invalid JSON output: %s", strings.TrimSpace(string(out)))
-	}
-	return updated.toPR(h.repo), nil
+	return h.updateDescription(ctx, pr, content.Title, evidence.plain, nil)
 }
 
 // DraftLifecycle reports whether PRs are opened as drafts and kept there until

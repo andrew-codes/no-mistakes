@@ -185,7 +185,13 @@ func buildHost(sctx *pipeline.StepContext, provider scm.Provider) (scm.Host, str
 			return nil, err.Error()
 		}
 		draft := sctx.Config != nil && sctx.Config.Providers.Bitbucket.DraftPullRequests
-		return bitbucket.New(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, repo, draft), ""
+		host := bitbucket.New(cmdFactory, func() bool { return stepCLIAvailable(sctx, provider) }, repo, draft)
+		host.WithEvidenceImages(func() []bitbucket.EvidenceImage { return bitbucketEvidenceUploads(sctx) }, func(line string) {
+			if sctx.Log != nil {
+				sctx.Log(line)
+			}
+		})
+		return host, ""
 	case scm.ProviderAzureDevOps:
 		if sctx.Repo.ForkURL != "" {
 			// Fork PR routing for Azure DevOps is intentionally not half-wired,

@@ -1042,11 +1042,18 @@ const RunIntentSourceAgent = "agent"
 // inherited intent inspectable instead of confusing it with a new override.
 const RunIntentSourceRerun = "rerun"
 
+// RunIntentSourceReplace marks an authoritative intent supplied together with
+// `axi run --replace-intent`: a deliberate change of direction that replaces
+// the intent anchored to the run's pull request. It is the only source that
+// can; see GetOriginalPRIntent. A rerun that inherits it records
+// RunIntentSourceRerun, so only the run that made the decision is an anchor.
+const RunIntentSourceReplace = "replace"
+
 // IsAuthoritativeRunIntentSource reports whether a run's intent came from an
 // explicit operator/agent contract, either directly or through rerun
 // inheritance.
 func IsAuthoritativeRunIntentSource(source string) bool {
-	return source == RunIntentSourceAgent || source == RunIntentSourceRerun
+	return source == RunIntentSourceAgent || source == RunIntentSourceRerun || source == RunIntentSourceReplace
 }
 
 // RunIntent carries the four intent-related columns persisted on a run.
@@ -1084,36 +1091,44 @@ func (d *DB) UpdateRunIntent(id string, intent RunIntent) error {
 	return nil
 }
 
-// GetOriginalPRIntent returns the intent of the first run in a repo that
-// carried a non-empty intent and is bound to the given PR URL, or nil when no
-// such run exists. It is the anchor for the PR body's published Intent
-// section: later runs on the same PR (reruns, resubmissions after a rebase or
-// a failed gate) keep driving their own prompts with their own intent, but
-// the section reviewers read stays the one the PR was opened with.
+// GetOriginalPRIntent returns the intent anchored to a pull request, or nil
+// when no run bound to it carried one. It is the source of the PR body's
+// published Intent section: later runs on the same PR (reruns, resubmissions
+// after a rebase, a failed gate or review feedback) keep driving their own
+// prompts with their own intent, but the section reviewers read stays put.
 //
-// The PR URL, not the branch, scopes the lookup: a branch reused for a new PR
-// after the old one merged or closed starts a new intent.
+// The anchor is the intent of the most recent run bound to the PR that was
+// started with `--replace-intent` (RunIntentSourceReplace), the one deliberate
+// way to change it, and otherwise the earliest run's intent. The PR URL, not
+// the branch, scopes the lookup: a branch reused for a new PR after the old one
+// merged or closed starts a new intent.
 func (d *DB) GetOriginalPRIntent(repoID, prURL string) (*RunIntent, error) {
 	prURL = strings.TrimRight(strings.TrimSpace(prURL), "/")
 	if prURL == "" {
 		return nil, nil
 	}
-	var summary string
-	var source sql.NullString
-	err := d.sql.QueryRow(
-		`SELECT intent, intent_source FROM runs
+	const bound = `SELECT intent, intent_source FROM runs
 		 WHERE repo_id = ? AND lower(rtrim(pr_url, '/')) = lower(?)
-		   AND intent IS NOT NULL AND trim(intent) <> ''
-		 ORDER BY created_at ASC, id ASC LIMIT 1`,
-		repoID, prURL,
-	).Scan(&summary, &source)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		   AND intent IS NOT NULL AND trim(intent) <> ''`
+	for _, q := range []struct {
+		query string
+		args  []any
+	}{
+		{bound + ` AND intent_source = ? ORDER BY created_at DESC, id DESC LIMIT 1`, []any{repoID, prURL, RunIntentSourceReplace}},
+		{bound + ` ORDER BY created_at ASC, id ASC LIMIT 1`, []any{repoID, prURL}},
+	} {
+		var summary string
+		var source sql.NullString
+		err := d.sql.QueryRow(q.query, q.args...).Scan(&summary, &source)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("get original PR intent: %w", err)
+		}
+		return &RunIntent{Summary: summary, Source: source.String}, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf("get original PR intent: %w", err)
-	}
-	return &RunIntent{Summary: summary, Source: source.String}, nil
+	return nil, nil
 }
 
 // ErrClosingIssueRefsLocked reports that a PR body composition already sampled

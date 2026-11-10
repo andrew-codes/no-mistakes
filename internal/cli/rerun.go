@@ -16,6 +16,7 @@ func newRerunCmd() *cobra.Command {
 	var intent string
 	var baseBranch string
 	var noPublishIntent bool
+	var replaceIntent bool
 	var model, effort string
 	var closesIssues []string
 	var prTitle, prBodyFile string
@@ -39,6 +40,9 @@ func newRerunCmd() *cobra.Command {
 			prText, err := resolvePRTextFlags(cmd, prTitle, prBodyFile, false)
 			if err != nil {
 				return err
+			}
+			if replaceIntent && strings.TrimSpace(intent) == "" {
+				return fmt.Errorf("--replace-intent requires --intent")
 			}
 			return trackCommand("rerun", func() error {
 				p, d, err := openResources()
@@ -97,7 +101,7 @@ func newRerunCmd() *cobra.Command {
 					return err
 				}
 				var result ipc.RerunResult
-				if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{RepoID: repo.ID, Branch: branch, Intent: intent, PRBaseBranch: baseBranch, OmitIntent: noPublishIntent, CallerHeadSHA: callerHead, PiProfile: profile, ClosingIssueRefs: closes, PRTitle: prText.Title, PRBody: prText.Body}, &result); err != nil {
+				if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{RepoID: repo.ID, Branch: branch, Intent: intent, PRBaseBranch: baseBranch, OmitIntent: noPublishIntent, ReplaceIntent: replaceIntent, CallerHeadSHA: callerHead, PiProfile: profile, ClosingIssueRefs: closes, PRTitle: prText.Title, PRBody: prText.Body}, &result); err != nil {
 					return fmt.Errorf("rerun pipeline: %w", err)
 				}
 
@@ -108,6 +112,7 @@ func newRerunCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&intent, "intent", "", "explicit intent for this rerun (overrides inherited intent or fresh inference)")
 	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch for the PR for this rerun only (overrides inherited per-run base branch)")
+	cmd.Flags().BoolVar(&replaceIntent, "replace-intent", false, "--intent is a deliberate change of direction and replaces the intent the PR description is anchored to; never use it for rebases, conflicts, test or CI fixes, or review feedback")
 	cmd.Flags().BoolVar(&noPublishIntent, "no-publish-intent", false, "keep the generated Intent section out of the PR body for this rerun (adds to the inherited decision; tighten-only)")
 	cmd.Flags().StringArrayVar(&closesIssues, "closes", nil, "GitHub issue this PR closes when merged; repeat for multiple issues (42 or owner/repo#42); adds to inherited references")
 	bindPRTextFlags(cmd, &prTitle, &prBodyFile)

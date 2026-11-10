@@ -100,6 +100,10 @@ type PushReceivedParams struct {
 	// generated Intent section out of the PR body. It never publishes intent
 	// a repository's trusted config disabled.
 	OmitIntent bool `json:"omit_intent,omitempty"`
+	// ReplaceIntent marks Intent as a deliberate change of direction
+	// (axi run --replace-intent) that replaces the intent anchored to the
+	// PR's description. Without it a later run never does.
+	ReplaceIntent bool `json:"replace_intent,omitempty"`
 	// ReconciledPreviousHead is the head a reconciled private mirror branch
 	// carried before the pusher archived and removed it. The push re-creates the
 	// branch, so the hook reports no previous head of its own. It is a claim the
@@ -259,6 +263,9 @@ type RerunParams struct {
 	// run. It is tighten-only: the selected prior run's decision is always
 	// inherited and this can only add to it.
 	OmitIntent bool `json:"omit_intent,omitempty"`
+	// ReplaceIntent marks Intent as a deliberate change of direction that
+	// replaces the intent anchored to the PR's description. It requires Intent.
+	ReplaceIntent bool `json:"replace_intent,omitempty"`
 	// CallerHeadSHA is a clean caller worktree's HEAD, when known. It guards
 	// the daemon's selected head; it never supplies a replacement run head.
 	CallerHeadSHA string `json:"caller_head_sha,omitempty"`

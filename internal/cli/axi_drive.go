@@ -198,6 +198,13 @@ func newAxiRunCmd() *cobra.Command {
 			"--base-branch targets an integration branch other than the repository default\n" +
 			"for this run only (for example an epic branch). It overrides pr.base_branch\n" +
 			"in repo config and is persisted on the run for rebase, PR, and CI steps.\n\n" +
+			"The PR description's Intent section stays anchored to the intent the PR\n" +
+			"was opened with. A later run's --intent drives that run's own steps but never\n" +
+			"replaces it, so a rebase, merge conflict, test or CI fix, or review feedback\n" +
+			"keeps the original. --replace-intent is the only way to change it, for a\n" +
+			"genuine change of direction: pass it with the new --intent and later runs\n" +
+			"anchor to that. It cannot be combined with --launch-nonce, and it does not\n" +
+			"apply when reattaching to an active run.\n\n" +
 			"--no-publish-intent keeps the generated public Intent section out of the\n" +
 			"PR body for this run. It is tighten-only: it can never publish intent on a\n" +
 			"repository whose trusted pr.publish_intent disabled it. The full intent\n" +
@@ -283,6 +290,7 @@ func newAxiRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&validationGeneration, "validation-generation", "", "opaque generation bound to --launch-nonce proof mode")
 	cmd.Flags().StringVar(&baseBranch, "base-branch", "", "integration branch to open the PR against for this run only (overrides pr.base_branch)")
 	cmd.Flags().BoolVar(&noPublishIntent, "no-publish-intent", false, "keep the generated Intent section out of the PR body for this run (tighten-only; full intent still reaches every step prompt except PR drafting)")
+	cmd.Flags().Bool("replace-intent", false, "this --intent is a deliberate change of direction and replaces the intent the PR description is anchored to; never use it for rebases, conflicts, test or CI fixes, or review feedback")
 	cmd.Flags().StringArrayVar(&closesIssues, "closes", nil, "issue this PR closes when merged; repeat for multiple issues (42, owner/repo#42, or a nested GitLab project path)")
 	cmd.Flags().String("verification-plan", "", "capture a nonempty UTF-8 verification plan as separate run evidence (new runs only)")
 	bindPRTextFlags(cmd, &prTitle, &prBodyFile)
@@ -329,6 +337,10 @@ func runAxiRunWithPRText(cmd *cobra.Command, autoYes bool, skipSteps []types.Ste
 	if hasRunPRText(prText) && slices.Contains(skipSteps, types.StepPR) {
 		return emitError(cmd, 2, "--pr-title and --pr-body-file cannot be combined with --skip pr: skipping the PR step creates no PR to use them", "Drop pr from --skip, or drop --pr-title and --pr-body-file.")
 	}
+	replaceIntent, _ := cmd.Flags().GetBool("replace-intent")
+	if replaceIntent && launchNonce != "" {
+		return emitError(cmd, 2, "--replace-intent cannot be combined with --launch-nonce: a strict launch receipt binds the exact intent bytes", "Drop --replace-intent, or drop --launch-nonce.")
+	}
 	ctx := cmd.Context()
 	driveCtx, cancel, err := boundAxiWait(ctx, wait)
 	if err != nil {
@@ -340,6 +352,7 @@ func runAxiRunWithPRText(cmd *cobra.Command, autoYes bool, skipSteps []types.Ste
 		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
 	}
 	defer env.close()
+	env.replaceIntent = replaceIntent
 	// Probe before any RPC carries omit_intent: an older daemon would drop
 	// the unknown field silently and publish the intent it was asked to
 	// withhold, so the run is refused instead. An unreadable global config
@@ -416,6 +429,10 @@ func runAxiRunWithPRText(cmd *cobra.Command, autoYes bool, skipSteps []types.Ste
 			if err := conflictingActiveRunOmitIntent(active, omitIntent); err != nil {
 				return emitError(cmd, 2, err.Error(),
 					"Omit --no-publish-intent to reattach, or abort the active run before starting a new one")
+			}
+			if replaceIntent {
+				return emitError(cmd, 2, fmt.Sprintf("active run %s is already in progress; reattaching never replaces intent", active.ID),
+					"Omit --replace-intent to reattach, or abort the active run before starting a new one")
 			}
 			if err := conflictingActiveRunPRText(active, prText); err != nil {
 				return emitError(cmd, 2, err.Error(),
@@ -820,6 +837,9 @@ func triggerRunWithPRText(ctx context.Context, env *axiEnv, branch string, skipS
 	if opt := formatOmitIntentPushOption(omitIntent); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
+	if opt := formatReplaceIntentPushOption(env.replaceIntent); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
 	observedHead, err := git.HeadSHA(ctx, ".")
 	if err != nil {
 		return "", fmt.Errorf("prepare private mirror for %q: resolve submission head: %w", branch, err)
@@ -894,6 +914,7 @@ func triggerRunWithPRText(ctx context.Context, env *axiEnv, branch string, skipS
 	var rr ipc.RerunResult
 	params := rerunParams(env.repo.ID, branch, skipSteps, intent, baseBranch)
 	params.OmitIntent = omitIntent
+	params.ReplaceIntent = env.replaceIntent
 	params.PiProfile = profile
 	params.ClosingIssueRefs = closesIssues
 	params.PRTitle, params.PRBody = prText.Title, prText.Body

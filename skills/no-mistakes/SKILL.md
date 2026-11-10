@@ -149,6 +149,14 @@ asked for that might otherwise look surprising in the diff. A few sentences to a
 short paragraph is normal - write down what you learned from the conversation
 that a reviewer reading only the diff would not know.
 
+The PR description's Intent section stays anchored to the intent the PR was
+opened with. When you resubmit after a rebase, merge conflict, failing test or
+CI fix, or review feedback, pass the same original user intent: the work item is
+not a new goal, and a different `--intent` there never replaces the anchored
+one. Add `--replace-intent` only when the user explicitly changed direction and
+the new `--intent` states the new goal; the description then switches to it and
+later runs keep it. Never use it to describe a correction.
+
 Shape it so it reads well when published as the PR's Intent section: open with
 a one- or two-line statement of the goal, then short bullets, one requirement,
 decision or constraint each, with identifiers in backticks. State each point

@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
@@ -94,13 +95,13 @@ func prDraftIntentPromptSection(sctx *pipeline.StepContext) string {
 // last thing that went wrong, so the PR step swaps the intent back to the
 // earliest one recorded against this PR for the duration of the step.
 //
-// Precedence, deliberately without an override: the first intent recorded for
-// the PR wins over every later run's, whether that later intent was inferred,
-// supplied with `axi run --intent`, or inherited by a rerun. Nothing in the
-// pipeline can tell a user who truly changed direction from an agent
-// describing a correction, and a wrongly kept Intent is cheaper than a
-// wrongly replaced one. A PR whose purpose really changed is a new PR: it
-// starts a new anchor. Tighten-only publication controls (runs.omit_intent,
+// Precedence: the first intent recorded for the PR wins over every later run's,
+// whether that later intent was inferred, supplied with `axi run --intent`, or
+// inherited by a rerun. Nothing in the pipeline can tell a changed goal from an
+// agent describing a correction, so the change is a deliberate signal instead:
+// a run started with `--replace-intent` (intent source db.RunIntentSourceReplace)
+// publishes its own intent and, from then on, is the anchor that later plain
+// runs pin to. Tighten-only publication controls (runs.omit_intent,
 // pr.publish_intent) are untouched and still read from the current run.
 //
 // The anchor lookup failing keeps the run's own intent, matching a PR that
@@ -109,6 +110,11 @@ func prDraftIntentPromptSection(sctx *pipeline.StepContext) string {
 func pinPublishedIntent(sctx *pipeline.StepContext, pr *scm.PR) func() {
 	noop := func() {}
 	if sctx == nil || sctx.DB == nil || sctx.Repo == nil || pr == nil {
+		return noop
+	}
+	// The run that decided to replace the anchor has not been recorded against
+	// the PR yet when it first publishes; it publishes its own intent.
+	if sctx.IntentSource == db.RunIntentSourceReplace && strings.TrimSpace(sctx.UserIntent) != "" {
 		return noop
 	}
 	prURL := strings.TrimSpace(pr.URL)

@@ -1928,3 +1928,77 @@ func TestOwnedGateAcceptsARelativeRootSpelling(t *testing.T) {
 		t.Fatal("a gate under another root must still be refused")
 	}
 }
+
+// Only an explicit replace request records the replace source; a plain intent
+// on a push or on a rerun stays an ordinary agent override, and replace cannot
+// ride without an intent or on a strict launch receipt.
+func TestReplaceIntentIsRecordedOnlyWhenRequested(t *testing.T) {
+	step := &mockPassStep{name: types.StepReview}
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{step}
+	})
+	_, headSHA := setupTestGitRepo(t, p, d, "replace-intent-repo")
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	push := func(intent string, replace bool) *db.Run {
+		t.Helper()
+		var res ipc.PushReceivedResult
+		if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+			Gate: p.RepoDir("replace-intent-repo"), Ref: "refs/heads/main",
+			Old: "0000000000000000000000000000000000000000", New: headSHA,
+			Intent: intent, ReplaceIntent: replace,
+		}, &res); err != nil {
+			t.Fatal(err)
+		}
+		return waitForRunTerminalState(t, d, res.RunID)
+	}
+	rerun := func(intent string, replace bool) (*db.Run, error) {
+		t.Helper()
+		var res ipc.RerunResult
+		if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{
+			RepoID: "replace-intent-repo", Branch: "main", Intent: intent, ReplaceIntent: replace,
+		}, &res); err != nil {
+			return nil, err
+		}
+		return waitForRunTerminalState(t, d, res.RunID), nil
+	}
+	source := func(r *db.Run) string {
+		if r.IntentSource == nil {
+			return ""
+		}
+		return *r.IntentSource
+	}
+
+	if got := push("plain intent", false); source(got) != db.RunIntentSourceAgent {
+		t.Fatalf("plain push source = %q, want %q", source(got), db.RunIntentSourceAgent)
+	}
+	if got := push("new direction", true); source(got) != db.RunIntentSourceReplace || *got.Intent != "new direction" {
+		t.Fatalf("replace push = %q / %v, want source %q", source(got), got.Intent, db.RunIntentSourceReplace)
+	}
+	if got, err := rerun("plain correction", false); err != nil || source(got) != db.RunIntentSourceAgent {
+		t.Fatalf("plain rerun = %v / %v, want source %q", got, err, db.RunIntentSourceAgent)
+	}
+	if got, err := rerun("another direction", true); err != nil || source(got) != db.RunIntentSourceReplace {
+		t.Fatalf("replace rerun = %v / %v, want source %q", got, err, db.RunIntentSourceReplace)
+	}
+	// Inheriting a replace run's intent is an ordinary inheritance, not a new anchor.
+	if got, err := rerun("", false); err != nil || source(got) != db.RunIntentSourceRerun || *got.Intent != "another direction" {
+		t.Fatalf("inheriting rerun = %v / %v, want source %q", got, err, db.RunIntentSourceRerun)
+	}
+	if _, err := rerun("", true); err == nil || !strings.Contains(err.Error(), "replace_intent requires an explicit intent") {
+		t.Fatalf("replace without intent err = %v", err)
+	}
+	var res ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir("replace-intent-repo"), Ref: "refs/heads/main",
+		Old: "0000000000000000000000000000000000000000", New: headSHA,
+		Intent: "x", ReplaceIntent: true, LaunchNonce: "n", ValidationGeneration: "g",
+	}, &res)
+	if err == nil || !strings.Contains(err.Error(), "strict launch") {
+		t.Fatalf("replace with launch nonce err = %v", err)
+	}
+}

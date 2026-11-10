@@ -413,3 +413,88 @@ func TestFinalizeRun_RefreshKeepsTheOriginalIntentAfterCorrection(t *testing.T) 
 		t.Fatalf("refreshed Intent = %q, want the original:\n%s", got, final)
 	}
 }
+
+// An explicit change of direction (a run started with --replace-intent) is the
+// one thing that moves the anchor: its own intent is published, and the next
+// plain run, even one carrying a correction, keeps the new one.
+func TestPRStep_ReplaceIntentMovesTheAnchorAndLaterPlainRunsKeepIt(t *testing.T) {
+	t.Parallel()
+	const newDirection = "Drop CSV and export widget reports as Parquet instead; the JSON export stays."
+	dir, base, head := setupGitRepo(t)
+	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1.Env, _ = fakeGH(t, "")
+	sctx1.UserIntent, sctx1.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
+	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&PRStep{}).Execute(sctx1); err != nil {
+		t.Fatal(err)
+	}
+	bodyFile := envEntry(sctx1.Env, "FAKE_CLI_PR_BODY_FILE")
+	existing := append(append([]string(nil), sctx1.Env...), "FAKE_CLI_PR_URL="+anchorExistingPRURL)
+
+	// A plain rerun with a correction: the original stays.
+	sctx2 := anchorRun(t, sctx1, anchorCorrections[0].intent, db.RunIntentSourceAgent)
+	sctx2.Env = existing
+	if _, err := (&PRStep{}).Execute(sctx2); err != nil {
+		t.Fatal(err)
+	}
+	if got := intentSection(readPRBodyFile(t, bodyFile)); got != anchorOriginalIntent {
+		t.Fatalf("plain rerun Intent = %q, want the original", got)
+	}
+
+	// The deliberate change publishes its own intent...
+	sctx3 := anchorRun(t, sctx1, newDirection, db.RunIntentSourceReplace)
+	sctx3.Env = existing
+	if _, err := (&PRStep{}).Execute(sctx3); err != nil {
+		t.Fatal(err)
+	}
+	replaced := readPRBodyFile(t, bodyFile)
+	t.Logf("after --replace-intent:\n%s", replaced)
+	if got := intentSection(replaced); got != newDirection {
+		t.Fatalf("replace run Intent = %q, want the new direction:\n%s", got, replaced)
+	}
+
+	// ...and every later plain run, including one inheriting it by rerun, and
+	// one carrying a correction, keeps the new one.
+	for _, later := range []struct{ intent, source string }{
+		{anchorCorrections[2].intent, db.RunIntentSourceAgent},
+		{newDirection, db.RunIntentSourceRerun},
+		{"Resolve review feedback: rename the exporter helper.", "claude"},
+	} {
+		next := anchorRun(t, sctx1, later.intent, later.source)
+		next.Env = existing
+		if _, err := (&PRStep{}).Execute(next); err != nil {
+			t.Fatal(err)
+		}
+		if got := intentSection(readPRBodyFile(t, bodyFile)); got != newDirection {
+			t.Fatalf("later %s run Intent = %q, want the replaced intent", later.source, got)
+		}
+	}
+}
+
+// The flag absent behaves as before the flag existed: a plain explicit intent
+// on a resubmission never moves the anchor, with or without prior replaces.
+func TestPRStep_PlainIntentNeverReplacesTheAnchor(t *testing.T) {
+	t.Parallel()
+	dir, base, head := setupGitRepo(t)
+	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1.Env, _ = fakeGH(t, "")
+	sctx1.UserIntent, sctx1.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
+	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&PRStep{}).Execute(sctx1); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range anchorCorrections {
+		next := anchorRun(t, sctx1, "A genuinely new goal written like any other intent: "+c.intent, db.RunIntentSourceAgent)
+		next.Env = append(append([]string(nil), sctx1.Env...), "FAKE_CLI_PR_URL="+anchorExistingPRURL)
+		if _, err := (&PRStep{}).Execute(next); err != nil {
+			t.Fatal(err)
+		}
+		if got := intentSection(readPRBodyFile(t, envEntry(sctx1.Env, "FAKE_CLI_PR_BODY_FILE"))); got != anchorOriginalIntent {
+			t.Fatalf("%s: Intent = %q, want the original", c.name, got)
+		}
+	}
+}

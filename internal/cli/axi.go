@@ -64,6 +64,8 @@ type axiEnv struct {
 	cfg             *config.GlobalConfig
 	globalConfigErr error
 	client          *ipc.Client
+	// replaceIntent is axi run --replace-intent for the run being started.
+	replaceIntent bool
 }
 
 type axiEnvOptions struct {

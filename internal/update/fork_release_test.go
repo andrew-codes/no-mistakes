@@ -64,6 +64,9 @@ func TestForkSemverOrdering(t *testing.T) {
 		a, b    string
 		wantCmp int
 	}{
+		{"first release to next minor", "v0.1.0", "v0.2.0", -1},
+		{"0.x numeric not lexical", "v0.9.0", "v0.10.0", -1},
+		{"0.x to 1.0", "v0.10.0", "v1.0.0", -1},
 		{"patch", "v1.0.0", "v1.0.1", -1},
 		{"minor", "v1.0.1", "v1.1.0", -1},
 		{"major", "v1.9.9", "v2.0.0", -1},
@@ -84,7 +87,7 @@ func TestForkSemverOrdering(t *testing.T) {
 			}
 		})
 	}
-	if isDevVersion("v1.0.0") {
+	if isDevVersion("v0.1.0") || isDevVersion("v1.0.0") {
 		t.Fatal("a fork release version must keep update checks on")
 	}
 }

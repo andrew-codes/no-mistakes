@@ -22,10 +22,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # release-drafter derives the next version from the previous published
-  # release and starts from 0.0.0 when there is none, which would draft v0.0.1.
-  # Until the fork has its first published release, pin the draft to this.
-  FORK_FIRST_VERSION: "1.0.0"
+  # release-drafter drafts v0.0.1 (and "No changes") when there is no previous
+  # published release. The fork's first release is this version instead; its
+  # notes are written by hand, so see the first-release step below.
+  FORK_FIRST_VERSION: "0.1.0"
 
 jobs:
   update_release_draft:
@@ -34,24 +34,35 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Resolve first release version
+      - name: Resolve first release
         id: first
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          releases="$(gh release list --limit 200 --json tagName,isDraft,isPrerelease)"
           # Prereleases are not a baseline for release-drafter, and the update
           # channel manifest lives on a "channels" prerelease.
-          published="$(gh release list --exclude-drafts --limit 200 --json tagName,isPrerelease \
-            --jq '[.[] | select(.isPrerelease | not)] | length')"
-          if [ "$published" = "0" ]; then
-            echo "version=${FORK_FIRST_VERSION}" >> "$GITHUB_OUTPUT"
-            echo "No published release yet: drafting v${FORK_FIRST_VERSION}." >> "$GITHUB_STEP_SUMMARY"
-          else
+          published="$(jq '[.[] | select((.isDraft | not) and (.isPrerelease | not))] | length' <<<"$releases")"
+          drafts="$(jq '[.[] | select(.isDraft)] | length' <<<"$releases")"
+          if [ "$published" != "0" ]; then
             echo "version=" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "$drafts" != "0" ]; then
+            # First release, draft already there. With no published release
+            # release-drafter has no baseline, so it would replace the
+            # hand-written notes with "No changes". Leave the draft alone.
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "First release: leaving the existing draft and its notes untouched." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "version=${FORK_FIRST_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "First release: creating a placeholder draft for v${FORK_FIRST_VERSION}; write its notes by hand." >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: release-drafter/release-drafter@v7
+        if: ${{ steps.first.outputs.skip != 'true' }}
         with:
           config-name: fork-release-drafter.yml
           version: ${{ steps.first.outputs.version }}

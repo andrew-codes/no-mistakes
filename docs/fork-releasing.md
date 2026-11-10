@@ -2,7 +2,7 @@
 
 This is the maintainer procedure for releasing `andrew-codes/no-mistakes`. For what the fork does differently from upstream, see FORK.md. Everything here lives in new files (`fork-*` workflows, `.github/fork-release-drafter.yml`, `scripts/fork-release-version.sh`), so an upstream sync never conflicts with it. Upstream's `release.yml`, `publish-channels.yml` and `docs.yml` stay disabled.
 
-The fork has its own semver line (`v1.0.0`, `v1.1.0`, ...) that is independent of upstream's version numbers. It follows the same model as ps5-mqtt: a draft release is kept up to date as PRs merge, and publishing the draft is the release.
+The fork has its own semver line (`v0.1.0`, `v0.2.0`, ...) that is independent of upstream's version numbers. It follows the same model as ps5-mqtt: a draft release is kept up to date as PRs merge, and publishing the draft is the release.
 
 ## How a release happens
 
@@ -47,7 +47,11 @@ The draft is a normal GitHub release, so you can edit its notes before publishin
 
 ## The first release
 
-The fork has no release yet, and release-drafter drafts `v0.0.1` when there is no previous published release. Until one exists, `fork-draft-release` pins the draft to `v1.0.0` (`FORK_FIRST_VERSION` in that workflow). The first draft has no comparison baseline, so it lists no changes and carries a release-drafter warning. Replace the body with your own notes, then publish. Later drafts compare against the previous release and need nothing special.
+The fork's first release is `v0.1.0`. Release-drafter has no baseline until a release is published: with none, it drafts `v0.0.1` with "No changes" and a warning. So until the first release is published, `fork-draft-release` does not run release-drafter when a draft already exists, which keeps a hand-written draft (tag, title and notes) exactly as you left it. If there is no draft at all, it creates a placeholder draft for `v0.1.0` (`FORK_FIRST_VERSION` in that workflow) that you fill in by hand.
+
+Publish the draft as usual. From then on, drafts compare against the previous release and are regenerated on each push to `main`.
+
+While the fork is on `0.x`, a `breaking-change` or `major` PR bumps to `v1.0.0`. Hold that label back until you want to declare `1.0.0`.
 
 ## Rehearsing a release
 

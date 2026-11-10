@@ -1,3 +1,6 @@
+> **This is a fork** of [kunchenguid/no-mistakes](https://github.com/kunchenguid/no-mistakes).
+> See [FORK.md](FORK.md) for what it adds or changes compared with upstream.
+
 <h1 align="center"><code>git push no-mistakes</code></h1>
 <p align="center">
   <a href="https://github.com/kunchenguid/no-mistakes/actions/workflows/release.yml"

@@ -1,6 +1,7 @@
 package db
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -124,5 +125,51 @@ func TestIntentCache_Cleanup(t *testing.T) {
 	}
 	if got, _ := d.GetIntentCache("new"); got == nil {
 		t.Errorf("expected new entry retained")
+	}
+}
+
+func TestGetOriginalPRIntent(t *testing.T) {
+	d := openTestDB(t)
+	repo, err := d.InsertRepo("/tmp/work", "https://github.com/o/r", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := d.InsertRepo("/tmp/other", "https://github.com/o/other", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const url = "https://github.com/o/r/pull/7"
+	record := func(repoID, intent, prURL string) {
+		t.Helper()
+		run, err := d.InsertRun(repoID, "refs/heads/feature", "head", "base")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if intent != "" {
+			if err := d.UpdateRunIntent(run.ID, RunIntent{Summary: intent, Source: RunIntentSourceAgent}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if prURL != "" {
+			if err := d.UpdateRunPRURL(run.ID, prURL); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if got, err := d.GetOriginalPRIntent(repo.ID, url); err != nil || got != nil {
+		t.Fatalf("no runs: got %+v, %v", got, err)
+	}
+	record(repo.ID, "", url)             // no intent recorded: skipped
+	record(repo.ID, "original", url+"/") // first with an intent; trailing slash and
+	record(repo.ID, "correction", url)   // later runs on the same PR do not displace it
+	record(repo.ID, "other pr", url+"0") // a different PR
+	record(other.ID, "other repo", url)  // the same URL in another repo
+	got, err := d.GetOriginalPRIntent(repo.ID, strings.ToUpper(url))
+	if err != nil || got == nil || got.Summary != "original" || got.Source != RunIntentSourceAgent {
+		t.Fatalf("got %+v, %v; want the earliest intent bound to the PR", got, err)
+	}
+	if got, err := d.GetOriginalPRIntent(repo.ID, ""); err != nil || got != nil {
+		t.Fatalf("empty URL: got %+v, %v", got, err)
 	}
 }

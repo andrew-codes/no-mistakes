@@ -1,0 +1,105 @@
+---
+# Release notes and next-version rules for the fork's own semver line. Modelled
+# on andrew-codes/ps5-mqtt: the fork-draft-release workflow keeps one draft
+# release up to date as PRs merge, and publishing that draft is the release.
+# See docs/fork-releasing.md.
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+change-template: "- $TITLE @$AUTHOR (#$NUMBER)"
+sort-direction: ascending
+
+# Categories use release-drafter's current (non-deprecated) format. Every
+# changelog category is `exclusive`, so a PR is listed once, under the first
+# category it matches: that is what keeps a PR labelled both `new-feature` and
+# `upstream-sync` from appearing twice, and a breaking change from also
+# appearing under New features. A changelog category also contributes its
+# `semver-increment` for the PRs assigned to it, and the highest increment wins.
+categories:
+  - title: "🚨 Breaking changes"
+    semver-increment: major
+    exclusive: true
+    when:
+      labels: [breaking-change]
+  # One line per upstream-sync PR instead of one per upstream commit. A sync
+  # counts as a patch unless it also carries a `minor` or `major` label.
+  - title: "🔄 Synced with upstream"
+    semver-increment: patch
+    exclusive: true
+    when:
+      labels: [upstream-sync]
+  - title: "✨ New features"
+    semver-increment: minor
+    exclusive: true
+    when:
+      labels: [new-feature, enhancement, performance]
+  - title: "🐛 Bug fixes"
+    semver-increment: patch
+    exclusive: true
+    when:
+      labels: [bugfix]
+  - title: "🧰 Maintenance"
+    semver-increment: patch
+    exclusive: true
+    when:
+      labels: [refactor, maintenance, chore, ci, dependencies]
+  - title: "📚 Documentation"
+    semver-increment: patch
+    exclusive: true
+    when:
+      labels: [documentation]
+  # Manual overrides, mirroring ps5-mqtt: these set the bump without adding a
+  # section. `patch` is also the fallback for a PR with no matching label.
+  - type: version-resolver
+    semver-increment: major
+    when:
+      labels: [major]
+  - type: version-resolver
+    semver-increment: minor
+    when:
+      labels: [minor]
+  - type: version-resolver
+    semver-increment: patch
+
+template: |
+  ## What’s changed
+  $CHANGES
+
+# Conventional commit titles drive the labels, so one title picks both the
+# release-notes category and the version bump. `major`, `minor` and `patch` stay
+# available as manual overrides.
+autolabeler:
+  - label: "breaking-change"
+    title:
+      - "/^break(ing)?[:(]/i"
+      - "/^[a-z]+(\\([^)]*\\))?!:/i"
+    body:
+      - "/BREAKING CHANGE/"
+  - label: "new-feature"
+    branch:
+      - "/^feat(ure)?\\/.+/"
+    title:
+      - "/^feat(\\([^)]*\\))?!?:/i"
+  - label: "bugfix"
+    branch:
+      - "/^fix\\/.+/"
+    title:
+      - "/^fix(\\([^)]*\\))?!?:/i"
+  - label: "documentation"
+    branch:
+      - "/^docs\\/.+/"
+    title:
+      - "/^docs(\\([^)]*\\))?!?:/i"
+  - label: "maintenance"
+    branch:
+      - "/^(chore|ci|refactor|test|build|style)\\/.+/"
+    title:
+      - "/^(chore|ci|refactor|test|build|style)(\\([^)]*\\))?!?:/i"
+  - label: "performance"
+    title:
+      - "/^perf(\\([^)]*\\))?!?:/i"
+  - label: "upstream-sync"
+    branch:
+      - "/^(sync|upstream)[-\\/].+/i"
+    title:
+      - "/\\bupstream\\b(?!-).*\\b(sync|merge)\\b/i"
+      - "/\\b(sync|merge)\\b.*\\bupstream\\b(?!-)/i"

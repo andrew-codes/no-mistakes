@@ -1,0 +1,59 @@
+name: fork-draft-release
+
+# Keeps one draft release on this fork up to date as PRs merge to main. The
+# draft carries the next version (from PR labels) and the release notes.
+# Publishing the draft is the release: fork-release.yml builds and attaches the
+# binaries. See docs/fork-releasing.md.
+#
+# Fork-only file; upstream has none by this name, so a sync never conflicts.
+on:
+  push:
+    branches:
+      - main
+  # Run it on main to regenerate the draft by hand, for example after relabelling
+  # a merged PR.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-draft-release
+  cancel-in-progress: false
+
+env:
+  # release-drafter derives the next version from the previous published
+  # release and starts from 0.0.0 when there is none, which would draft v0.0.1.
+  # Until the fork has its first published release, pin the draft to this.
+  FORK_FIRST_VERSION: "1.0.0"
+
+jobs:
+  update_release_draft:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Resolve first release version
+        id: first
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Prereleases are not a baseline for release-drafter, and the update
+          # channel manifest lives on a "channels" prerelease.
+          published="$(gh release list --exclude-drafts --limit 200 --json tagName,isPrerelease \
+            --jq '[.[] | select(.isPrerelease | not)] | length')"
+          if [ "$published" = "0" ]; then
+            echo "version=${FORK_FIRST_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "No published release yet: drafting v${FORK_FIRST_VERSION}." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: release-drafter/release-drafter@v7
+        with:
+          config-name: fork-release-drafter.yml
+          version: ${{ steps.first.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,192 @@
+name: fork-release
+
+# Fork-only release workflow for andrew-codes/no-mistakes. Upstream has no file
+# with this name, so a sync never conflicts with it. release.yml,
+# publish-channels.yml and docs.yml stay disabled on the fork.
+#
+# Publishing the draft release that fork-draft-release.yml keeps up to date is
+# the release: this workflow then builds the binaries for the tag the draft
+# carries, attaches them to that same release and refreshes the update channel
+# manifest. Run by hand (workflow_dispatch) it does the whole build as a
+# rehearsal but never uploads, publishes or tags anything.
+#
+# Binaries are built with no telemetry host or website ID, so a fork build never
+# reports to upstream's analytics, and with the update repository pointed at
+# this fork, so `no-mistakes update` follows the fork's releases. macOS and
+# Windows binaries are unsigned (darwin/arm64 is linker ad-hoc signed).
+# See docs/fork-releasing.md.
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# One release at a time; a second run waits instead of interleaving.
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }} # e.g. 1.2.0
+      tag: ${{ steps.version.outputs.tag }} # e.g. v1.2.0
+      # true only for a published release; a manual run never ships.
+      should_publish: ${{ steps.version.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/fork-release-version.sh
+
+  check:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: make lint
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: [version, check]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bi=github.com/kunchenguid/no-mistakes/internal/buildinfo
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          COMMIT="$(git rev-parse --short=7 HEAD)"
+          BIN=no-mistakes; [ "$GOOS" = windows ] && BIN=no-mistakes.exe
+          # No TelemetryHost/TelemetryWebsiteID: a fork build must not report to
+          # upstream's analytics. UpdateRepo points `update` at this fork.
+          CGO_ENABLED=0 go build \
+            -ldflags "-X ${bi}.Version=${TAG} -X ${bi}.Commit=${COMMIT} -X ${bi}.Date=${DATE} -X ${bi}.UpdateRepo=${GITHUB_REPOSITORY}" \
+            -o "dist/${BIN}" ./cmd/no-mistakes
+          if [ "$GOOS" = windows ]; then
+            ARCHIVE="dist/no-mistakes-${TAG}-${GOOS}-${GOARCH}.zip"
+            (cd dist && zip -q "$(basename "$ARCHIVE")" "$BIN")
+          else
+            ARCHIVE="dist/no-mistakes-${TAG}-${GOOS}-${GOARCH}.tar.gz"
+            tar -C dist -czf "$ARCHIVE" "$BIN"
+          fi
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          # Only the runner's own platform can execute its binary.
+          if [ "$GOOS" = linux ] && [ "$GOARCH" = amd64 ]; then
+            "dist/${BIN}" --version | grep -F "no-mistakes version ${TAG} "
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: archive-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    name: Attach binaries to the release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          archives=(no-mistakes-*)
+          [ "${#archives[@]}" = 6 ] || { echo "::error::expected 6 archives, found ${#archives[@]}"; exit 1; }
+          sha256sum no-mistakes-* > checksums.txt
+          cat checksums.txt
+      - name: Upload to the published release
+        if: ${{ needs.version.outputs.should_publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.tag }}
+        # --clobber: a run that was rolled back and published again re-uploads.
+        run: gh release upload "$TAG" dist/* --clobber
+      - name: Rehearsal summary
+        if: ${{ needs.version.outputs.should_publish != 'true' }}
+        run: |
+          echo "Rehearsal of ${{ needs.version.outputs.tag }}: built and checksummed six archives; nothing was uploaded or published." >> "$GITHUB_STEP_SUMMARY"
+
+  # Refreshes channels.json on the "channels" release so a fork build stamped
+  # with UpdateRepo sees this release. Runs the same publisher upstream uses,
+  # inline, so it does not depend on the (disabled) publish-channels.yml.
+  publish-channels:
+    name: Publish update channel manifest
+    needs: [version, release]
+    if: ${{ needs.version.outputs.should_publish == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: go run ./cmd/publish-channels
+
+  # If any part of a real (published-release) run fails, roll the release back:
+  # unpublish it (revert to draft) and delete the tag, so a failed release
+  # leaves no published-but-unshipped version. Publishing the draft again
+  # recreates the tag and runs this workflow fresh.
+  rollback:
+    name: Roll back failed release
+    needs: [version, check, build, release, publish-channels]
+    if: ${{ failure() && github.event_name == 'release' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Unpublish the GitHub release (revert to draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release edit "$TAG" --draft
+      - name: Delete the release tag
+        # Best-effort: the draft may not have created the tag yet.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}"

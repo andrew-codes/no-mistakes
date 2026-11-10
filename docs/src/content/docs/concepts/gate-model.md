@@ -41,7 +41,7 @@ When you run `no-mistakes init` in a repo:
 8. It makes sure the daemon is running so incoming pushes can start runs.
 
 `init` is idempotent.
-If the repo is already initialized, it refreshes the existing gate instead of failing: managed hook installation, push-option support, hook-path isolation, gate and working remotes, and origin/default-branch metadata are repaired or updated where needed. A `no-mistakes` remote that is not this home's own gate wiring is never rewritten; see [`no-mistakes init`](/no-mistakes/reference/cli/#no-mistakes-init) for when init refuses it.
+For an already-initialized repo, see the [`init` reference](/no-mistakes/reference/cli/#no-mistakes-init) for refresh behavior and gate-identity and remote-wiring refusals.
 If the working repo was renamed or moved and the old path no longer exists, `init` reattaches the existing gate from the leftover `no-mistakes` remote, updates the stored working path, and preserves the repo ID plus run history.
 A checkout is one repository however its path is spelled: when no stored working path matches exactly, lookup falls back to filesystem identity (`os.SameFile`), so a case variant on a case-insensitive volume or a symlinked spelling resolves to the registered repository from the main checkout and from any linked worktree, and `init` refreshes it instead of registering a second one. The stored path keeps the spelling it was first recorded with. Directories that differ only in case on a case-sensitive volume stay separate repositories.
 If the working repo was copied and the original path still exists, `init` treats the copy as a new repo and repoints the copied `no-mistakes` remote to a fresh gate.
@@ -117,6 +117,31 @@ halves prove the whole private head, so a rebased copy whose patch ID drifted
 with context and whose lines a later live commit edited is not at risk either.
 At most 64 first-parent candidates are tried; past that bound the proof fails
 closed.
+
+When a rebase accepted a file deletion from the selected integration base,
+private edits to that file cause a modify/delete conflict even with
+live-favoring resolution. If the ordinary proofs leave content at risk,
+the deletion-aware proof reads and fetches the exact live selected base head
+from the upstream URL supplied by its caller. The URL and integration branch
+travel together; the proof never rediscovers a gate worktree's `origin` or
+default branch. Publication supplies the same resolved upstream URL used by
+rebase and push, including a refreshed checkout registration. The caller
+supplies the integration branch selected under the
+[`pr.base_branch` rules](/no-mistakes/reference/repo-config/#prbase_branch).
+Only when this proof is needed does AXI submission without a run override
+fetch the default branch to resolve trusted configuration. A submission
+without a stale mirror does not query upstream for reconciliation.
+
+The selected base's merge base with the live head identifies the upstream
+changes already integrated by the branch. The live and private heads must
+also have a unique common ancestor, which must be an ancestor of that
+integration boundary. Only paths deleted between those two commits, and still
+absent from the live tree, may be removed from an unreferenced copy of the
+private tree for the survival proof.
+Every remaining path must pass the same whole-tree proof above. A deletion
+made only on the branch does not qualify, and an unreadable or ambiguous base
+or failed tree inspection refuses reconciliation. The original private head
+is still the head archived before the mirror ref is removed.
 
 If survival cannot be proven, the whole private-only range is reported as at
 risk.

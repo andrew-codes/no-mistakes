@@ -51,6 +51,9 @@ func anchorRun(t *testing.T, base *pipeline.StepContext, intent, source string) 
 	next := *base
 	next.Run = run
 	next.UserIntent, next.IntentSource = intent, source
+	// A later run pushed its head too: the PR step refuses to publish for a
+	// run with no successful-push evidence.
+	recordPRTestPush(t, &next)
 	return &next
 }
 
@@ -95,7 +98,7 @@ func TestPRStep_RerunAfterCorrectionKeepsTheOriginalIntentInTheDescription(t *te
 	for _, tc := range anchorCorrections {
 		t.Run(tc.name, func(t *testing.T) {
 			dir, base, head := setupGitRepo(t)
-			sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+			sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 			sctx1.Env, _ = fakeGH(t, "")
 			if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
 				t.Fatal(err)
@@ -142,7 +145,7 @@ func TestPRStep_RerunAfterCorrectionKeepsTheOriginalIntentInTheDescription(t *te
 func TestPRStep_InferredIntentOnRerunDoesNotReplaceTheOriginal(t *testing.T) {
 	t.Parallel()
 	dir, base, head := setupGitRepo(t)
-	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx1.Env, _ = fakeGH(t, "")
 	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: "claude", Score: 0.9}); err != nil {
 		t.Fatal(err)
@@ -171,7 +174,7 @@ func TestPRStep_FallbackBodyKeepsTheOriginalIntentAfterCorrection(t *testing.T) 
 	failing := &mockAgent{name: "test", runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
 		return nil, context.DeadlineExceeded
 	}}
-	sctx1 := newTestContextWithDBRecords(t, failing, dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, failing, dir, base, head, config.Commands{})
 	sctx1.Env, _ = fakeGH(t, "")
 	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
 		t.Fatal(err)
@@ -200,7 +203,7 @@ func TestPRStep_RerunDescriptionReflectsOnlyTheCurrentPipelineState(t *testing.T
 	const failure = "TestExportCSV panics: index out of range [3] with length 3"
 	const reviewIssue = "exporter ignores the locale when formatting decimals"
 	dir, base, head := setupGitRepo(t)
-	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx1.Env, _ = fakeGH(t, "")
 	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
 		t.Fatal(err)
@@ -247,7 +250,7 @@ func TestPRStep_RerunDescriptionReflectsOnlyTheCurrentPipelineState(t *testing.T
 func TestPRStep_NoRecordedOriginalPublishesTheRunsOwnIntent(t *testing.T) {
 	t.Parallel()
 	dir, base, head := setupGitRepo(t)
-	sctx := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx.Env, _ = fakeGH(t, anchorExistingPRURL)
 	sctx.UserIntent, sctx.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
 	if _, err := (&PRStep{}).Execute(sctx); err != nil {
@@ -264,7 +267,7 @@ func TestPRStep_NoRecordedOriginalPublishesTheRunsOwnIntent(t *testing.T) {
 func TestPRStep_NewPRForAReusedBranchStartsANewIntent(t *testing.T) {
 	t.Parallel()
 	dir, base, head := setupGitRepo(t)
-	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx1.Env, _ = fakeGH(t, "")
 	sctx1.UserIntent, sctx1.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
 	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
@@ -292,7 +295,7 @@ func TestPRStep_NewPRForAReusedBranchStartsANewIntent(t *testing.T) {
 func TestPRStep_OriginalIntentStillHonorsOmission(t *testing.T) {
 	t.Parallel()
 	dir, base, head := setupGitRepo(t)
-	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx1.Env, _ = fakeGH(t, "")
 	sctx1.UserIntent, sctx1.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
 	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
@@ -318,7 +321,7 @@ func TestPRStep_BitbucketRerunKeepsTheOriginalIntent(t *testing.T) {
 	t.Parallel()
 	dir, base, head := setupGitRepo(t)
 	api := newFakeBitbucketAPI(t, 42, "https://bitbucket.org/test/repo/pull-requests/42")
-	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx1.Env = api.Env()
 	sctx1.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 	sctx1.UserIntent, sctx1.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
@@ -377,7 +380,7 @@ func TestPRStep_TemplateRerunKeepsTheOriginalIntentInTheAppendix(t *testing.T) {
 func TestFinalizeRun_RefreshKeepsTheOriginalIntentAfterCorrection(t *testing.T) {
 	t.Parallel()
 	dir, base, head := setupGitRepo(t)
-	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx1.Env, _ = fakeGH(t, "")
 	sctx1.UserIntent, sctx1.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
 	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
@@ -421,7 +424,7 @@ func TestPRStep_ReplaceIntentMovesTheAnchorAndLaterPlainRunsKeepIt(t *testing.T)
 	t.Parallel()
 	const newDirection = "Drop CSV and export widget reports as Parquet instead; the JSON export stays."
 	dir, base, head := setupGitRepo(t)
-	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx1.Env, _ = fakeGH(t, "")
 	sctx1.UserIntent, sctx1.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
 	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {
@@ -478,7 +481,7 @@ func TestPRStep_ReplaceIntentMovesTheAnchorAndLaterPlainRunsKeepIt(t *testing.T)
 func TestPRStep_PlainIntentNeverReplacesTheAnchor(t *testing.T) {
 	t.Parallel()
 	dir, base, head := setupGitRepo(t)
-	sctx1 := newTestContextWithDBRecords(t, anchorDraftAgent(), dir, base, head, config.Commands{})
+	sctx1 := newPRTestContext(t, anchorDraftAgent(), dir, base, head, config.Commands{})
 	sctx1.Env, _ = fakeGH(t, "")
 	sctx1.UserIntent, sctx1.IntentSource = anchorOriginalIntent, db.RunIntentSourceAgent
 	if err := sctx1.DB.UpdateRunIntent(sctx1.Run.ID, db.RunIntent{Summary: anchorOriginalIntent, Source: db.RunIntentSourceAgent, Score: 1}); err != nil {

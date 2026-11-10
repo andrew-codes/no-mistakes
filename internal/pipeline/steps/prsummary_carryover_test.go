@@ -66,7 +66,7 @@ const carryPRURL = "https://bitbucket.org/test/repo/pull-requests/42"
 func carryContext(t *testing.T, api *fakeBitbucketAPI) *pipeline.StepContext {
 	t.Helper()
 	dir, baseSHA, headSHA := setupGitRepo(t)
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 	sctx.Env = api.Env()
 	owned := carryPRURL

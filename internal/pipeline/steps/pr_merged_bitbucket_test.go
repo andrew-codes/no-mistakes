@@ -22,7 +22,7 @@ func newBitbucketPRStepContext(t *testing.T, api *fakeBitbucketAPI) (*pipeline.S
 	t.Helper()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	ag := &mockAgent{name: "test"}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = api.Env()
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 	return sctx, ag, dir, baseSHA, headSHA
@@ -287,7 +287,7 @@ func TestCIStep_BitbucketPRMergedDuringRunFinishesCleanly(t *testing.T) {
 		withStatuses(`[{"name":"build","state":"INPROGRESS"}]`)
 
 	prURL := "https://bitbucket.org/test/repo/pull-requests/42"
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = api.Env()
 	sctx.Run.PRURL = &prURL
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"

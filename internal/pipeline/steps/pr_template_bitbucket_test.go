@@ -33,10 +33,12 @@ func TestPRTemplateBitbucketCreateReadbackUpdateAndPrePush(t *testing.T) {
 
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 	sctx.Env = api.Env()
+	assertNotice := capturePRProofNotice(t, sctx, "bitbucket")
 	if _, err := (&PRStep{}).Execute(sctx); err != nil {
 		t.Fatal(err)
 	}
 	body := api.lastDescription(t)
+	assertNotice(body)
 	if api.logCount("pull-requests create") != 1 || !strings.Contains(body, "```text\n"+pipelineAttestationCommentPrefix) {
 		t.Fatal("no owned text declaration created")
 	}
@@ -53,9 +55,11 @@ func TestPRTemplateBitbucketCreateReadbackUpdateAndPrePush(t *testing.T) {
 	// human edit is what the next Execute reads back.
 	api.setDescription(t, body)
 	sctx.Config.PR.Template = ""
+	assertNotice = capturePRProofNotice(t, sctx, "bitbucket")
 	if _, err := (&PRStep{}).Execute(sctx); err != nil {
 		t.Fatal(err)
 	}
+	assertNotice(body)
 	newHead := strings.Repeat("bc", 20)
 	if err := attestHeadBeforePush(sctx, newHead, nil); err != nil {
 		t.Fatal(err)

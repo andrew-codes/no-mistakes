@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS runs (
     head_sha                TEXT NOT NULL,
     base_sha                TEXT NOT NULL,
     worktree_dir            TEXT,
+    evidence_dir            TEXT,
+	transcript_homes        TEXT,
     submitted_head_sha      TEXT,
     no_mistakes_version     TEXT,
     no_mistakes_build_sha   TEXT,
@@ -47,9 +49,15 @@ CREATE TABLE IF NOT EXISTS runs (
     pr_base_branch       TEXT,
     omit_intent          INTEGER NOT NULL DEFAULT 0,
     pi_profile           TEXT,
+	 reviewer_profile     TEXT,
     verification_plan    TEXT,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_commit_identities (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    identity_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS step_results (
@@ -185,6 +193,17 @@ CREATE TABLE IF NOT EXISTS run_media_attachments (
     PRIMARY KEY (run_id, path)
 );
 
+-- GitLab project uploads already sent for an evidence file's contents.
+-- Keyed by project and digest, not by run, so a later PR rewrite of the same
+-- bytes reuses the markdown instead of posting another upload.
+CREATE TABLE IF NOT EXISTS gitlab_evidence_uploads (
+    project_path TEXT NOT NULL,
+    digest       TEXT NOT NULL,
+    markdown     TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    PRIMARY KEY (project_path, digest)
+);
+
 CREATE TABLE IF NOT EXISTS intent_cache (
     cache_key   TEXT PRIMARY KEY,
     summary     TEXT NOT NULL,
@@ -260,6 +279,8 @@ var migrationStatements = []string{
 	`ALTER TABLE runs ADD COLUMN verification_plan TEXT`,
 	`CREATE TRIGGER IF NOT EXISTS runs_verification_plan_immutable BEFORE UPDATE OF verification_plan ON runs WHEN NEW.verification_plan IS NOT OLD.verification_plan BEGIN SELECT RAISE(ABORT, 'run verification plan is immutable'); END`,
 	`ALTER TABLE runs ADD COLUMN pi_profile TEXT`,
+	`ALTER TABLE runs ADD COLUMN reviewer_profile TEXT`,
+	`CREATE TRIGGER IF NOT EXISTS runs_reviewer_profile_immutable BEFORE UPDATE OF reviewer_profile ON runs WHEN NEW.reviewer_profile IS NOT OLD.reviewer_profile BEGIN SELECT RAISE(ABORT, 'run reviewer profile is immutable'); END`,
 	// quota_routing records one run's quota-aware agent ordering (the
 	// quotarouting.Record JSON). Unlike pi_profile it is intentionally
 	// mutable: a mid-run quota switch appends to the record's switch list.
@@ -308,6 +329,7 @@ var migrationStatements = []string{
 	// since this column shipped with the setting that moves it
 	// (worktrees.RecordedDir).
 	`ALTER TABLE runs ADD COLUMN worktree_dir TEXT`,
+	`ALTER TABLE runs ADD COLUMN evidence_dir TEXT`,
 	// Build identity is nullable for historical records. New runs record the
 	// version and embedded build SHA used by the running binary.
 	`ALTER TABLE runs ADD COLUMN no_mistakes_version TEXT`,
@@ -449,4 +471,7 @@ CREATE INDEX IF NOT EXISTS idx_step_rounds_step_round ON step_rounds (step_resul
 CREATE INDEX IF NOT EXISTS idx_runs_repo_branch_created_id ON runs (repo_id, branch, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_runs_status_created_id ON runs (status, created_at DESC, id DESC);
 COMMIT;`,
+	// Caller transcript roots are immutable launch context. Historical runs
+	// retain NULL and the pre-existing default discovery paths.
+	`ALTER TABLE runs ADD COLUMN transcript_homes TEXT`,
 }

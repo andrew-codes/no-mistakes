@@ -224,8 +224,8 @@ func TestBitbucketDescription_RefreshRebuildsTheSameDocument(t *testing.T) {
 	if narrative != bitbucketDocWhatChanged {
 		t.Fatalf("stripping the generated sections must leave only the narrative, got:\n%s", narrative)
 	}
-	pipelineMD, riskLine, testingMD := (&PRStep{}).buildPipelineSectionWith(sctx, scm.ProviderBitbucket, false, true)
-	if again := assembleDraftPRBody(sctx, narrative, riskLine, testingMD, pipelineMD, 0, scm.ProviderBitbucket); again != body {
+	pipelineMD, riskLine, testingMD, _ := (&PRStep{}).buildPipelineSectionWith(sctx, scm.ProviderBitbucket, false, true)
+	if again := assembleDraftPRBody(sctx, narrative, riskLine, testingMD, pipelineMD, "", 0, scm.ProviderBitbucket); again != body {
 		t.Fatalf("rebuilding from the stripped body changed the document:\n--- first\n%s\n--- again\n%s", body, again)
 	}
 }
@@ -234,10 +234,10 @@ func TestBitbucketDescription_RefreshRebuildsTheSameDocument(t *testing.T) {
 func TestBitbucketDescription_OrderHoldsUnderABodyBudget(t *testing.T) {
 	t.Parallel()
 	sctx := newBitbucketDocContext(t)
-	pipelineMD, riskLine, testingMD := (&PRStep{}).buildPipelineSectionWith(sctx, scm.ProviderBitbucket, false, true)
-	full := assembleDraftPRBody(sctx, bitbucketDocWhatChanged, riskLine, testingMD, pipelineMD, 0, scm.ProviderBitbucket)
+	pipelineMD, riskLine, testingMD, _ := (&PRStep{}).buildPipelineSectionWith(sctx, scm.ProviderBitbucket, false, true)
+	full := assembleDraftPRBody(sctx, bitbucketDocWhatChanged, riskLine, testingMD, pipelineMD, "", 0, scm.ProviderBitbucket)
 	limit := scm.PRBodyLen(full) - scm.PRBodyLen(testingMD) + 10
-	body := assembleDraftPRBody(sctx, bitbucketDocWhatChanged, riskLine, testingMD, pipelineMD, limit, scm.ProviderBitbucket)
+	body := assembleDraftPRBody(sctx, bitbucketDocWhatChanged, riskLine, testingMD, pipelineMD, "", limit, scm.ProviderBitbucket)
 	if scm.PRBodyLen(body) > limit {
 		t.Fatalf("body is %d chars, over its %d budget", scm.PRBodyLen(body), limit)
 	}

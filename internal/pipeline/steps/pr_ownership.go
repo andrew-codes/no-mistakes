@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
@@ -40,6 +41,8 @@ type prOwnedBody struct {
 
 var errUnownedLegacyAttestation = errors.New("existing PR has an unowned legacy attestation; explicitly separate its generated evidence before enabling pr.template")
 
+var errPRAppendixMismatch = errors.New("PR appendix was edited or is malformed; refusing to overwrite possible author content")
+
 // The digest is an accidental-edit/ownership guard, NOT authentication. PR
 // authors can edit every byte, including the attestation. We never infer
 // ownership from headings: only an intact, unchanged, explicitly delimited
@@ -63,8 +66,11 @@ func parsePROwnedBody(body string) (prOwnedBody, error) {
 		return prOwnedBody{}, fmt.Errorf("malformed PR appendix ownership markers")
 	}
 	parts := prOwnedBody{before: body[:start], appendix: body[contentStart : end-1], after: body[afterEnd:], managed: true}
-	if markdownFenceOpen(parts.appendix) || !appendixDigestMatches(parts.appendix, body[digestStart:digestStart+64]) {
+	if markdownFenceOpen(parts.appendix) {
 		return prOwnedBody{}, fmt.Errorf("PR appendix was edited or is malformed; refusing to overwrite possible author content")
+	}
+	if !appendixDigestMatches(parts.appendix, body[digestStart:digestStart+64]) {
+		return prOwnedBody{}, errPRAppendixMismatch
 	}
 	if strings.Contains(parts.before+parts.after, pipelineAttestationCommentPrefix) || strings.Count(parts.appendix, pipelineAttestationCommentPrefix) != 1 {
 		return prOwnedBody{}, fmt.Errorf("ambiguous PR attestation ownership")
@@ -157,8 +163,9 @@ func validateOwnedPRBudget(body string, bodyLimit int) error {
 
 // updateOwnedPR re-reads before the full-body write and verifies afterwards.
 // This is NOT compare-and-swap: providers expose full-body writes. Detected
-// pre-write edits are merged from their latest version (bounded); a write error
-// or post-write divergence fails without replaying a potentially applied write.
+// pre-write edits are merged from their latest version (bounded). Readback may
+// briefly retain that exact pre-write body; any other divergence or a write error
+// fails without replaying a potentially applied write.
 func updateOwnedPR(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, initial scm.PRContent, title, emptyNarrative, appendix string, bodyLimit int) error {
 	reader, ok := host.(scm.PRContentReader)
 	if !ok {
@@ -196,14 +203,25 @@ func updateOwnedPR(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR, initia
 				return fmt.Errorf("update templated PR: %w", err)
 			}
 		}
-		verified, err := reader.GetPRContent(sctx.Ctx, pr)
-		if err != nil {
-			return fmt.Errorf("verify templated PR update: %w", err)
+		for verification := 0; ; verification++ {
+			verified, err := reader.GetPRContent(sctx.Ctx, pr)
+			if err != nil {
+				return fmt.Errorf("verify templated PR update: %w", err)
+			}
+			if verified.Body == content.Body {
+				return nil
+			}
+			// Only the exact pre-write snapshot is known to be stale. Never
+			// retry a foreign body, normalize URLs, or repeat the write.
+			if verified.Body != current.Body || verification >= 2 {
+				return fmt.Errorf("PR body changed or update did not settle; refusing to report successful publication")
+			}
+			select {
+			case <-sctx.Ctx.Done():
+				return fmt.Errorf("verify templated PR update: %w", sctx.Ctx.Err())
+			case <-time.After(250 * time.Millisecond):
+			}
 		}
-		if verified.Body != content.Body {
-			return fmt.Errorf("PR body changed or update did not settle; refusing to report successful publication")
-		}
-		return nil
 	}
 	return fmt.Errorf("PR body kept changing before template update; no write performed")
 }

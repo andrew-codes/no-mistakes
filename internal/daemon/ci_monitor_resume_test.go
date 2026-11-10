@@ -26,6 +26,9 @@ func seedMonitoringCIRun(t *testing.T, p *paths.Paths, d *db.DB, repoID string, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A normal launch records the submitter identity; recovery refuses a run
+	// without it.
+	bindFixtureCommitIdentity(t, d, run.ID)
 	if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
 		t.Fatal(err)
 	}

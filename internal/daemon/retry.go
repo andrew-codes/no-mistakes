@@ -91,6 +91,9 @@ func refuseRetry(runID, proof, format string, args ...any) error {
 // recorded global configuration, and the agent and model that served each
 // carried step are the ones a new run would use.
 func (m *RunManager) HandleRetry(ctx context.Context, repoID, branch, runID, callerHeadSHA string) (*db.RunRetry, error) {
+	if m.restartPending() {
+		return nil, errRestartPending
+	}
 	repo, err := m.db.GetRepo(repoID)
 	if err != nil {
 		return nil, fmt.Errorf("get repo: %w", err)
@@ -117,11 +120,14 @@ func (m *RunManager) HandleRetry(ctx context.Context, repoID, branch, runID, cal
 		if source.PRBaseBranch != nil {
 			prBaseBranch = strings.TrimSpace(*source.PRBaseBranch)
 		}
-		var profiles []*agentcfg.PiProfile
+		var profiles []agentcfg.RunSelection
 		if source.PiProfile != nil {
 			profiles = append(profiles, source.PiProfile)
 		}
-		continuation, err := m.startRunWithIntentSourceLocked(ctx, repo, branch, source.HeadSHA, source.BaseSHA, "retry", nil, "", "", "", "", "", prBaseBranch, source.OmitIntent, inheritablePRURL(source), "", source.ClosingIssueRefs, inheritRunPRText(source, db.RunPRText{}), launch, profiles...)
+		if source.ReviewerProfile != nil {
+			profiles = append(profiles, agentcfg.InheritReviewerProfile(source.ReviewerProfile))
+		}
+		continuation, err := m.startRunWithIntentSourceLocked(ctx, repo, branch, source.HeadSHA, source.BaseSHA, "retry", nil, "", "", "", "", "", prBaseBranch, source.OmitIntent, inheritablePRURL(source), "", source.ClosingIssueRefs, inheritRunPRText(source, db.RunPRText{}), launch, source.TranscriptHomes, profiles...)
 		link = launch.link
 		link.RunID = continuation
 		return continuation, err
@@ -276,6 +282,9 @@ func (m *RunManager) proveRetryConfiguration(ctx context.Context, repo *db.Repo,
 // the configuration the continuation run actually loaded, so a change between
 // the proof and the launch cannot carry a Review approval.
 func (m *RunManager) proveConfigurationMatches(ctx context.Context, source *db.Run, globalCfg *config.GlobalConfig, cfg *config.Config, currentRepoCfg *config.RepoConfig, pinned []config.Gate, checkpoint *pipeline.RetryCheckpoint) error {
+	if err := cfg.ApplyReviewerProfile(source.ReviewerProfile); err != nil {
+		return err
+	}
 	current, err := config.MarshalGates(cfg.Gates)
 	if err != nil {
 		return fmt.Errorf("resolve the repository's gates: %w", err)
@@ -482,10 +491,11 @@ func (r *retryLaunch) proveAtLaunch(ctx context.Context, m *RunManager, globalCf
 // directory a refused retry created, so the failed run stays the branch's
 // latest run and can be retried again once the cause is fixed.
 func (m *RunManager) discardRefusedRetryRun(runID string, cfg *config.Config) {
+	evidenceDir := m.recordedRunEvidenceDir(cfg, runID)
 	if err := m.db.DeleteRun(runID); err != nil {
 		m.db.UpdateRunError(runID, fmt.Sprintf("discard refused retry: %s", err))
 	}
-	os.RemoveAll(m.paths.RunEvidenceDir(cfg.Test.Evidence.LocalRoot, runID))
+	os.RemoveAll(evidenceDir)
 }
 
 // RetryProofConversation names the proof that a carried Review's question
@@ -516,9 +526,8 @@ func (m *RunManager) carryReviewConversation(r *retryLaunch, cfg *config.Config,
 			asked = true
 		}
 	}
-	local := cfg.Test.Evidence.LocalRoot
-	src := reviewqa.Dir(m.paths.RunEvidenceDir(local, r.source.ID))
-	dst := reviewqa.Dir(m.paths.RunEvidenceDir(local, runID))
+	src := reviewqa.Dir(m.recordedRunEvidenceDir(cfg, r.source.ID))
+	dst := reviewqa.Dir(m.recordedRunEvidenceDir(cfg, runID))
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		if asked {

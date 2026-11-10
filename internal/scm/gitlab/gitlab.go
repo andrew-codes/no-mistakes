@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -31,6 +32,9 @@ type Host struct {
 	draft               bool   // open created MRs as drafts (glab mr create --draft)
 	requiredReviews     []string
 	requiredReviewBotID string
+	// formProbeOnce records whether this glab has api --form. See uploads.go.
+	formProbeOnce sync.Once
+	formProbeOK   bool
 }
 
 // New builds a Host. cliAvailable reports whether the glab binary is
@@ -625,7 +629,17 @@ func (h *Host) GetMergeableState(ctx context.Context, pr *scm.PR) (scm.Mergeable
 // the source revision a pipeline belongs to goes through it, so the identity
 // fields are parsed in one place.
 func (h *Host) viewMR(ctx context.Context, id string) (mrPayload, error) {
-	cmd := h.cmd(ctx, "glab", "mr", "view", id, "--output", "json")
+	return h.viewMRInRepository(ctx, id, "")
+}
+
+// viewMRInRepository shares the payload parser while letting the opt-in
+// verifier target a repository without changing the pipeline's default argv.
+func (h *Host) viewMRInRepository(ctx context.Context, id, repo string) (mrPayload, error) {
+	args := []string{"mr", "view", id, "--output", "json"}
+	if repo != "" {
+		args = append(args, "--repo", repo)
+	}
+	cmd := h.cmd(ctx, "glab", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return mrPayload{}, fmt.Errorf("glab mr view: %s: %w", strings.TrimSpace(string(out)), err)

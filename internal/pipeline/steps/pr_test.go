@@ -206,7 +206,7 @@ func TestPRStep_BitbucketUpdatesExistingPR(t *testing.T) {
 	sctx.Env = api.Env()
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 
-	assertNotice := capturePRProofNotice(t, sctx, "bitbucket")
+	assertNotice := captureProvenPRHead(t, sctx)
 	step := &PRStep{}
 	outcome, err := step.Execute(sctx)
 	if err != nil {
@@ -251,7 +251,7 @@ func TestPRStep_BitbucketUpdatesExistingPRWithoutHTMLLink(t *testing.T) {
 	sctx.Env = api.Env()
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 
-	assertNotice := capturePRProofNotice(t, sctx, "bitbucket")
+	assertNotice := captureProvenPRHead(t, sctx)
 	step := &PRStep{}
 	outcome, err := step.Execute(sctx)
 	if err != nil {
@@ -800,7 +800,7 @@ func TestPRStep_BitbucketCreatesNewPR(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertNotice := capturePRProofNotice(t, sctx, "bitbucket")
+	assertNotice := captureProvenPRHead(t, sctx)
 	step := &PRStep{}
 	outcome, err := step.Execute(sctx)
 	if err != nil {
@@ -855,7 +855,7 @@ func TestPRStep_BitbucketRiskAssessmentReachesDescription(t *testing.T) {
 			api := newFakeBitbucketAPI(t, tc.existingID, tc.existing)
 
 			ag := &mockAgent{name: "test"}
-			sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+			sctx := newPRTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
 			sctx.Env = api.Env()
 			sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 			reviewStep, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
@@ -906,7 +906,7 @@ func TestPRStep_BitbucketCreatesNewPRWithoutHTMLLink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertNotice := capturePRProofNotice(t, sctx, "bitbucket")
+	assertNotice := captureProvenPRHead(t, sctx)
 	step := &PRStep{}
 	outcome, err := step.Execute(sctx)
 	if err != nil {

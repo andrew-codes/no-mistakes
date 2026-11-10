@@ -131,6 +131,7 @@ func newRefreshFixture(t *testing.T, api *fakeBitbucketAPI, earlierHead string) 
 	owned := carryPRURL
 	rerun.PRURL = &owned
 	c.Run = rerun
+	recordPRTestPush(t, c)
 	insertCarryStep(t, d, rerun.ID, types.StepReview, types.StepStatusCompleted, &cleanReview)
 	insertCarryStep(t, d, rerun.ID, types.StepTest, types.StepStatusSkipped, nil)
 	insertCarryStep(t, d, rerun.ID, types.StepDocument, types.StepStatusSkipped, nil)
@@ -208,6 +209,7 @@ func TestCarriedSkippedSteps_ChainOfRefreshesReachesTheRunThatExecutedTheStep(t 
 		t.Fatal(err)
 	}
 	f.c.Run = third
+	recordPRTestPush(t, f.c)
 	insertCarryStep(t, d, third.ID, types.StepTest, types.StepStatusSkipped, nil)
 	steps, err := d.GetStepsByRun(third.ID)
 	if err != nil {
@@ -337,6 +339,7 @@ func TestCarriedRiskLine(t *testing.T) {
 				t.Fatal(err)
 			}
 			c.Run = rerun
+			recordPRTestPush(t, c)
 			insertCarryStep(t, c.DB, rerun.ID, types.StepReview, types.StepStatusCompleted, tc.current)
 			if tc.skipped {
 				insertCarryStep(t, c.DB, rerun.ID, types.StepTest, types.StepStatusSkipped, nil)

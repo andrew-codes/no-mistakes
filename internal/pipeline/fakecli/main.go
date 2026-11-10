@@ -1674,6 +1674,9 @@ type bbFakeState struct {
 	Source       string `json:"source,omitempty"`
 	Dest         string `json:"dest,omitempty"`
 	SourceCommit string `json:"source_commit,omitempty"`
+	// Published is set once a `create` or a description `update` was served,
+	// for FAKE_CLI_BB_GET_FAIL_AFTER_PUBLISH.
+	Published bool `json:"published,omitempty"`
 	// Others are further PRs `query` lists (a merged or declined sibling, for
 	// example). `get`, `create` and `update` only ever act on the primary PR.
 	Others []bbFakePR `json:"others,omitempty"`
@@ -1901,8 +1904,18 @@ func fakeTWGPullRequests(args []string) {
 		if payload["state"] == "" {
 			payload["state"] = "OPEN"
 		}
-		if sourceCommit := os.Getenv("FAKE_CLI_BB_SOURCE_COMMIT"); sourceCommit != "" {
-			payload["source"] = map[string]any{"commit": map[string]string{"hash": sourceCommit}}
+		if os.Getenv("FAKE_CLI_BB_GET_FAIL_AFTER_PUBLISH") != "" && state.Published {
+			// A twg outage that begins once the PR was written, which is when
+			// the pushed head is read back.
+			fmt.Fprintln(os.Stderr, "twg bb pull-requests get: the API is down")
+			os.Exit(1)
+		}
+		payload["source"] = fakeTWGPRSource(state, rest)
+		if state.URL == "" {
+			// Real twg always reports the PR's web URL.
+			workspace, _ := fakeCLIFlagValue(rest, "--workspace")
+			repoSlug, _ := fakeCLIFlagValue(rest, "--repo")
+			payload["links"] = map[string]any{"html": map[string]string{"href": fmt.Sprintf("https://bitbucket.org/%s/%s/pull-requests/%d", workspace, repoSlug, state.ID)}}
 		}
 		if state.Dest != "" {
 			payload["destination"] = map[string]any{"branch": map[string]string{"name": state.Dest}}
@@ -1951,6 +1964,10 @@ func fakeTWGPullRequests(args []string) {
 		state.Title = title
 		state.Description = description
 		state.Draft = fakeCLIHasFlag(rest, "--draft")
+		if source, ok := fakeCLIFlagValue(rest, "--source"); ok && state.Source == "" {
+			state.Source = source
+		}
+		state.Published = true
 		saveBBState(state)
 		fmt.Println(fakeTWGPRJSON(state))
 		os.Exit(0)
@@ -1992,6 +2009,7 @@ func fakeTWGPullRequests(args []string) {
 		descFile, _ := fakeCLIFlagValue(rest, "--description-file")
 		state.Description = fakeReadDescriptionFile(descFile)
 		state.Puts++
+		state.Published = true
 		saveBBState(state)
 		fmt.Println(fakeTWGPRJSON(state))
 		os.Exit(0)
@@ -2145,4 +2163,45 @@ func fakeCLIArgsHaveFlag(args []string, flag string) bool {
 		}
 	}
 	return false
+}
+
+// fakeTWGPRSource is the `source` object `pull-requests get` reports. Like the
+// real command it names the source branch and repository and gives the source
+// commit as a 12-character abbreviation. By default the commit is the
+// checkout's HEAD, which the fixtures publish with their Push fixture;
+// FAKE_CLI_BB_SOURCE_COMMIT supplies an independent value for fault tests, and
+// FAKE_CLI_BB_OMIT_SOURCE_COMMIT drops the field.
+func fakeTWGPRSource(state bbFakeState, args []string) map[string]any {
+	branch := state.Source
+	if b := os.Getenv("FAKE_CLI_BB_SOURCE_BRANCH"); b != "" {
+		branch = b
+	}
+	if branch == "" {
+		branch = "feature"
+	}
+	workspace, _ := fakeCLIFlagValue(args, "--workspace")
+	repoSlug, _ := fakeCLIFlagValue(args, "--repo")
+	source := map[string]any{
+		"branch":     map[string]string{"name": branch},
+		"repository": map[string]string{"full_name": workspace + "/" + repoSlug},
+	}
+	if os.Getenv("FAKE_CLI_BB_OMIT_SOURCE_COMMIT") != "" {
+		return source
+	}
+	hash := os.Getenv("FAKE_CLI_BB_SOURCE_COMMIT")
+	if hash == "" {
+		hash = state.SourceCommit
+	}
+	if hash == "" {
+		if head, err := exec.Command(os.Getenv("FAKE_CLI_REAL_GIT"), "rev-parse", "HEAD").Output(); err == nil {
+			hash = strings.TrimSpace(string(head))
+			if len(hash) > 12 && os.Getenv("FAKE_CLI_BB_FULL_HASH") == "" {
+				hash = hash[:12]
+			}
+		}
+	}
+	if hash != "" {
+		source["commit"] = map[string]string{"hash": hash}
+	}
+	return source
 }

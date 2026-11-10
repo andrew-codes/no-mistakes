@@ -683,6 +683,9 @@ func TestEveryJSONCallPassesOutputSummaryNone(t *testing.T) {
 			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
 		{"SetPRBaseBranch", prJSON, func(h *Host) error { return h.SetPRBaseBranch(context.Background(), pr, "main") },
 			"bb pull-requests update --pull-request 42 --dest main --workspace ws --repo repo " + flags},
+		{"VerifyPRHead", `{"id":42,"state":"OPEN","links":{"html":{"href":"https://bitbucket.org/ws/repo/pull-requests/42"}},"source":{"branch":{"name":"feature"},"repository":{"full_name":"ws/repo"},"commit":{"hash":"0123456789ab"}}}`, func(h *Host) error {
+			return h.VerifyPRHead(context.Background(), pr, "feature", "0123456789abcdef0123456789abcdef01234567")
+		}, "bb pull-requests get 42 --workspace ws --repo repo " + flags},
 		{"GetPRContent", prJSON, func(h *Host) error { _, err := h.GetPRContent(context.Background(), pr); return err },
 			"bb pull-requests get 42 --workspace ws --repo repo " + flags},
 	}

@@ -1922,6 +1922,13 @@ func fakeTWGPullRequests(args []string) {
 		}
 		if fakeCLIHasFlag(rest, "--statuses") {
 			statuses := os.Getenv("FAKE_CLI_BB_STATUSES_JSON")
+			// FAKE_CLI_BB_STATUSES_FILE wins when its file is readable, so a
+			// rerun can replace the statuses a later poll reads.
+			if path := os.Getenv("FAKE_CLI_BB_STATUSES_FILE"); path != "" {
+				if data, err := os.ReadFile(path); err == nil {
+					statuses = string(data)
+				}
+			}
 			if statuses == "" {
 				statuses = "[]"
 			}
@@ -2126,6 +2133,23 @@ func fakeReadDescriptionFile(path string) string {
 }
 
 func fakeTWGPipeline(args []string) {
+	if len(args) > 0 && args[0] == "rerun-failed" {
+		// FAKE_CLI_BB_RERUN_FAIL makes Bitbucket refuse the rerun. A rerun that
+		// is accepted replaces the statuses file with FAKE_CLI_BB_RERUN_STATUSES_JSON,
+		// the way the pipeline's status moves on once its failed steps run again.
+		if msg := os.Getenv("FAKE_CLI_BB_RERUN_FAIL"); msg != "" {
+			fmt.Fprintln(os.Stderr, msg)
+			os.Exit(1)
+		}
+		if path, after := os.Getenv("FAKE_CLI_BB_STATUSES_FILE"), os.Getenv("FAKE_CLI_BB_RERUN_STATUSES_JSON"); path != "" && after != "" {
+			if err := os.WriteFile(path, []byte(after), 0o644); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
+		fmt.Println(`{"uuid":"{rerun}"}`)
+		os.Exit(0)
+	}
 	if len(args) == 0 || args[0] != "get" {
 		fmt.Fprintln(os.Stderr, "unsupported twg bb pipeline argv:", strings.Join(args, " "))
 		os.Exit(1)

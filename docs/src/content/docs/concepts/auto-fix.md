@@ -41,7 +41,7 @@ Unresolved documentation findings and unresolved blocking lint findings pause fo
 
 The CI step has one cheaper option than a fix round, and it tries it first.
 
-A check whose failure the provider attributes to itself rather than to your commit, such as a cancellation, is the provider telling you about itself. On GitHub, a positive transient rerun budget also enables structural detection of jobs that failed before any repository step ran. Handing a detected provider failure to the fix agent spends an agent round reading a run that never tested anything, and the fix it invents edits code that was never broken. So when every terminally failed check on the pull request is one of those and the configured budget authorizes a rerun, the CI step asks the provider to run those checks again for the same commit and keeps polling.
+A check whose failure the provider attributes to itself rather than to your commit, such as a cancellation (a stopped pipeline on Bitbucket Cloud), is the provider telling you about itself. On GitHub, a positive transient rerun budget also enables structural detection of jobs that failed before any repository step ran. Handing a detected provider failure to the fix agent spends an agent round reading a run that never tested anything, and the fix it invents edits code that was never broken. So when every terminally failed check on the pull request is one of those and the configured budget authorizes a rerun, the CI step asks the provider to run those checks again for the same commit and keeps polling.
 
 That deterministic rerun sits strictly before the agent rounds described above:
 

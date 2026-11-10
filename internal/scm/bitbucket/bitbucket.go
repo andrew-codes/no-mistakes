@@ -516,12 +516,19 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 	statuses = LatestStatuses(statuses)
 	checks := make([]scm.Check, 0, len(statuses))
 	for _, status := range statuses {
-		checks = append(checks, scm.Check{
+		bucket := statusBucket(status.State)
+		check := scm.Check{
 			Name:        statusName(status),
 			ProviderID:  statusProviderID(status),
-			Bucket:      statusBucket(status.State),
+			Bucket:      bucket,
+			State:       statusProviderState(status.State),
+			Link:        strings.TrimSpace(status.URL),
 			ExecutionID: pipelineBuildNumberFromStatusURL(status.URL),
-		})
+		}
+		if bucket == scm.CheckBucketPass || bucket == scm.CheckBucketFail || bucket == scm.CheckBucketCancel {
+			check.CompletedAt = statusCompletedAt(status)
+		}
+		checks = append(checks, check)
 	}
 	return checks, nil
 }
@@ -859,6 +866,31 @@ func statusBucket(state string) scm.CheckBucket {
 	default:
 		return ""
 	}
+}
+
+// statusProviderState is the check's own outcome string. Bitbucket reports a
+// stopped (cancelled) pipeline as STOPPED; it is given the CANCELLED spelling
+// the CI step reads as a transient outcome that a rerun can replace. Every
+// other state keeps Bitbucket's wording.
+func statusProviderState(state string) string {
+	state = strings.ToUpper(strings.TrimSpace(state))
+	if state == "STOPPED" {
+		return "CANCELLED"
+	}
+	return state
+}
+
+// statusCompletedAt is when a finished status last changed, which is what the
+// CI step compares to tell a re-run's replacement outcome from the one it was
+// meant to replace. A status with no parsable time reports none, and the step
+// then treats the outcome as changed rather than guessing.
+func statusCompletedAt(status CommitStatus) time.Time {
+	for _, raw := range []string{status.UpdatedOn, status.CreatedOn} {
+		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(raw)); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 func pipelineBuildNumberFromStatusURL(raw string) string {

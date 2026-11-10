@@ -805,7 +805,8 @@ Legacy alias: `auto_fix.babysit`.
 ### ci.rerun_transient
 
 How many times the CI step may re-run a single provider-attributed check before that check reaches an approval gate.
-This covers cancellations on supported providers and, when the value is positive, opts GitHub into detecting jobs that failed before any repository step ran.
+This covers cancellations on GitHub and Bitbucket Cloud and, when the value is positive, opts GitHub into detecting jobs that failed before any repository step ran.
+On Bitbucket Cloud a pipeline Bitbucket reports as `STOPPED` is the cancellation: it is re-run with `twg bb pipeline rerun-failed`, which re-runs every failed step of that pipeline for the same commit and needs a token with pipeline write permission. A `FAILED` pipeline is a verdict on the code and is never re-run. If Bitbucket refuses the rerun, or the status names no pipeline, the refusal is logged and the check escalates exactly as it would with no budget. Bitbucket has no setup-failure detection, so that part stays GitHub only.
 
 | | |
 |---|---|

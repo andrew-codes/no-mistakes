@@ -38,7 +38,7 @@ What you do not get is PR automation and CI monitoring.
 | **Review-bot findings and comments at the CI gate** | GitHub via `gh` CLI (check identity by app slug, comments from review threads) | GitLab via `glab` CLI (comments from unresolved discussion notes, matched by the bot's login; no check identity) | not supported | not supported | not supported | not supported | not supported | not supported |
 | **Review comments answered by the CI fix agent** (every unresolved human and bot comment becomes a finding; the step replies and resolves threads) | not supported | not supported | not supported | `twg` CLI | not supported | not supported | not supported | not supported |
 | **[Explicit issue closure](/no-mistakes/reference/cli/#closing-issues)** (`axi run --closes`) | `gh` CLI | `glab` CLI | not supported | not supported | not supported | not supported | not supported | not supported |
-| **[Transient-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)** (cancellations and pre-run infra failures) | `gh` CLI | not supported | not supported | not supported | not supported | not supported | not supported | not supported |
+| **[Transient-check rerun](/no-mistakes/reference/repo-config/#cirerun_transient)** (cancellations and pre-run infra failures) | `gh` CLI | not supported | not supported | `twg` CLI (stopped pipelines only) | not supported | not supported | not supported | not supported |
 
 ## What changes when provider wiring is present
 
@@ -174,13 +174,14 @@ twg whoami
 - Failed pipeline step log fetching for the CI auto-fix step
 - Merged-PR lookup before a PR is created (`twg bb pull-requests query --state MERGED`), so a branch whose PR was already merged on green does not get a duplicate PR (see the [PR step](/no-mistakes/reference/pipeline-steps/#pr))
 - Reading and changing an existing PR's destination branch (`twg bb pull-requests get`, `twg bb pull-requests update --dest`), so a per-run `--base-branch` retargets the open PR instead of failing the PR step. When no base was requested and Bitbucket does not report one, the PR step updates the PR in place and logs that it could not read the base
+- Transient-check reruns: with a positive [`ci.rerun_transient`](/no-mistakes/reference/repo-config/#cirerun_transient) budget, a pipeline Bitbucket reports as `STOPPED` is re-run for the same commit (`twg bb pipeline rerun-failed`, which re-runs the pipeline's failed steps and needs a token with pipeline write permission) before it reaches an approval gate. A `FAILED` pipeline is never re-run, and a refused rerun escalates the check as before
 - Exact pushed-head proof before the PR step reports success: a fresh `twg bb pull-requests get` read must show the PR open in this repository, from the pushed branch, at the pushed commit (Bitbucket states it as a 12-character abbreviation, matched by prefix). A head that cannot be proven fails the step instead of publishing, and the PR body then carries no "head proof unavailable" notice. A run whose push was skipped has no head to prove, so the PR step refuses to publish for it, as on GitHub
 - Mergeability polling and merge-conflict auto-fix, read from Bitbucket's own merge checks (`twg bb pull-requests mergeability`). A failed `git_mergeability_check` is a merge conflict. A failing, blocking `maximum_commits_behind` check means Bitbucket will not merge the branch until it is rebased onto its destination, so it takes the same rebase and revalidate repair; no-mistakes does not count commits behind itself. Checks that are `PENDING` or `UNKNOWN` keep the monitor waiting, and other merge checks (approvals, tasks, builds) are not read.
 - Review comments, human and bot, inline and general: each unresolved comment (read with `twg bb pull-requests comment query`) becomes a finding the CI fix agent addresses. After the fix the step replies on the comment (`twg bb pull-requests comment create --reply-to`) and resolves the thread where it changed the code; a comment the agent decides not to change gets a reply saying why and stays open. Notices such as a merge-on-green message, a review bot's summary, the pipeline's own attestation, and comments written by the authenticated `twg` user are ignored, and a thread is never answered twice. See the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
 
 **What you don't get (yet):**
 
-- Review-bot check findings (Bitbucket build statuses carry no app identity), explicit issue closure, and transient-check reruns, which are GitHub (and, for review-bot checks, GitLab) only right now.
+- Review-bot check findings (Bitbucket build statuses carry no app identity), explicit issue closure, and pre-run (setup) failure detection, which are GitHub (and, for review-bot checks, GitLab) only right now.
 
 ## Azure DevOps
 

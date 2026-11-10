@@ -55,19 +55,20 @@ func TestDefaultUpdaterManifestURLFollowsUpdateRepo(t *testing.T) {
 	}
 }
 
-// Fork releases are tagged v<upstream version>-andrew-codes.N: a semver
-// prerelease of the upstream version whose first identifier contains a hyphen.
-func TestForkTagsOrderAsSemverAndAreNotDevVersions(t *testing.T) {
+// The fork releases on its own plain semver line (v1.0.0, v1.1.0, ...), so the
+// updater needs no special handling: a newer fork release is offered to an
+// older fork build, ordered numerically rather than lexically.
+func TestForkSemverOrdering(t *testing.T) {
 	tests := []struct {
 		name    string
 		a, b    string
 		wantCmp int
 	}{
-		{"next revision", "v1.111.0-andrew-codes.1", "v1.111.0-andrew-codes.2", -1},
-		{"revisions compare numerically", "v1.111.0-andrew-codes.9", "v1.111.0-andrew-codes.10", -1},
-		{"later upstream base", "v1.111.0-andrew-codes.2", "v1.112.0-andrew-codes.1", -1},
-		{"same tag", "v1.111.0-andrew-codes.1", "v1.111.0-andrew-codes.1", 0},
-		{"prerelease of its own upstream base", "v1.111.0-andrew-codes.1", "v1.111.0", -1},
+		{"patch", "v1.0.0", "v1.0.1", -1},
+		{"minor", "v1.0.1", "v1.1.0", -1},
+		{"major", "v1.9.9", "v2.0.0", -1},
+		{"numeric not lexical", "v1.9.0", "v1.10.0", -1},
+		{"same", "v1.2.3", "v1.2.3", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -83,15 +84,13 @@ func TestForkTagsOrderAsSemverAndAreNotDevVersions(t *testing.T) {
 			}
 		})
 	}
-	for _, tag := range []string{"v1.111.0-andrew-codes.1", "v1.112.0-andrew-codes.1"} {
-		if isDevVersion(tag) {
-			t.Fatalf("isDevVersion(%q) = true, want false so update checks stay on", tag)
-		}
+	if isDevVersion("v1.0.0") {
+		t.Fatal("a fork release version must keep update checks on")
 	}
 }
 
-// forkRelease is a fork release as GitHub's REST API returns it: tagged
-// v<base>-andrew-codes.N but published as a normal, non-prerelease release.
+// forkRelease is a fork release as GitHub's REST API returns it: a plain
+// semver tag on a normal, non-prerelease release.
 func forkRelease(tag string) releaseResponse {
 	return releaseResponse{
 		TagName: tag,
@@ -111,9 +110,9 @@ func TestForkReleasesAreOfferedOnStableAndBetaChannels(t *testing.T) {
 	// GitHub's list endpoint is newest first; "latest" is the newest
 	// non-prerelease release.
 	all := []releaseResponse{
-		forkRelease("v1.112.0-andrew-codes.1"),
-		forkRelease("v1.111.0-andrew-codes.2"),
-		forkRelease("v1.111.0-andrew-codes.1"),
+		forkRelease("v1.10.0"),
+		forkRelease("v1.9.0"),
+		forkRelease("v1.0.0"),
 	}
 	allJSON, err := json.Marshal(all)
 	if err != nil {
@@ -134,57 +133,63 @@ func TestForkReleasesAreOfferedOnStableAndBetaChannels(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tests := []struct {
-		name    string
-		current string
-		beta    bool
-		want    string // empty: already up to date
-	}{
-		{"stable next revision", "v1.111.0-andrew-codes.1", false, "v1.112.0-andrew-codes.1"},
-		{"beta next revision", "v1.111.0-andrew-codes.1", true, "v1.112.0-andrew-codes.1"},
-		{"stable later upstream base", "v1.111.0-andrew-codes.2", false, "v1.112.0-andrew-codes.1"},
-		{"beta later upstream base", "v1.111.0-andrew-codes.2", true, "v1.112.0-andrew-codes.1"},
-		{"stable current", "v1.112.0-andrew-codes.1", false, ""},
-		{"beta current", "v1.112.0-andrew-codes.1", true, ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			u := &updater{
-				appName:            "no-mistakes",
-				currentVersion:     tt.current,
-				platform:           platformSpec{GOOS: "darwin", GOARCH: "arm64"},
-				manifestURL:        server.URL + "/channels.json",
-				httpClient:         server.Client(),
-				includePrereleases: tt.beta,
-			}
-			plan, err := u.checkLatest(context.Background())
-			if err != nil {
-				t.Fatalf("checkLatest: %v", err)
-			}
-			if plan.LatestVersion != "v1.112.0-andrew-codes.1" {
-				t.Fatalf("LatestVersion = %q", plan.LatestVersion)
-			}
-			if got := plan.UpdateAvailable; got != (tt.want != "") {
-				t.Fatalf("UpdateAvailable = %v, want %v", got, tt.want != "")
-			}
-			if tt.want != "" && plan.ArchiveName != "no-mistakes-"+tt.want+"-darwin-arm64.tar.gz" {
-				t.Fatalf("ArchiveName = %q", plan.ArchiveName)
+	for _, beta := range []bool{false, true} {
+		channel := "stable"
+		if beta {
+			channel = "beta"
+		}
+		for _, current := range []string{"v1.0.0", "v1.9.0"} {
+			t.Run(channel+" offers v1.10.0 to "+current, func(t *testing.T) {
+				plan := checkForkUpdate(t, server.URL, current, beta)
+				if !plan.UpdateAvailable || plan.LatestVersion != "v1.10.0" {
+					t.Fatalf("plan = %+v, want an update to v1.10.0", plan)
+				}
+				if want := "no-mistakes-v1.10.0-darwin-arm64.tar.gz"; plan.ArchiveName != want {
+					t.Fatalf("ArchiveName = %q, want %q", plan.ArchiveName, want)
+				}
+			})
+		}
+		t.Run(channel+" is up to date at v1.10.0", func(t *testing.T) {
+			plan := checkForkUpdate(t, server.URL, "v1.10.0", beta)
+			if plan.UpdateAvailable {
+				t.Fatalf("plan = %+v, want no update", plan)
 			}
 		})
 	}
 }
 
-func TestForkBetaChannelPicksHighestRevisionRegardlessOfListOrder(t *testing.T) {
-	all := []releaseResponse{
-		forkRelease("v1.111.0-andrew-codes.1"),
-		forkRelease("v1.111.0-andrew-codes.10"),
-		forkRelease("v1.111.0-andrew-codes.2"),
+func checkForkUpdate(t *testing.T, serverURL, current string, beta bool) *releasePlan {
+	t.Helper()
+	u := &updater{
+		appName:            "no-mistakes",
+		currentVersion:     current,
+		platform:           platformSpec{GOOS: "darwin", GOARCH: "arm64"},
+		manifestURL:        serverURL + "/channels.json",
+		httpClient:         http.DefaultClient,
+		includePrereleases: beta,
 	}
-	allJSON, err := json.Marshal(all)
+	plan, err := u.checkLatest(context.Background())
+	if err != nil {
+		t.Fatalf("checkLatest: %v", err)
+	}
+	return plan
+}
+
+// The fork's stable channel is GitHub's latest non-prerelease release, so a
+// release published as a prerelease only reaches users on the beta channel.
+func TestForkPrereleaseOnlyReachesBetaChannel(t *testing.T) {
+	stable := forkRelease("v1.0.0")
+	pre := forkRelease("v1.1.0")
+	pre.Prerelease = true
+	allJSON, err := json.Marshal([]releaseResponse{pre, stable})
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := EncodeChannelsManifest(nil, allJSON)
+	latestJSON, err := json.Marshal(stable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := EncodeChannelsManifest(latestJSON, allJSON)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,11 +197,13 @@ func TestForkBetaChannelPicksHighestRevisionRegardlessOfListOrder(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	beta, err := m.channel(true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if beta.TagName != "v1.111.0-andrew-codes.10" {
-		t.Fatalf("beta = %q, want v1.111.0-andrew-codes.10", beta.TagName)
+	for beta, want := range map[bool]string{false: "v1.0.0", true: "v1.1.0"} {
+		got, err := m.channel(beta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.TagName != want {
+			t.Fatalf("channel(beta=%v) = %q, want %q", beta, got.TagName, want)
+		}
 	}
 }

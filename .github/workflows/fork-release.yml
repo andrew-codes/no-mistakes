@@ -1,66 +1,70 @@
 name: fork-release
 
 # Fork-only release workflow for andrew-codes/no-mistakes. Upstream has no file
-# with this name, so a sync never conflicts with it. Manual only: release.yml,
-# publish-channels.yml and docs.yml stay disabled on the fork, and this
-# workflow never touches the release-please files.
+# with this name, so a sync never conflicts with it. release.yml,
+# publish-channels.yml and docs.yml stay disabled on the fork.
 #
-# Tag = v<upstream version from .release-please-manifest.json>-andrew-codes.N,
-# with N the next unused number for that upstream version. The suffix is a
-# semver prerelease of the upstream version, so it cannot collide with an
-# upstream tag, and the repo's own updater orders -andrew-codes.2 above
-# -andrew-codes.1 and v1.112.0-andrew-codes.1 above v1.111.0-andrew-codes.9.
+# Publishing the draft release that fork-draft-release.yml keeps up to date is
+# the release: this workflow then builds the binaries for the tag the draft
+# carries, attaches them to that same release and refreshes the update channel
+# manifest. Run by hand (workflow_dispatch) it does the whole build as a
+# rehearsal but never uploads, publishes or tags anything.
 #
-# Binaries are built unsigned (macOS arm64 is linker ad-hoc signed) and with no
-# telemetry host or website ID, so a fork build never reports to upstream's
-# analytics. The release is published as the repository's latest (non
-# prerelease) release, and channels.json is refreshed so `no-mistakes update`
-# on a fork build reads the fork's releases.
+# Binaries are built with no telemetry host or website ID, so a fork build never
+# reports to upstream's analytics, and with the update repository pointed at
+# this fork, so `no-mistakes update` follows the fork's releases. macOS and
+# Windows binaries are unsigned (darwin/arm64 is linker ad-hoc signed).
+# See docs/fork-releasing.md.
 on:
-  workflow_dispatch:
-    inputs:
-      revision:
-        description: "Git revision (branch, tag or commit) to release. Empty builds the commit this run was dispatched on."
-        required: false
-        default: ""
+  release:
+    types: [published]
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
+# One release at a time; a second run waits instead of interleaving.
 concurrency:
   group: fork-release
   cancel-in-progress: false
 
 jobs:
-  plan:
+  version:
+    name: Resolve version
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.v.outputs.tag }}
-      sha: ${{ steps.v.outputs.sha }}
+      version: ${{ steps.version.outputs.version }} # e.g. 1.2.0
+      tag: ${{ steps.version.outputs.tag }} # e.g. v1.2.0
+      # true only for a published release; a manual run never ships.
+      should_publish: ${{ steps.version.outputs.should_publish }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.revision }}
-      - id: v
-        run: |
-          set -euo pipefail
-          sha="$(git rev-parse HEAD)"
-          base="$(jq -er '.["."]' .release-please-manifest.json)"
-          prefix="v${base}-andrew-codes."
-          # Highest existing revision for this upstream version, 0 if none.
-          last="$(git ls-remote --tags origin "refs/tags/${prefix}*" \
-            | sed -n "s#.*refs/tags/${prefix}\([0-9][0-9]*\)\$#\1#p" \
-            | sort -n | tail -n 1)"
-          tag="${prefix}$(( ${last:-0} + 1 ))"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "::error::tag ${tag} already exists"; exit 1
-          fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
-          echo "Releasing ${tag} from ${sha}" >> "$GITHUB_STEP_SUMMARY"
+          fetch-depth: 0
+      - id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/fork-release-version.sh
+
+  check:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: make lint
 
   build:
-    needs: plan
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: [version, check]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -75,7 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.plan.outputs.sha }}
+          ref: ${{ github.sha }}
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -83,7 +87,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          TAG: ${{ needs.plan.outputs.tag }}
+          TAG: ${{ needs.version.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -114,7 +118,8 @@ jobs:
           path: ${{ env.ARCHIVE }}
 
   release:
-    needs: [plan, build]
+    name: Attach binaries to the release
+    needs: [version, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -122,36 +127,66 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: (cd dist && sha256sum no-mistakes-* > checksums.txt)
-      - name: Create release
+        run: |
+          set -euo pipefail
+          cd dist
+          archives=(no-mistakes-*)
+          [ "${#archives[@]}" = 6 ] || { echo "::error::expected 6 archives, found ${#archives[@]}"; exit 1; }
+          sha256sum no-mistakes-* > checksums.txt
+          cat checksums.txt
+      - name: Upload to the published release
+        if: ${{ needs.version.outputs.should_publish == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ needs.plan.outputs.tag }}
-          SHA: ${{ needs.plan.outputs.sha }}
+          TAG: ${{ needs.version.outputs.tag }}
+        # --clobber: a run that was rolled back and published again re-uploads.
+        run: gh release upload "$TAG" dist/* --clobber
+      - name: Rehearsal summary
+        if: ${{ needs.version.outputs.should_publish != 'true' }}
         run: |
-          set -euo pipefail
-          gh release create "$TAG" dist/* \
-            --target "$SHA" \
-            --title "$TAG" \
-            --notes "Fork build of upstream ${TAG%%-andrew-codes.*} at ${SHA::7}." \
-            --latest
+          echo "Rehearsal of ${{ needs.version.outputs.tag }}: built and checksummed six archives; nothing was uploaded or published." >> "$GITHUB_STEP_SUMMARY"
 
   # Refreshes channels.json on the "channels" release so a fork build stamped
-  # with UpdateRepo can see this release. Runs the same publisher upstream uses,
+  # with UpdateRepo sees this release. Runs the same publisher upstream uses,
   # inline, so it does not depend on the (disabled) publish-channels.yml.
   publish-channels:
-    needs: [plan, release]
+    name: Publish update channel manifest
+    needs: [version, release]
+    if: ${{ needs.version.outputs.should_publish == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.plan.outputs.sha }}
+          ref: ${{ github.sha }}
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: Publish update channel manifest
-        env:
+      - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: go run ./cmd/publish-channels
+
+  # If any part of a real (published-release) run fails, roll the release back:
+  # unpublish it (revert to draft) and delete the tag, so a failed release
+  # leaves no published-but-unshipped version. Publishing the draft again
+  # recreates the tag and runs this workflow fresh.
+  rollback:
+    name: Roll back failed release
+    needs: [version, check, build, release, publish-channels]
+    if: ${{ failure() && github.event_name == 'release' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Unpublish the GitHub release (revert to draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release edit "$TAG" --draft
+      - name: Delete the release tag
+        # Best-effort: the draft may not have created the tag yet.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}"

@@ -8,13 +8,15 @@ import "runtime/debug"
 //	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.Commit=abc1234
 //	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.Date=2024-01-01
 //	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.TelemetryHost=https://a.example.com
-//	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.TelemetryWebsiteID=abc123"
+//	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.TelemetryWebsiteID=abc123
+//	          -X github.com/kunchenguid/no-mistakes/internal/buildinfo.UpdateRepo=owner/repo"
 var (
 	Version            = "dev"
 	Commit             = "unknown"
 	Date               = "unknown"
 	TelemetryHost      = ""
 	TelemetryWebsiteID = ""
+	UpdateRepo         = ""
 )
 
 func CurrentVersion() string {

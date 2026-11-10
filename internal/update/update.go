@@ -142,7 +142,7 @@ func defaultUpdater(stdout, stderr io.Writer) (*updater, error) {
 		appName:         appName,
 		currentVersion:  buildinfo.CurrentVersion(),
 		platform:        platformSpec{GOOS: runtime.GOOS, GOARCH: runtime.GOARCH},
-		manifestURL:     defaultManifestURL(repoName),
+		manifestURL:     defaultManifestURL(updateRepo()),
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		cachePath:       p.UpdateCheckFile(),
 		executablePath:  execPath,
@@ -159,6 +159,16 @@ func defaultUpdater(stdout, stderr io.Writer) (*updater, error) {
 		restartStatus:   func() (*ipc.RestartStatusResult, error) { return daemon.RestartStatus(p) },
 		scheduleRestart: func() (*ipc.RestartStatusResult, error) { return daemon.ScheduleRestart(p) },
 	}, nil
+}
+
+// updateRepo is the GitHub repository whose channels.json drives `update`. A
+// fork release sets buildinfo.UpdateRepo at build time so its binaries update
+// from the fork's own releases; every other build keeps upstream's.
+func updateRepo() string {
+	if buildinfo.UpdateRepo != "" {
+		return buildinfo.UpdateRepo
+	}
+	return repoName
 }
 
 func inNixStore(path string) bool {

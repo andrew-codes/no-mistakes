@@ -1,0 +1,157 @@
+name: fork-release
+
+# Fork-only release workflow for andrew-codes/no-mistakes. Upstream has no file
+# with this name, so a sync never conflicts with it. Manual only: release.yml,
+# publish-channels.yml and docs.yml stay disabled on the fork, and this
+# workflow never touches the release-please files.
+#
+# Tag = v<upstream version from .release-please-manifest.json>-andrew-codes.N,
+# with N the next unused number for that upstream version. The suffix is a
+# semver prerelease of the upstream version, so it cannot collide with an
+# upstream tag, and the repo's own updater orders -andrew-codes.2 above
+# -andrew-codes.1 and v1.112.0-andrew-codes.1 above v1.111.0-andrew-codes.9.
+#
+# Binaries are built unsigned (macOS arm64 is linker ad-hoc signed) and with no
+# telemetry host or website ID, so a fork build never reports to upstream's
+# analytics. The release is published as the repository's latest (non
+# prerelease) release, and channels.json is refreshed so `no-mistakes update`
+# on a fork build reads the fork's releases.
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Git revision (branch, tag or commit) to release. Empty builds the commit this run was dispatched on."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      sha: ${{ steps.v.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.revision }}
+      - id: v
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          base="$(jq -er '.["."]' .release-please-manifest.json)"
+          prefix="v${base}-andrew-codes."
+          # Highest existing revision for this upstream version, 0 if none.
+          last="$(git ls-remote --tags origin "refs/tags/${prefix}*" \
+            | sed -n "s#.*refs/tags/${prefix}\([0-9][0-9]*\)\$#\1#p" \
+            | sort -n | tail -n 1)"
+          tag="${prefix}$(( ${last:-0} + 1 ))"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::tag ${tag} already exists"; exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${tag} from ${sha}" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bi=github.com/kunchenguid/no-mistakes/internal/buildinfo
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          COMMIT="$(git rev-parse --short=7 HEAD)"
+          BIN=no-mistakes; [ "$GOOS" = windows ] && BIN=no-mistakes.exe
+          # No TelemetryHost/TelemetryWebsiteID: a fork build must not report to
+          # upstream's analytics. UpdateRepo points `update` at this fork.
+          CGO_ENABLED=0 go build \
+            -ldflags "-X ${bi}.Version=${TAG} -X ${bi}.Commit=${COMMIT} -X ${bi}.Date=${DATE} -X ${bi}.UpdateRepo=${GITHUB_REPOSITORY}" \
+            -o "dist/${BIN}" ./cmd/no-mistakes
+          if [ "$GOOS" = windows ]; then
+            ARCHIVE="dist/no-mistakes-${TAG}-${GOOS}-${GOARCH}.zip"
+            (cd dist && zip -q "$(basename "$ARCHIVE")" "$BIN")
+          else
+            ARCHIVE="dist/no-mistakes-${TAG}-${GOOS}-${GOARCH}.tar.gz"
+            tar -C dist -czf "$ARCHIVE" "$BIN"
+          fi
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          # Only the runner's own platform can execute its binary.
+          if [ "$GOOS" = linux ] && [ "$GOARCH" = amd64 ]; then
+            "dist/${BIN}" --version | grep -F "no-mistakes version ${TAG} "
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: archive-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: (cd dist && sha256sum no-mistakes-* > checksums.txt)
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --target "$SHA" \
+            --title "$TAG" \
+            --notes "Fork build of upstream ${TAG%%-andrew-codes.*} at ${SHA::7}." \
+            --latest
+
+  # Refreshes channels.json on the "channels" release so a fork build stamped
+  # with UpdateRepo can see this release. Runs the same publisher upstream uses,
+  # inline, so it does not depend on the (disabled) publish-channels.yml.
+  publish-channels:
+    needs: [plan, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Publish update channel manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: go run ./cmd/publish-channels

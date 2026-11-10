@@ -94,6 +94,9 @@ func (s *PRStep) refreshDescription(sctx *pipeline.StepContext, host scm.Host, p
 		return fmt.Errorf("provider cannot read pull request content")
 	}
 	provider := resolvedProvider(sctx)
+	// The end-of-run refresh recomposes the Intent section too, from the
+	// finished run's own intent. Keep it on the intent the PR was opened with.
+	defer pinPublishedIntent(sctx, pr)()
 	live, err := reader.GetPRContent(sctx.Ctx, pr)
 	if err != nil {
 		return fmt.Errorf("read pull request: %w", err)

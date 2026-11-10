@@ -24,6 +24,9 @@ import (
 
 // PRStep creates or updates a pull request via the provider CLI or API.
 type PRStep struct {
+	// host overrides the SCM boundary for tests of publication composition.
+	// Production always constructs the configured provider below.
+	host scm.Host
 	// mediaUploader uploads image/video evidence at PR render time. Nil uses
 	// the GitHub host's user-attachments client. Tests inject a stub so they
 	// never talk to live GitHub.
@@ -32,6 +35,11 @@ type PRStep struct {
 	// will replace the drafted one, so the drafted title is neither validated
 	// nor formatted: discarded text must not block publishing.
 	titleReplaced bool
+
+	headProofUnavailable string
+	// gitlabUploader uploads image evidence to a GitLab project. Nil uses the
+	// GitLab host. Tests inject a stub so they never talk to live GitLab.
+	gitlabUploader gitlabEvidenceUploader
 }
 
 type prContent struct {
@@ -108,7 +116,10 @@ type pipelineUpdateGroup struct {
 func (s *PRStep) Name() types.StepName { return types.StepPR }
 
 func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	step := *s
+	s = &step
 	sctx.PublicIntentBrief = ""
+	s.headProofUnavailable = ""
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
 	}
@@ -128,7 +139,11 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		return &pipeline.StepOutcome{Skipped: true}, nil
 	}
 	provider := resolvedProvider(sctx)
-	host, skipReason := buildHost(sctx, provider)
+	host := s.host
+	var skipReason string
+	if host == nil {
+		host, skipReason = buildHost(sctx, provider)
+	}
 	if host == nil {
 		if err := refuseSkipWithClosingIssues(sctx, skipReason); err != nil {
 			return nil, err
@@ -147,6 +162,15 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		sctx.Log(fmt.Sprintf("skipping PR creation: %v", err))
 		logSuppliedPRTextUnused(sctx, "PR creation was skipped")
 		return &pipeline.StepOutcome{Skipped: true, SkipReason: err.Error()}, nil
+	}
+
+	if _, err := publishedPRPushBinding(sctx, host); err != nil {
+		return nil, err
+	}
+	_, verifiesHead := host.(scm.PRHeadVerifier)
+	if !verifiesHead {
+		s.headProofUnavailable = fmt.Sprintf("PR head proof unavailable for provider %s; the exact pushed head was not verified.", provider)
+		sctx.Log(s.headProofUnavailable)
 	}
 
 	// Capture live author content before model drafting. An unreadable
@@ -177,6 +201,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		return nil, err
 	}
 	if existing != nil {
+		if err := verifyPublishedPR(sctx, host, existing); err != nil {
+			return nil, err
+		}
 		// The description keeps the intent the PR was opened with, not the
 		// latest run's restatement of a correction. See pinPublishedIntent.
 		defer pinPublishedIntent(sctx, existing)()
@@ -270,6 +297,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			if err := verifyClosingIssuesInBody(content.Body, sctx); err != nil {
 				return nil, err
 			}
+			if err := verifyPRHeadProofDisclosure(content.Body, s.headProofUnavailable, bodyLimit); err != nil {
+				return nil, err
+			}
 			if err := retargetExistingPRIfNeeded(sctx, host, existing, runPRBaseBranch(sctx)); err != nil {
 				return nil, err
 			}
@@ -282,6 +312,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			}
 		}
 		if err := verifyClosingIssues(ctx, host, updated, sctx); err != nil {
+			return nil, err
+		}
+		if err := verifyPublishedPR(sctx, host, updated); err != nil {
 			return nil, err
 		}
 		// A new run restarts validation, so a PR an earlier run published as
@@ -338,6 +371,9 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	if err := verifyClosingIssuesInBody(content.Body, sctx); err != nil {
 		return nil, err
 	}
+	if err := verifyPRHeadProofDisclosure(content.Body, s.headProofUnavailable, bodyLimit); err != nil {
+		return nil, err
+	}
 	sctx.Log("creating pull request...")
 	created, err := host.CreatePR(ctx, branch, baseBranch, scm.PRContent{Title: content.Title, Body: content.Body})
 	if err != nil {
@@ -350,11 +386,16 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		if len(sctx.ClosingIssueRefs) > 0 {
 			return nil, fmt.Errorf("verify closing issues: created pull request identity is unavailable")
 		}
+		if verifiesHead {
+			return nil, fmt.Errorf("verify published PR: created pull request identity is unavailable")
+		}
 		return &pipeline.StepOutcome{}, nil
 	}
-	sctx.Log(fmt.Sprintf("created pull request: %s", created.URL))
-	if err := sctx.DB.UpdateRunPRURL(sctx.Run.ID, created.URL); err != nil {
-		slog.Warn("failed to persist PR URL", "run", sctx.Run.ID, "url", created.URL, "err", err)
+	if !verifiesHead {
+		sctx.Log(fmt.Sprintf("created pull request: %s", created.URL))
+		if err := sctx.DB.UpdateRunPRURL(sctx.Run.ID, created.URL); err != nil {
+			slog.Warn("failed to persist PR URL", "run", sctx.Run.ID, "url", created.URL, "err", err)
+		}
 	}
 	if template != "" || keepsPRUpdateText(sctx) || suppliedBody {
 		owner := createdOwnedBodyOwner(template, suppliedBody)
@@ -372,6 +413,15 @@ func (s *PRStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	}
 	if err := verifyClosingIssues(ctx, host, created, sctx); err != nil {
 		return nil, err
+	}
+	if verifiesHead {
+		if err := verifyPublishedPR(sctx, host, created); err != nil {
+			return nil, err
+		}
+		if err := sctx.DB.UpdateRunPRURL(sctx.Run.ID, created.URL); err != nil {
+			return nil, fmt.Errorf("persist verified PR URL: %w", err)
+		}
+		sctx.Log(fmt.Sprintf("created pull request: %s", created.URL))
 	}
 	return &pipeline.StepOutcome{PRURL: created.URL}, nil
 }
@@ -577,13 +627,8 @@ func (s *PRStep) buildPRContent(sctx *pipeline.StepContext, branch, baseBranch, 
 		return content, nil
 	}
 	redacted := redactPRContent(content, sctx.WorkDir, nmWorktreesRoot())
-	// Component text is cleaned before it is budgeted, so redaction should not
-	// grow the body. If it does, the body was never fitted to the limit: refuse
-	// rather than send one the provider rejects or truncates.
-	if len(redacted.Body) > len(content.Body) {
-		if err := validateOwnedPRBudget(redacted.Body, bodyLimit); err != nil {
-			return prContent{}, err
-		}
+	if err := validateOwnedPRBudget(redacted.Body, bodyLimit); err != nil {
+		return prContent{}, err
 	}
 	return redacted, nil
 }
@@ -611,9 +656,9 @@ func (s *PRStep) draftPRContent(sctx *pipeline.StepContext, branch, baseBranch, 
 		return prContent{}, fmt.Errorf("read final branch diff: %w", err)
 	}
 	inventory := prPromptInventory(sctx, finalDiff, baseSHA)
-	var pipelineMD, riskLine, testingMD string
+	var pipelineMD, riskLine, testingMD, evidenceMD string
 	if !keepsPRUpdateText(sctx) {
-		pipelineMD, riskLine, testingMD = s.buildPipelineSection(sctx, provider)
+		pipelineMD, riskLine, testingMD, evidenceMD = s.buildPipelineSection(sctx, provider)
 		if marker := extractPipelineAttestationMarker(pipelineMD); marker != "" &&
 			((bodyLimit > 0 && scm.PRBodyLen(marker) > bodyLimit) || len(marker) > maxPullRequestBodyBytes) {
 			return prContent{}, fmt.Errorf("pipeline attestation exceeds PR body limit")
@@ -660,7 +705,7 @@ Final diff paths and statuses:
 	})
 	if err != nil {
 		slog.Warn("agent failed for PR content, using fallback", "error", err)
-		fallback, fallbackErr := s.fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, bodyLimit, provider)
+		fallback, fallbackErr := s.fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, evidenceMD, bodyLimit, provider)
 		return fallback, fallbackErr
 	}
 
@@ -689,7 +734,7 @@ Final diff paths and statuses:
 				if keepsPRUpdateText(sctx) {
 					return s.publishKeptDraft(sctx, provider, content.Title, content.Body, bodyLimit)
 				}
-				content.Body = assembleDraftPRBody(sctx, content.Body, riskLine, testingMD, pipelineMD, bodyLimit, provider)
+				content.Body = assembleDraftPRBody(sctx, content.Body, riskLine, testingMD, pipelineMD, evidenceMD, bodyLimit, provider)
 				return content, nil
 			}
 		}
@@ -698,7 +743,7 @@ Final diff paths and statuses:
 	if needsPRIntentBrief(sctx) && strings.TrimSpace(sctx.PublicIntentBrief) == "" {
 		return prContent{}, fmt.Errorf("agent returned no valid configured public Intent brief")
 	}
-	return s.fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, bodyLimit, provider)
+	return s.fallbackPRContent(sctx, finalDiff, riskLine, testingMD, pipelineMD, evidenceMD, bodyLimit, provider)
 }
 
 func (s *PRStep) draftConfiguredPRTitle(sctx *pipeline.StepContext, branch, baseBranch, baseSHA string) (string, error) {
@@ -914,21 +959,21 @@ func renderPRTitle(sctx *pipeline.StepContext, title string) (string, error) {
 // produces the deterministic pipeline, risk, and testing sections. These are
 // scoped to this run's own steps and rounds, so they already describe only
 // the final terminal state each step reached in this run.
-func (s *PRStep) buildPipelineSection(sctx *pipeline.StepContext, provider scm.Provider) (pipelineMD, riskLine, testingMD string) {
+func (s *PRStep) buildPipelineSection(sctx *pipeline.StepContext, provider scm.Provider) (pipelineMD, riskLine, testingMD, evidenceMD string) {
 	return s.buildPipelineSectionFor(sctx, provider, false)
 }
 
-func (s *PRStep) buildPipelineSectionFor(sctx *pipeline.StepContext, provider scm.Provider, owned bool) (pipelineMD, riskLine, testingMD string) {
+func (s *PRStep) buildPipelineSectionFor(sctx *pipeline.StepContext, provider scm.Provider, owned bool) (pipelineMD, riskLine, testingMD, evidenceMD string) {
 	return s.buildPipelineSectionWith(sctx, provider, owned, false)
 }
 
 // buildPipelineSectionWith is buildPipelineSectionFor with the end-of-run
 // rendering switched on by final: see pipelineAttestationPolicy.Final.
-func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider scm.Provider, owned, final bool) (pipelineMD, riskLine, testingMD string) {
+func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider scm.Provider, owned, final bool) (pipelineMD, riskLine, testingMD, evidenceMD string) {
 	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
 	if err != nil {
 		slog.Warn("failed to query step results for pipeline summary", "error", err)
-		return "", "", ""
+		return "", "", "", ""
 	}
 
 	rounds := make(map[string][]*db.StepRound, len(steps))
@@ -962,12 +1007,20 @@ func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider s
 	}
 	// The Testing section is rendered first because the Pipeline's Test group
 	// must know what it already says (see testingCoverage).
-	testingMD = buildPRTestingSummaryCarried(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir, testEvidenceDir(sctx), publishRunEvidence(sctx), provider, s.attachRunEvidenceMedia(sctx, provider, steps, rounds), compact, ciPassed, carried)
+	testingMD = buildPRTestingSummaryCarried(steps, rounds, sctx.Repo.UpstreamURL, sctx.Run.HeadSHA, sctx.WorkDir, testEvidenceDir(sctx), publishRunEvidence(sctx), provider, s.attachRunEvidenceMedia(sctx, provider, steps, rounds), compact, ciPassed, evidenceLinkBase(sctx.Config), carried)
 	if testingMD != "" && prBodyFlavorFor(provider) == prBodyMarkdown {
 		policy.TestingCovers = testingCoverage{Verdict: true, Commands: !compact}
 	}
 	pipelineMD, riskLine = buildPipelineSummaryFor(steps, rounds, sctx.Run.HeadSHA, provider, policy)
 	riskLine = carriedRiskLine(sctx, steps, rounds, riskLine)
+	if s.headProofUnavailable != "" {
+		intro := noMistakesPRSignature + " " + s.headProofUnavailable
+		if pipelineMD == "" {
+			pipelineMD = "## Pipeline\n\n" + intro + "\n\n"
+		} else {
+			pipelineMD = strings.Replace(pipelineMD, noMistakesPRSignature, intro, 1)
+		}
+	}
 	// The review conversation rides inside the Pipeline section as an ordinary
 	// `### ` group, so the existing body-budget logic can drop it whole rather
 	// than competing with the attestation it must never displace.
@@ -980,7 +1033,8 @@ func (s *PRStep) buildPipelineSectionWith(sctx *pipeline.StepContext, provider s
 	if owned && provider == scm.ProviderBitbucket && pipelineMD != "" {
 		pipelineMD += "\n\n```text\n" + buildPipelineAttestationWithPolicy(steps, rounds, sctx.Run.HeadSHA, policy) + "\n```"
 	}
-	return pipelineMD, riskLine, testingMD
+	evidenceMD = s.gitlabEvidenceSection(sctx, provider)
+	return pipelineMD, riskLine, testingMD, evidenceMD
 }
 
 // unwrapNestedPRBody detects when the agent returned the body as a
@@ -1835,7 +1889,7 @@ func isGeneratedSectionHeading(line string) bool {
 	heading = strings.ToLower(heading)
 
 	switch heading {
-	case "intent", "risk assessment", "testing", "tests", "pipeline", "issues":
+	case "intent", "risk assessment", "testing", "tests", "pipeline", "issues", "evidence":
 		return true
 	default:
 		return false
@@ -1864,7 +1918,7 @@ func prependIntentSection(body string, sctx *pipeline.StepContext) string {
 	return section + "\n\n" + body
 }
 
-func (s *PRStep) fallbackPRContent(sctx *pipeline.StepContext, finalDiff, riskLine, testingMD, pipelineMD string, bodyLimit int, provider scm.Provider) (prContent, error) {
+func (s *PRStep) fallbackPRContent(sctx *pipeline.StepContext, finalDiff, riskLine, testingMD, pipelineMD, evidenceMD string, bodyLimit int, provider scm.Provider) (prContent, error) {
 	if needsPRIntentBrief(sctx) && strings.TrimSpace(sctx.PublicIntentBrief) == "" {
 		return prContent{}, fmt.Errorf("cannot publish configured public Intent brief without a valid draft")
 	}
@@ -1884,7 +1938,7 @@ func (s *PRStep) fallbackPRContent(sctx *pipeline.StepContext, finalDiff, riskLi
 	if keepsPRUpdateText(sctx) {
 		return s.publishKeptDraft(sctx, provider, title, body, bodyLimit)
 	}
-	body = assembleDraftPRBody(sctx, body, riskLine, testingMD, pipelineMD, bodyLimit, provider)
+	body = assembleDraftPRBody(sctx, body, riskLine, testingMD, pipelineMD, evidenceMD, bodyLimit, provider)
 	return prContent{
 		Title: title,
 		Body:  body,

@@ -110,6 +110,36 @@ func TestBodyDocumentsAxiGateGuidance(t *testing.T) {
 	}
 }
 
+func TestBodyDocumentsBlockingWaiting(t *testing.T) {
+	md := strings.Join(strings.Fields(Markdown()), " ")
+	for _, want := range []string{
+		"Keep the blocking",
+		"`no-mistakes axi run`",
+		"`no-mistakes axi respond`",
+		"background that same call",
+		"When backgrounding, pass a long `--wait`, for example `--wait 6h`",
+		"a backgrounded task notifies its harness when it exits",
+		"a short hold causes repeated wake-ups",
+		"re-run `no-mistakes axi run` to reattach",
+		"Do not poll progress with separate `no-mistakes axi status` calls or sleep loops",
+		"after a wait expiry, a refusal, or during recovery",
+		"never advances past a gate on its own",
+		"on a `gate:`, respond; loop until an `outcome:`",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("installed skill missing blocking-wait guidance %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"To check progress without disturbing the run",
+		"use `no-mistakes axi status` from a separate call",
+	} {
+		if strings.Contains(md, unwanted) {
+			t.Errorf("installed skill still recommends status polling: %q", unwanted)
+		}
+	}
+}
+
 func TestInstallWritesBothPaths(t *testing.T) {
 	root := t.TempDir()
 	written, err := Install(root)

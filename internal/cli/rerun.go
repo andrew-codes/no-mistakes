@@ -9,6 +9,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/daemon"
 	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/runenv"
 	"github.com/spf13/cobra"
 )
 
@@ -30,6 +31,10 @@ func newRerunCmd() *cobra.Command {
 				return fmt.Errorf("--intent must not be empty")
 			}
 			profile, err := piProfileFromFlags(cmd, model, effort)
+			if err != nil {
+				return err
+			}
+			reviewer, err := reviewerFromFlags(cmd)
 			if err != nil {
 				return err
 			}
@@ -72,6 +77,10 @@ func newRerunCmd() *cobra.Command {
 					return fmt.Errorf("connect to daemon: %w", err)
 				}
 				defer client.Close()
+				reviewer, err = resolveReviewer(client, repo.ID, reviewer)
+				if err != nil {
+					return err
+				}
 				// A rerun inherits omission from the selected prior run, and
 				// only the daemon knows that selection, so the caller can never
 				// rule omission out: probe unconditionally, whatever the flag
@@ -100,8 +109,16 @@ func newRerunCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				if err := client.RequireTranscriptHomes(); err != nil {
+					return err
+				}
+				homes := runenv.CaptureTranscriptHomes()
+				identity, err := captureSubmissionIdentity(cmd.Context(), client, ".")
+				if err != nil {
+					return err
+				}
 				var result ipc.RerunResult
-				if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{RepoID: repo.ID, Branch: branch, Intent: intent, PRBaseBranch: baseBranch, OmitIntent: noPublishIntent, ReplaceIntent: replaceIntent, CallerHeadSHA: callerHead, PiProfile: profile, ClosingIssueRefs: closes, PRTitle: prText.Title, PRBody: prText.Body}, &result); err != nil {
+				if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{CommitIdentity: identity, TranscriptHomes: homes, RepoID: repo.ID, Branch: branch, Intent: intent, PRBaseBranch: baseBranch, OmitIntent: noPublishIntent, ReplaceIntent: replaceIntent, CallerHeadSHA: callerHead, PiProfile: profile, ReviewerProfile: reviewer, ClosingIssueRefs: closes, PRTitle: prText.Title, PRBody: prText.Body}, &result); err != nil {
 					return fmt.Errorf("rerun pipeline: %w", err)
 				}
 
@@ -117,6 +134,7 @@ func newRerunCmd() *cobra.Command {
 	cmd.Flags().StringArrayVar(&closesIssues, "closes", nil, "GitHub issue this PR closes when merged; repeat for multiple issues (42 or owner/repo#42); adds to inherited references")
 	bindPRTextFlags(cmd, &prTitle, &prBodyFile)
 	bindPiProfileFlags(cmd, &model, &effort)
+	bindReviewerFlags(cmd)
 	return cmd
 }
 

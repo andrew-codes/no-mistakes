@@ -34,7 +34,7 @@ func newDescriptionFixture(t *testing.T) *descriptionFixture {
 	t.Helper()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	env, logFile := fakeGH(t, refreshPRURL)
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = env
 	return &descriptionFixture{sctx: sctx, bodyFile: envEntry(env, "FAKE_CLI_PR_BODY_FILE"), logFile: logFile}
 }

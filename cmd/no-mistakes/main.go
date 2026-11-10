@@ -21,7 +21,7 @@ import (
 var cleanupOldExecutable = update.CleanupOldExecutable
 var maybeHandleBackgroundCheck = update.MaybeHandleBackgroundCheck
 var prepareDaemonRunStdio = daemon.PrepareRunStdio
-var runDaemon = daemon.Run
+var runDaemon = daemon.RunRestartable
 
 func main() {
 	os.Exit(run())
@@ -33,6 +33,12 @@ func run() int {
 			fmt.Fprintln(os.Stderr, err)
 		}
 		return exitCode
+	}
+
+	// Export is a storage-only probe, including in release builds. Dispatch
+	// before executable cleanup, background update checks and CLI log creation.
+	if len(os.Args) > 1 && os.Args[1] == "export" {
+		return cli.Execute()
 	}
 
 	_ = cleanupOldExecutable()

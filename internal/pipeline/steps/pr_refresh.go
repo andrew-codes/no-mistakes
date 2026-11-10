@@ -118,8 +118,8 @@ func (s *PRStep) refreshDescription(sctx *pipeline.StepContext, host scm.Host, p
 	}
 
 	narrative := neutralizeAttestationMarkers(provider, stripGeneratedSections(live.Body))
-	pipelineMD, riskLine, testingMD := s.buildPipelineSectionWith(sctx, provider, false, true)
-	body := assembleDraftPRBody(sctx, narrative, riskLine, testingMD, pipelineMD, bodyLimit, provider)
+	pipelineMD, riskLine, testingMD, evidenceMD := s.buildPipelineSectionWith(sctx, provider, false, true)
+	body := assembleDraftPRBody(sctx, narrative, riskLine, testingMD, pipelineMD, evidenceMD, bodyLimit, provider)
 	content := redactPRContent(prContent{Body: body}, sctx.WorkDir, nmWorktreesRoot())
 	if err := verifyClosingIssuesInBody(content.Body, sctx); err != nil {
 		return err

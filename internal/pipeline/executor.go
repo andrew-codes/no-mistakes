@@ -83,13 +83,14 @@ type approvalResponse struct {
 
 // Executor runs pipeline steps sequentially and coordinates approval interactions.
 type Executor struct {
-	db     *db.DB
-	paths  *paths.Paths
-	config *config.Config
-	forge  *forgecontext.Context
-	agent  agent.Agent
-	steps  []Step
-	skips  map[types.StepName]bool
+	db             *db.DB
+	paths          *paths.Paths
+	config         *config.Config
+	forge          *forgecontext.Context
+	commitIdentity *git.CommitIdentity
+	agent          agent.Agent
+	steps          []Step
+	skips          map[types.StepName]bool
 	// retrySource is the failed run Execute continues instead of starting the
 	// pipeline from the beginning (SetRetrySource).
 	retrySource string
@@ -135,6 +136,7 @@ type Executor struct {
 	ciMonitorLifecycle      func(runID string, active bool)
 	ciWake                  func(runID string) <-chan struct{}
 	handoffPending          func(runID string) bool
+	gateClaimGuard          func() (release func(), ok bool)
 }
 
 // SetOnPRMerged registers a best-effort hook invoked after a merged PR state
@@ -172,6 +174,13 @@ func (e *Executor) SetCIWake(fn func(runID string) <-chan struct{}) {
 
 func (e *Executor) SetHandoffPending(fn func(runID string) bool) {
 	e.handoffPending = fn
+}
+
+// SetGateClaimGuard orders a parked gate's own resume or reconciliation
+// against the daemon: when fn refuses, the gate stays parked and is checked
+// again later; when it allows, release is called once the gate is claimed.
+func (e *Executor) SetGateClaimGuard(fn func() (release func(), ok bool)) {
+	e.gateClaimGuard = fn
 }
 
 // SetForgeContext configures the immutable provider context used by every
@@ -234,6 +243,17 @@ func (e *Executor) runEvidenceDir(runID string) string {
 	if e.paths == nil {
 		return ""
 	}
+	// A pin written at run creation wins over a since-changed evidence_dir.
+	// A run from before the column existed has no pin and keeps the
+	// local_root resolution, so setting evidence_dir does not retarget it.
+	if e.db != nil && runID != "" {
+		run, err := e.db.GetRun(runID)
+		if err != nil {
+			slog.Warn("evidence dir pin unreadable; using the configured root", "run_id", runID, "error", err)
+		} else if run != nil && run.EvidencePath() != "" {
+			return run.EvidencePath()
+		}
+	}
 	configured := ""
 	if e.config != nil {
 		configured = e.config.Test.Evidence.LocalRoot
@@ -252,6 +272,13 @@ func (e *Executor) SetGateReconcileTimings(interval, timeout time.Duration) {
 	if timeout > 0 {
 		e.gateReconcileTimeout = timeout
 	}
+}
+
+// AwaitingApproval reports whether a step is blocked at an approval gate.
+func (e *Executor) AwaitingApproval() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.waiting
 }
 
 // Respond sends a gate response to the currently waiting step.
@@ -1143,11 +1170,19 @@ func (e *Executor) ResumeCIMonitor(ctx context.Context, run *db.Run, repo *db.Re
 	return e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, ciIndex, true)
 }
 
+// SetCommitIdentity binds every Git call in this executor, including recovery.
+func (e *Executor) SetCommitIdentity(identity git.CommitIdentity) {
+	e.commitIdentity = &identity
+}
+
 func (e *Executor) runContext(ctx context.Context) context.Context {
-	if e.forge == nil {
-		return ctx
+	if e.forge != nil {
+		ctx = git.WithEnvironment(ctx, e.forge.Environment)
 	}
-	return git.WithEnvironment(ctx, e.forge.Environment)
+	if e.commitIdentity != nil {
+		ctx = git.WithCommitIdentity(ctx, *e.commitIdentity)
+	}
+	return ctx
 }
 
 func (e *Executor) recoveredGate(runID string) (*recoveredGate, error) {
@@ -2574,8 +2609,13 @@ func (e *Executor) waitForApprovalOrReconcile(ctx context.Context, step Step, sc
 			// race guard reconciliation uses: an operator response that landed
 			// first wins.
 			if action, resume, err := e.resumeApprovalGate(ctx, step, sctx, findings); resume {
-				if e.claimGateReconciliation() {
+				claimed, deferred := e.claimGateReconciliationGuarded()
+				if claimed {
 					return approvalResponse{action: action}, false, nil
+				}
+				if deferred {
+					timer.Reset(e.gateReconcileInterval)
+					continue
 				}
 				return <-e.approvalCh, false, nil
 			} else if err != nil && ctx.Err() == nil {
@@ -2587,8 +2627,13 @@ func (e *Executor) waitForApprovalOrReconcile(ctx context.Context, step Step, sc
 			}
 			resolved, err := e.reconcileApprovalGate(ctx, step, sctx, findings)
 			if resolved {
-				if e.claimGateReconciliation() {
+				claimed, deferred := e.claimGateReconciliationGuarded()
+				if claimed {
 					return approvalResponse{}, true, nil
+				}
+				if deferred {
+					timer.Reset(e.gateReconcileInterval)
+					continue
 				}
 				return <-e.approvalCh, false, nil
 			}
@@ -2605,6 +2650,19 @@ func (e *Executor) waitForApprovalOrReconcile(ctx context.Context, step Step, sc
 			timer.Reset(e.gateReconcileInterval)
 		}
 	}
+}
+
+// claimGateReconciliationGuarded claims the gate unless the gate claim guard
+// defers it, in which case the gate stays parked.
+func (e *Executor) claimGateReconciliationGuarded() (claimed, deferred bool) {
+	if e.gateClaimGuard != nil {
+		release, ok := e.gateClaimGuard()
+		if !ok {
+			return false, true
+		}
+		defer release()
+	}
+	return e.claimGateReconciliation(), false
 }
 
 func (e *Executor) claimGateReconciliation() bool {

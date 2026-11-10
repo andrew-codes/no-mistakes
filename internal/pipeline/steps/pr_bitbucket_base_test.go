@@ -24,7 +24,7 @@ func bbBaseContext(t *testing.T, api *fakeBitbucketAPI, requested string) *pipel
 	if requested != "" {
 		ensureLocalBranch(t, dir, requested, baseSHA)
 	}
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Repo.UpstreamURL = "https://bitbucket.org/test/repo.git"
 	sctx.Env = api.Env()
 	owned := bbBasePRURL

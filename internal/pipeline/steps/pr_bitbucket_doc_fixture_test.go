@@ -114,9 +114,9 @@ func newBitbucketDocContext(t *testing.T) *pipeline.StepContext {
 // a finished run on Bitbucket, with no body budget.
 func bitbucketDocBody(t *testing.T, sctx *pipeline.StepContext) string {
 	t.Helper()
-	pipelineMD, riskLine, testingMD := (&PRStep{}).buildPipelineSectionWith(sctx, scm.ProviderBitbucket, false, true)
+	pipelineMD, riskLine, testingMD, _ := (&PRStep{}).buildPipelineSectionWith(sctx, scm.ProviderBitbucket, false, true)
 	if pipelineMD == "" || testingMD == "" {
 		t.Fatalf("fixture rendered no pipeline or testing section:\n%q\n%q", pipelineMD, testingMD)
 	}
-	return assembleDraftPRBody(sctx, bitbucketDocWhatChanged, riskLine, testingMD, pipelineMD, 0, scm.ProviderBitbucket)
+	return assembleDraftPRBody(sctx, bitbucketDocWhatChanged, riskLine, testingMD, pipelineMD, "", 0, scm.ProviderBitbucket)
 }

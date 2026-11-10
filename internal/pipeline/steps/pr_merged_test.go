@@ -14,7 +14,7 @@ func TestPRStep_GitHubAlreadyMergedAtHeadCreatesNothing(t *testing.T) {
 	env, logFile := fakeGH(t, "")
 	merged := `[{"number":7,"url":"https://github.com/test/repo/pull/7","baseRefName":"main","headRefOid":"` + headSHA + `"}]`
 	ag := &mockAgent{name: "test"}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = append(env, "FAKE_CLI_MERGED_PR_LIST_JSON="+merged)
 
 	outcome, err := (&PRStep{}).Execute(sctx)
@@ -41,7 +41,7 @@ func TestPRStep_GitHubMergedButBranchAdvancedCreatesNewPR(t *testing.T) {
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	env, logFile := fakeGH(t, "")
 	merged := `[{"number":7,"url":"https://github.com/test/repo/pull/7","baseRefName":"main","headRefOid":"` + baseSHA + `"}]`
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = append(env, "FAKE_CLI_MERGED_PR_LIST_JSON="+merged)
 
 	if _, err := (&PRStep{}).Execute(sctx); err != nil {
@@ -56,7 +56,7 @@ func TestPRStep_GitHubUnreadableMergedLookupFailsTheStep(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	env, logFile := fakeGH(t, "")
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = append(env, "FAKE_CLI_MERGED_PR_LIST_JSON=not json")
 
 	_, err := (&PRStep{}).Execute(sctx)
@@ -74,7 +74,7 @@ func TestPRStep_GitLabAlreadyMergedAtHeadCreatesNothing(t *testing.T) {
 	env, logFile := fakeGlab(t, "")
 	merged := `[{"iid":9,"web_url":"https://gitlab.com/test/repo/-/merge_requests/9","target_branch":"main","sha":"` + headSHA + `"}]`
 	ag := &mockAgent{name: "test"}
-	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = append(env, "FAKE_CLI_MERGED_MR_LIST_JSON="+merged)
 	sctx.Repo.UpstreamURL = "https://gitlab.com/test/repo.git"
 
@@ -99,7 +99,7 @@ func TestPRStep_GitLabMergedIntoDifferentBaseCreatesNewMR(t *testing.T) {
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	env, logFile := fakeGlab(t, "")
 	merged := `[{"iid":9,"web_url":"https://gitlab.com/test/repo/-/merge_requests/9","target_branch":"release","sha":"` + headSHA + `"}]`
-	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx := newPRTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = append(env, "FAKE_CLI_MERGED_MR_LIST_JSON="+merged)
 	sctx.Repo.UpstreamURL = "https://gitlab.com/test/repo.git"
 

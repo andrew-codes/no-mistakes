@@ -66,8 +66,14 @@ func handleFakeCLI(mode string) {
 		fakeGHHandler(args)
 	case "glab":
 		fakeGlabHandler(args)
+	case "az-empty-pr":
+		fakeAzureEmptyPRHandler(args)
 	case "record-success":
 		fakeRecordSuccessHandler()
+	case "pr-appendix-verify":
+		fakePRAppendixVerifyHandler(args)
+	case "pr-appendix-identity":
+		fakePRAppendixIdentityHandler(args)
 	case "git-passthrough":
 		fakeGitPassthroughHandler(args)
 	case "git-move-head-passthrough":
@@ -111,6 +117,59 @@ func handleFakeCLI(mode string) {
 		} else {
 			fakeCIGHHandler(args)
 		}
+	default:
+		os.Exit(1)
+	}
+}
+
+func fakePRAppendixIdentityHandler(args []string) {
+	name := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
+	joined := strings.Join(args, " ")
+	if len(args) >= 2 && args[0] == "auth" && args[1] == "status" {
+		if (name == "gh" && strings.Contains(joined, "github.com")) || (name == "glab" && strings.Contains(joined, "gitlab.com")) || name == "origin" {
+			return
+		}
+		os.Exit(1)
+	}
+	if len(args) > 0 && args[0] == "status" {
+		fmt.Println(os.Getenv("FAKE_CLI_STATUS_JSON"))
+		return
+	}
+	if name == "az" && len(args) > 0 && (args[0] == "extension" || args[0] == "devops") {
+		return
+	}
+	if name == "twg" {
+		// Bitbucket is read through twg: `whoami` is its availability probe and
+		// `bb pull-requests get` returns the normalized PR JSON.
+		if len(args) > 0 && args[0] == "whoami" {
+			return
+		}
+		if len(args) >= 3 && args[0] == "bb" && args[1] == "pull-requests" && args[2] == "get" {
+			fmt.Println(os.Getenv("FAKE_CLI_PR_CONTENT_JSON"))
+			return
+		}
+		os.Exit(1)
+	}
+	if name == "tea" && (strings.Contains(joined, "--help") || strings.HasSuffix(joined, "/user")) {
+		fmt.Println("{}")
+		return
+	}
+	if (len(args) >= 2 && ((args[0] == "pr" && args[1] == "view") || (args[0] == "mr" && args[1] == "view"))) ||
+		(name == "az" && strings.HasPrefix(joined, "repos pr show ")) ||
+		(len(args) > 0 && args[0] == "api" && (name == "tea" || name == "forgejo-axi")) {
+		fmt.Println(os.Getenv("FAKE_CLI_PR_CONTENT_JSON"))
+		return
+	}
+	os.Exit(1)
+}
+
+func fakePRAppendixVerifyHandler(args []string) {
+	switch {
+	case len(args) > 0 && args[0] == "status":
+		fmt.Println(os.Getenv("FAKE_CLI_STATUS_JSON"))
+	case len(args) >= 3 && args[0] == "api" && args[1] == "GET",
+		len(args) >= 3 && args[0] == "pr" && args[1] == "view":
+		fmt.Println(os.Getenv("FAKE_CLI_PR_CONTENT_JSON"))
 	default:
 		os.Exit(1)
 	}
@@ -227,6 +286,61 @@ func fakeGHListMerged(args []string) {
 }
 
 func fakeGHHandler(args []string) {
+	if len(args) > 0 && args[0] == "api" && !isFakeGHPRPatch(args) {
+		if raw, ok := os.LookupEnv("FAKE_CLI_PR_PROOF_JSON"); ok {
+			if os.Getenv("FAKE_CLI_PR_PROOF_FAIL") == "1" {
+				os.Exit(1)
+			}
+			if os.Getenv("FAKE_CLI_PR_PROOF_AFTER_UPDATE") == "1" {
+				body, _ := os.ReadFile(os.Getenv("FAKE_CLI_PR_BODY_FILE"))
+				if len(body) == 0 {
+					raw = os.Getenv("FAKE_CLI_PR_PROOF_INITIAL_JSON")
+				}
+			}
+			fmt.Print(raw)
+			os.Exit(0)
+		}
+		// Default PR fixtures represent the real local commit that their Push
+		// fixture published. Fault tests supply an independent explicit object.
+		for _, arg := range args {
+			if !fakeGHPullEndpoint.MatchString(arg) {
+				continue
+			}
+			head, err := exec.Command(os.Getenv("FAKE_CLI_REAL_GIT"), "rev-parse", "HEAD").Output()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			parts := strings.Split(arg, "/")
+			repo := parts[1] + "/" + parts[2]
+			host, ok := fakeCLIFlagValue(args, "--hostname")
+			if !ok {
+				host = "github.com"
+			}
+			source := os.Getenv("FAKE_CLI_PR_SOURCE_REPO")
+			if source == "" {
+				source = repo
+			}
+			branch := "feature"
+			if data, err := os.ReadFile(os.Getenv("FAKE_CLI_PR_BODY_FILE") + ".branch"); err == nil {
+				branch = string(data)
+			}
+			if b := os.Getenv("FAKE_CLI_PR_HEAD_BRANCH"); b != "" {
+				branch = b
+			}
+			number, _ := strconv.Atoi(parts[4])
+			state := os.Getenv("FAKE_CLI_PR_STATE")
+			if state == "" {
+				state = "OPEN"
+			}
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"number": number, "html_url": "https://" + host + "/" + repo + "/pull/" + parts[4], "state": strings.ToLower(state), "merged": state == "MERGED",
+				"base": map[string]any{"repo": map[string]any{"full_name": repo}},
+				"head": map[string]any{"ref": branch, "sha": strings.TrimSpace(string(head)), "repo": map[string]any{"full_name": source, "owner": map[string]string{"login": strings.Split(source, "/")[0]}}},
+			})
+			os.Exit(0)
+		}
+	}
 	fakeGHHandlePRContentCommands(args, strings.Join(args, " "))
 	prURL := os.Getenv("FAKE_CLI_PR_URL")
 	prBase := os.Getenv("FAKE_CLI_PR_BASE")
@@ -235,6 +349,11 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+		if branch, ok := fakeCLIFlagValue(args, "--head"); ok {
+			if path := os.Getenv("FAKE_CLI_PR_BODY_FILE"); path != "" {
+				_ = os.WriteFile(path+".branch", []byte(branch), 0o644)
+			}
+		}
 		fakeGHListMerged(args)
 		if hasPRListJSON {
 			fmt.Print(prListJSON)
@@ -256,6 +375,13 @@ func fakeGHHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "pr" && args[1] == "view" {
+		if fields, _ := fakeCLIFlagValue(args, "--json"); fields == "baseRefName" {
+			if prBase == "" {
+				prBase = "main"
+			}
+			fmt.Println(prBase)
+			os.Exit(0)
+		}
 		if strings.Contains(strings.Join(args, " "), "--json state") {
 			state := os.Getenv("FAKE_CLI_PR_STATE")
 			if state == "" {
@@ -285,7 +411,16 @@ func fakeGHHandler(args []string) {
 				}
 			}
 		}
-		fmt.Println("https://github.com/test/repo/pull/99")
+		repo, ok := fakeCLIFlagValue(args, "--repo")
+		if !ok {
+			repo = "test/repo"
+		}
+		host := "github.com"
+		parts := strings.Split(repo, "/")
+		if len(parts) == 3 {
+			host, repo = parts[0], strings.Join(parts[1:], "/")
+		}
+		fmt.Println("https://" + host + "/" + repo + "/pull/99")
 		os.Exit(0)
 	}
 	os.Exit(1)
@@ -518,6 +653,34 @@ func fakeGitForward(args []string, realGit string) {
 	os.Exit(0)
 }
 
+func fakeAzureEmptyPRHandler(args []string) {
+	if len(args) >= 2 && ((args[0] == "extension" && args[1] == "show") || (args[0] == "devops" && args[1] == "project")) {
+		os.Exit(0)
+	}
+	if len(args) >= 3 && args[0] == "repos" && args[1] == "pr" {
+		switch args[2] {
+		case "list":
+			fmt.Println("[]")
+			os.Exit(0)
+		case "create":
+			file, ok := fakeCLIFlagValue(args, "--description")
+			if !ok || !strings.HasPrefix(file, "@") {
+				os.Exit(1)
+			}
+			body, err := os.ReadFile(strings.TrimPrefix(file, "@"))
+			if err != nil {
+				os.Exit(1)
+			}
+			if err := os.WriteFile(os.Getenv("FAKE_CLI_PR_BODY_FILE"), body, 0o600); err != nil {
+				os.Exit(1)
+			}
+			fmt.Println(`{"pullRequestId":0}`)
+			os.Exit(0)
+		}
+	}
+	os.Exit(1)
+}
+
 func fakeGlabHandler(args []string) {
 	mrViewJSON := os.Getenv("FAKE_CLI_MR_VIEW_JSON")
 	if len(args) >= 2 && args[0] == "auth" && args[1] == "status" {
@@ -542,6 +705,10 @@ func fakeGlabHandler(args []string) {
 		os.Exit(0)
 	}
 	if len(args) >= 2 && args[0] == "mr" && args[1] == "view" {
+		if raw, ok := os.LookupEnv("FAKE_CLI_MR_READBACK_JSON"); ok {
+			fmt.Println(raw)
+			os.Exit(0)
+		}
 		if mrViewJSON != "" {
 			fmt.Println(mrViewJSON)
 			os.Exit(0)
@@ -558,6 +725,10 @@ func fakeGlabHandler(args []string) {
 	}
 	if len(args) >= 2 && args[0] == "mr" && args[1] == "create" {
 		fakeGlabRecordMR(args, 99)
+		if raw, ok := os.LookupEnv("FAKE_CLI_MR_CREATE_OUTPUT"); ok {
+			fmt.Println(raw)
+			os.Exit(0)
+		}
 		fmt.Println("https://gitlab.com/test/repo/-/merge_requests/99")
 		os.Exit(0)
 	}
@@ -649,6 +820,10 @@ func extractTrailingNumber(rawURL string) int {
 
 func fakeCIGHReconcileHandler(args []string) {
 	joined := strings.Join(args, " ")
+	if len(args) > 0 && args[0] == "api" && !strings.Contains(joined, "graphql") {
+		fakeGHHandler(args)
+		return
+	}
 	if len(args) >= 2 && args[0] == "auth" && args[1] == "status" {
 		os.Exit(0)
 	}

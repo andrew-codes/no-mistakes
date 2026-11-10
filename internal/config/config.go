@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -251,6 +252,11 @@ type GlobalConfig struct {
 	GateReconcileInterval time.Duration `yaml:"-"`
 	GateReconcileTimeout  time.Duration `yaml:"-"`
 	LogLevel              string        `yaml:"log_level"`
+	// EvidenceDir is the global-only parent directory for new run evidence.
+	// Empty keeps <NM_HOME>/evidence (or test.evidence.local_root). A missing
+	// or unwritable value falls back to the app-root default at resolution
+	// time; already-pinned runs are not moved. A repository cannot set it.
+	EvidenceDir string `yaml:"evidence_dir"`
 	// SessionReuse controls per-run agent session reuse in the review loop:
 	// one durable fixer session across review-fix turns. Review turns always
 	// run session-free so the rereview never resumes the session whose
@@ -321,6 +327,7 @@ type globalConfigRaw struct {
 	ReviewAgentWorkingTimeout string                     `yaml:"review_agent_working_timeout"`
 	TestAgentWorkingTimeout   string                     `yaml:"test_agent_working_timeout"`
 	LogLevel                  string                     `yaml:"log_level"`
+	EvidenceDir               string                     `yaml:"evidence_dir"`
 	SessionReuse              *bool                      `yaml:"session_reuse"`
 	AutoFix                   AutoFixRaw                 `yaml:"auto_fix"`
 	CI                        CIRaw                      `yaml:"ci"`
@@ -454,6 +461,9 @@ type RepoConfig struct {
 	// pushed branch cannot opt its own integration out of the shape the
 	// maintainer chose.
 	Rebase RebaseRaw `yaml:"rebase"`
+	// Push reserves publication for an external publisher when declared paths
+	// match. It is trusted-only, regardless of allow_repo_commands.
+	Push   Push      `yaml:"push"`
 	Commit CommitRaw `yaml:"commit"`
 	Intent IntentRaw `yaml:"intent"`
 	Test   TestRaw   `yaml:"test"`
@@ -733,6 +743,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 		AutoFix                AutoFixRaw   `yaml:"auto_fix"`
 		CI                     CIRaw        `yaml:"ci"`
 		Rebase                 RebaseRaw    `yaml:"rebase"`
+		Push                   Push         `yaml:"push"`
 		Commit                 CommitRaw    `yaml:"commit"`
 		Intent                 IntentRaw    `yaml:"intent"`
 		Test                   TestRaw      `yaml:"test"`
@@ -757,6 +768,7 @@ func (c *RepoConfig) UnmarshalYAML(value *yaml.Node) error {
 	c.AutoFix = raw.AutoFix
 	c.CI = raw.CI
 	c.Rebase = raw.Rebase
+	c.Push = raw.Push
 	c.Commit = raw.Commit
 	c.Intent = raw.Intent
 	c.Test = raw.Test
@@ -1014,6 +1026,7 @@ type Config struct {
 	AutoFix        AutoFix
 	CI             CI
 	Rebase         Rebase
+	Push           Push
 	Commit         Commit
 	Intent         Intent
 	Test           Test
@@ -1289,8 +1302,9 @@ type EvidenceRaw struct {
 	// Compact controls PR testing-section presentation only; pushed-readable.
 	Compact *bool `yaml:"compact"`
 	// AttachMedia uploads image and video evidence to GitHub user-attachments
-	// when the PR body is rendered. It defaults on so default-config PRs stop
-	// citing local disk paths for screenshots; set false to opt out even when
+	// and images to GitLab project uploads when explicitly enabled. It defaults
+	// on for GitHub so default-config PRs stop citing local disk paths for
+	// screenshots; set false to opt out even when
 	// store_in_repo is true. The orphan-branch store is independent: when both
 	// are on, the PR body carries both the commit-pinned link and the attachment.
 	// Like store_in_repo, this is pushed-readable.
@@ -1318,6 +1332,17 @@ type EvidenceRaw struct {
 	LocalRoot *string `yaml:"local_root"`
 	Retention *string `yaml:"retention"`
 	MaxRuns   *int    `yaml:"max_runs"`
+	// LinkBaseURL links structured local evidence references for an operator
+	// who serves their evidence parent
+	// (evidence_dir or local_root) over HTTP themselves. Unset keeps today's
+	// local-path rendering byte for byte. It is global-only for the same
+	// reason as LocalRoot: a pushed branch must never choose where a PR's
+	// evidence links point, so Merge resolves it from GlobalConfig alone and
+	// a repository value is IGNORED, never refused at parse time: the round
+	// provenance record serializes the effective RepoConfig and reads it back
+	// through LoadRepoFromBytes, so an earlier draft that refused the key by
+	// name broke eval capture for every run.
+	LinkBaseURL *string `yaml:"link_base_url"`
 }
 
 // Test is the resolved test-step config. Prepare, BaseAttribution,
@@ -1348,8 +1373,13 @@ type Evidence struct {
 	Compact     bool
 	StoreInRepo bool
 	AttachMedia bool
-	Dir         string
-	Branch      string
+
+	// GitLabAttachMedia resolves the same attach_media setting, defaulting off
+	// for GitLab so uploading real-data screenshots requires explicit opt-in.
+	GitLabAttachMedia bool
+
+	Dir    string
+	Branch string
 	// CommitMessage is the configured subject template; empty keeps the
 	// built-in subject (see RenderCommitMessage).
 	CommitMessage string
@@ -1360,6 +1390,9 @@ type Evidence struct {
 	LocalRoot string
 	Retention time.Duration
 	MaxRuns   int
+	// LinkBaseURL is the normalized test.evidence.link_base_url (trimmed, no
+	// trailing slash). Empty keeps evidence files cited as local paths.
+	LinkBaseURL string
 }
 
 // EvalRaw is the YAML representation of local evaluation-corpus settings.
@@ -1920,9 +1953,20 @@ intent:
 # directory timer: retention ages run directories out (default 14 days) and
 # max_runs caps how many survive regardless of age (default 200). Set retention
 # to "unlimited", or either to 0, to disable that bound. local_root moves the
-# directory to another disk and must be an absolute path. These three are
-# global-only - a repository's .no-mistakes.yaml cannot change where this
-# machine writes evidence or how long it keeps it.
+# directory to another disk and must be an absolute path. evidence_dir is the
+# other way to move it: a ~/path is expanded, and a missing or unwritable
+# directory falls back to <NM_HOME>/evidence with a warning. A run keeps the
+# directory it started with. These settings are global-only - a repository's
+# .no-mistakes.yaml cannot change where this machine writes evidence or how
+# long it keeps it.
+# link_base_url is for an operator who serves that evidence parent over HTTP
+# themselves (a synced folder behind a web server, say). See Evidence links
+# in docs/src/content/docs/reference/global-config.md for the linked surfaces
+# and precedence. On GitLab, with uploads off, the Evidence section lists
+# the run's images as links without uploading them. Unset
+# leaves PR bodies unchanged. Global-only like local_root; a repository value
+# is ignored. Hosting and access control of the served copy are yours.
+# evidence_dir: ~/Dropbox/no-mistakes-evidence
 # commit_message templates the evidence-branch commit subject with
 # {{.Branch}} and {{.RunID}}; it follows commit.fix_message's template rules.
 # test:
@@ -1935,6 +1979,7 @@ intent:
 #     local_root: /var/lib/no-mistakes/evidence
 #     retention: 720h
 #     max_runs: 50
+#     link_base_url: https://evidence.example.com/no-mistakes
 
 # Local review evaluation corpus, used by "no-mistakes eval" to compare
 # agent candidates, pinned to an explicit model and reasoning effort, against
@@ -3009,6 +3054,7 @@ func LoadGlobalFromBytes(data []byte) (*GlobalConfig, error) {
 	if raw.LogLevel != "" {
 		cfg.LogLevel = raw.LogLevel
 	}
+	cfg.EvidenceDir = strings.TrimSpace(raw.EvidenceDir)
 	if raw.SessionReuse != nil {
 		cfg.SessionReuse = *raw.SessionReuse
 	}
@@ -3222,12 +3268,16 @@ func parseRepoConfig(data []byte) (*RepoConfig, error) {
 	// LoadGlobalFromBytes uses to refuse the repository-only auto_fix.gates.
 	var globalOnly struct {
 		QuotaRouting yaml.Node `yaml:"quota_routing"`
+		EvidenceDir  yaml.Node `yaml:"evidence_dir"`
 	}
 	if err := yaml.Unmarshal(data, &globalOnly); err != nil {
 		return nil, fmt.Errorf("parse repo config: %w", err)
 	}
 	if !globalOnly.QuotaRouting.IsZero() {
 		return nil, fmt.Errorf("quota_routing is global-only; configure it in ~/.no-mistakes/config.yaml on this machine")
+	}
+	if !globalOnly.EvidenceDir.IsZero() {
+		return nil, fmt.Errorf("evidence_dir is global-only; configure it in ~/.no-mistakes/config.yaml on this machine")
 	}
 	cfg := &RepoConfig{}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
@@ -3558,6 +3608,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		// in either direction, so it is trusted-only regardless of
 		// allow_repo_commands.
 		effective.Rebase = trusted.Rebase
+		effective.Push = copyPush(trusted.Push)
 		// test.evidence.branch names the git ref evidence commits are pushed
 		// to with the maintainer's credentials. It is trusted-only so a pushed
 		// branch cannot aim them at another branch of the repository; the rest
@@ -3609,6 +3660,7 @@ func EffectiveRepoConfig(pushed, trusted *RepoConfig, allowRepoCommands bool) *R
 		effective.NoCI = false
 		effective.CI = CIRaw{}
 		effective.Rebase = RebaseRaw{}
+		effective.Push = Push{}
 		effective.Test.Evidence.Branch = nil
 		effective.Test.Instructions = ""
 		effective.Test.Prepare = false
@@ -3724,6 +3776,7 @@ func applyTestOverrides(dst *Test, src *TestRaw) {
 	}
 	if src.Evidence.AttachMedia != nil {
 		dst.Evidence.AttachMedia = *src.Evidence.AttachMedia
+		dst.Evidence.GitLabAttachMedia = *src.Evidence.AttachMedia
 	}
 	if src.Evidence.Dir != nil && strings.TrimSpace(*src.Evidence.Dir) != "" {
 		dst.Evidence.Dir = strings.TrimSpace(*src.Evidence.Dir)
@@ -3754,6 +3807,11 @@ func applyEvidenceStorageOverrides(dst *Evidence, src *EvidenceRaw) {
 	}
 	if src.MaxRuns != nil && *src.MaxRuns >= 0 {
 		dst.MaxRuns = *src.MaxRuns
+	}
+	if src.LinkBaseURL != nil {
+		if base, err := normalizeEvidenceLinkBaseURL(*src.LinkBaseURL); err == nil {
+			dst.LinkBaseURL = base
+		}
 	}
 }
 
@@ -3943,7 +4001,40 @@ func validateTestRaw(test TestRaw) error {
 	if test.Evidence.MaxRuns != nil && *test.Evidence.MaxRuns < 0 {
 		return fmt.Errorf("test.evidence.max_runs must be 0 (keep every run) or greater, got %d", *test.Evidence.MaxRuns)
 	}
+	if test.Evidence.LinkBaseURL != nil {
+		if _, err := normalizeEvidenceLinkBaseURL(*test.Evidence.LinkBaseURL); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// normalizeEvidenceLinkBaseURL validates test.evidence.link_base_url and
+// returns it trimmed with no trailing slash, so <base>/<run-id>/<file> joins
+// cleanly. Only an absolute http(s) URL with a host is accepted: the value is
+// published verbatim in every PR body, so a scheme a browser will not follow,
+// embedded credentials, or a query or fragment the run path would land after
+// are refused when the config loads instead of surfacing as dead links. Empty
+// is the off state.
+func normalizeEvidenceLinkBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if strings.ContainsAny(raw, " \t\r\n") {
+		return "", fmt.Errorf("test.evidence.link_base_url must not contain whitespace, got %q", raw)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("test.evidence.link_base_url must be an absolute http or https URL, got %q", raw)
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("test.evidence.link_base_url must not carry credentials, got %q", raw)
+	}
+	if strings.ContainsAny(raw, "?#") {
+		return "", fmt.Errorf("test.evidence.link_base_url must not carry a query or fragment, got %q", raw)
+	}
+	return strings.TrimRight(raw, "/"), nil
 }
 
 // applyProvidersOverrides applies non-nil raw values onto resolved defaults.
@@ -4304,6 +4395,7 @@ func merge(global *GlobalConfig, repo *RepoConfig, override *RepositoryOverride)
 		AutoFix:        af,
 		CI:             ci,
 		Rebase:         rebase,
+		Push:           copyPush(repo.Push),
 		Commit:         commit,
 		Intent:         intent,
 		Test:           test,

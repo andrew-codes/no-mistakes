@@ -159,23 +159,62 @@ func TestRemoveRemote(t *testing.T) {
 	}
 }
 
-func TestCopyLocalUserIdentity(t *testing.T) {
-	ctx := context.Background()
-	src := initTestRepo(t)
-	dst := initTestRepo(t)
-
-	run(t, dst, "git", "config", "--local", "--unset", "user.name")
-	run(t, dst, "git", "config", "--local", "--unset", "user.email")
-
-	if err := CopyLocalUserIdentity(ctx, src, dst); err != nil {
-		t.Fatalf("CopyLocalUserIdentity failed: %v", err)
-	}
-
-	if got := run(t, dst, "git", "config", "--local", "--get", "user.name"); got != "Test" {
-		t.Fatalf("user.name = %q, want %q", got, "Test")
-	}
-	if got := run(t, dst, "git", "config", "--local", "--get", "user.email"); got != "test@test.com" {
-		t.Fatalf("user.email = %q, want %q", got, "test@test.com")
+func TestCopyLocalUserIdentityIgnoresUnreadableSiblingMetadata(t *testing.T) {
+	for _, isolated := range []bool{false, true} {
+		name := "shared config"
+		if isolated {
+			name = "worktree config"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			src := initTestRepo(t)
+			bare := filepath.Join(t.TempDir(), "gate.git")
+			if err := InitBare(ctx, bare); err != nil {
+				t.Fatal(err)
+			}
+			run(t, src, "git", "push", bare, "HEAD:refs/heads/main")
+			if isolated {
+				if err := IsolateHooksPath(ctx, bare); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wt := filepath.Join(t.TempDir(), "current")
+			sibling := filepath.Join(t.TempDir(), "previous")
+			for _, dir := range []string{wt, sibling} {
+				if err := WorktreeAdd(ctx, bare, dir, "refs/heads/main"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// An unreadable sibling commondir reproduces the failed Git read
+			// seen during concurrent teardown. Use a directory for a deterministic
+			// read error on every OS, rather than racing an unlink with Git.
+			commonFile := run(t, sibling, "git", "rev-parse", "--git-path", "commondir")
+			if !filepath.IsAbs(commonFile) {
+				commonFile = filepath.Join(sibling, commonFile)
+			}
+			if err := os.Remove(commonFile); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(commonFile, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			identity, err := CaptureCommitIdentity(ctx, src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := CopyLocalUserIdentity(ctx, wt, identity); err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range map[string]string{"user.name": "Test", "user.email": "test@test.com"} {
+				if got := run(t, wt, "git", "config", "--get", key); got != want {
+					t.Errorf("%s = %q, want %q", key, got, want)
+				}
+				shared := run(t, bare, "git", "config", "--local", "--get", "--default", "", key)
+				if isolated && shared != "" || !isolated && shared != want {
+					t.Errorf("shared %s = %q, isolated = %v", key, shared, isolated)
+				}
+			}
+		})
 	}
 }
 
@@ -470,5 +509,48 @@ func TestWorktreeAddRemoveOnBareRepoUnderSafeBareRepositoryExplicit(t *testing.T
 	}
 	if err := WorktreeRemove(ctx, bare, wt); err != nil {
 		t.Fatalf("worktree remove from bare repo: %v", err)
+	}
+}
+
+func TestFetchRemoteBranchToPrivateRefPreservesSharedRefs(t *testing.T) {
+	for _, named := range []bool{true, false} {
+		name := "url"
+		if named {
+			name = "named remote"
+		}
+		t.Run(name, func(t *testing.T) {
+			source := initTestRepo(t)
+			target := t.TempDir()
+			run(t, source, "git", "clone", source, target)
+			run(t, target, "git", "fetch", "origin")
+			before := run(t, target, "git", "show-ref")
+			fetchPath := filepath.Join(target, ".git", "FETCH_HEAD")
+			fetchBefore, err := os.ReadFile(fetchPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			branch := run(t, source, "git", "symbolic-ref", "--short", "HEAD")
+			run(t, source, "git", "commit", "--allow-empty", "-m", "advance trusted branch")
+			want := run(t, source, "git", "rev-parse", "HEAD")
+			remote := source
+			if named {
+				remote = "origin"
+			}
+			privateRef := "refs/no-mistakes/test-fetch"
+			if err := FetchRemoteBranchToPrivateRef(context.Background(), target, remote, branch, privateRef); err != nil {
+				t.Fatal(err)
+			}
+			if got := run(t, target, "git", "rev-parse", privateRef); got != want {
+				t.Fatalf("private ref=%s, want %s", got, want)
+			}
+			run(t, target, "git", "update-ref", "-d", privateRef)
+			if after := run(t, target, "git", "show-ref"); after != before {
+				t.Fatalf("private fetch moved shared refs: before=%s after=%s", before, after)
+			}
+			fetchAfter, err := os.ReadFile(fetchPath)
+			if err != nil || string(fetchAfter) != string(fetchBefore) {
+				t.Fatalf("private fetch changed FETCH_HEAD: %s %v", fetchAfter, err)
+			}
+		})
 	}
 }

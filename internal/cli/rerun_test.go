@@ -55,8 +55,11 @@ func TestRerunCallerHeadDoesNotCombineDifferentGitStates(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
+	// The wrapper runs the re-entry guard first: if the "real git" it forwards
+	// to ever launches `git` through PATH again (macOS's xcrun shim does under
+	// nix-shell), the wrapper stops after a few laps instead of looping.
 	const source = `package main
-import ("fmt"; "os"; "os/exec")
+import ("fmt"; "os"; "os/exec"; "strconv")
 func check(err error) {
   if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(1) }
 }
@@ -66,6 +69,7 @@ func run(args ...string) {
   check(cmd.Run())
 }
 func main() {
+  nmFakeCLIEnter()
   run(os.Args[1:]...)
   if os.Args[1] == "status" {
     check(os.WriteFile("tracked.txt", []byte("edited\n"), 0644))
@@ -73,7 +77,7 @@ func main() {
     run("update-ref", "HEAD", os.Getenv("NM_RERUN_NEXT_HEAD"), os.Getenv("NM_RERUN_ORIGINAL_HEAD"))
   }
 }
-`
+` + testgit.GoSourceGuard
 	file := filepath.Join(binDir, "main.go")
 	if err := os.WriteFile(file, []byte(source), 0o644); err != nil {
 		t.Fatal(err)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -60,7 +61,7 @@ func TestRealGit_NeverReturnsTheXcodeShim(t *testing.T) {
 
 	for _, active := range []string{"", "/Applications/Xcode-15.app/Contents/Developer"} {
 		for _, p := range darwinGitLocations(active) {
-			if filepath.Dir(p) == "/usr/bin" {
+			if path.Dir(filepath.ToSlash(p)) == "/usr/bin" {
 				t.Errorf("darwinGitLocations(%q) lists %q, a macOS shim", active, p)
 			}
 		}

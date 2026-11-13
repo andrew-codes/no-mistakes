@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -63,15 +64,15 @@ func usableGit(p string) bool {
 // isXcodeShim reports whether path, after following symlinks, is a binary in
 // /usr/bin on macOS - where every entry is an xcode-select shim rather than
 // the tool it names. It is false on every other OS, where /usr/bin/git is git.
-func isXcodeShim(goos, path string) bool {
+func isXcodeShim(goos, gitPath string) bool {
 	if goos != "darwin" {
 		return false
 	}
-	resolved, err := filepath.EvalSymlinks(path)
+	resolved, err := filepath.EvalSymlinks(gitPath)
 	if err != nil {
-		resolved = path
+		resolved = gitPath
 	}
-	return filepath.Dir(filepath.Clean(resolved)) == "/usr/bin"
+	return path.Dir(filepath.ToSlash(filepath.Clean(resolved))) == "/usr/bin"
 }
 
 func gitLocations() []string {

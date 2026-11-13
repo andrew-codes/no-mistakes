@@ -2,7 +2,7 @@
 
 This is [andrew-codes/no-mistakes](https://github.com/andrew-codes/no-mistakes), a fork of [kunchenguid/no-mistakes](https://github.com/kunchenguid/no-mistakes), maintained by Andrew Smith. It does everything upstream does, plus the capabilities below.
 
-Last synced with upstream: `63c01829` (2026-11-10).
+Last synced with upstream: `67c4cfa2` (2026-11-13).
 
 ## What you gain
 

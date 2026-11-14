@@ -14,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/kunchenguid/no-mistakes/internal/testgit"
 )
 
 var (
@@ -248,7 +250,7 @@ func newGitPause(t *testing.T, dir string) *gitPause {
 	t.Helper()
 	p := &gitPause{binDir: filepath.Join(dir, "bin")}
 	mkdirAll(t, p.binDir)
-	realGit, err := exec.LookPath("git")
+	realGit, err := testgit.RealGit()
 	if err != nil {
 		t.Fatalf("find git: %v", err)
 	}
@@ -266,8 +268,7 @@ func newGitPause(t *testing.T, dir string) *gitPause {
 	}
 	p.reached, p.release = pipes[0], pipes[1]
 
-	shim := fmt.Sprintf(`#!/bin/sh
-if [ "$1" = "remote" ] && [ "$2" = "add" ] && mkdir %s 2>/dev/null; then
+	shim := "#!/bin/sh\n" + testgit.ShellGuard + fmt.Sprintf(`if [ "$1" = "remote" ] && [ "$2" = "add" ] && mkdir %s 2>/dev/null; then
   echo reached > %s
   read line < %s
 fi

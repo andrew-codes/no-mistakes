@@ -20,6 +20,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/pipeline/fakecli/ghsanitize"
 	"github.com/kunchenguid/no-mistakes/internal/scm/plugin/fakeplugin"
+	"github.com/kunchenguid/no-mistakes/internal/testgit"
 )
 
 // Logging and stateful PR readback consume the same command stdin, not two
@@ -27,6 +28,13 @@ import (
 var readFakeBody = sync.OnceValues(func() ([]byte, error) { return io.ReadAll(os.Stdin) })
 
 func main() {
+	// Before anything else: a fake git is re-launched by whatever it forwards
+	// to when that program re-resolves `git` through PATH (macOS's xcrun shim
+	// does), and each lap would otherwise fork until the process table is full.
+	if err := testgit.Enter(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", filepath.Base(os.Args[0]), err)
+		os.Exit(testgit.ExitCode)
+	}
 	// The fake provider plugin is selected by executable name, not by
 	// FAKE_CLI_MODE: that variable is shared by every fake gh/git in the same
 	// step environment.

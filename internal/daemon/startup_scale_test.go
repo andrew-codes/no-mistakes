@@ -78,7 +78,7 @@ func startColdDetachedFixture(t *testing.T, gateCount int, delayedGit bool) time
 		}
 		shimDir := t.TempDir()
 		gitShim := filepath.Join(shimDir, "git")
-		shim := "#!/bin/sh\n" +
+		shim := "#!/bin/sh\n" + testgit.ShellGuard +
 			"if [ \"$2\" = config ] && [ \"$3\" = receive.advertisePushOptions ]; then /bin/sleep 0.075; fi\n" +
 			"exec \"$NM_TEST_REAL_GIT\" \"$@\"\n"
 		if err := os.WriteFile(gitShim, []byte(shim), 0o755); err != nil {

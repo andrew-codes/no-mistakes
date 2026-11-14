@@ -13,6 +13,7 @@ Last synced with upstream: `67c4cfa2` (2026-11-13).
 | Draft until proven | Bitbucket PRs stay drafts until the run has proven them ready |
 | Pushed-head proof on Bitbucket | A PR description is only published for the exact commit you pushed |
 | Re-run of stopped pipelines | A stopped Bitbucket pipeline is re-run before it bothers you |
+| Warnings do not break Bitbucket reads | A notice from the Atlassian CLI (an update or deprecation warning) no longer stops PR lookups or CI polling on a healthy run |
 | Evidence images on Bitbucket | Test screenshots show up in the PR description |
 | No duplicate PRs | A branch whose PR already merged does not get a second PR |
 | Accurate PR descriptions | The description reflects how the run actually ended |

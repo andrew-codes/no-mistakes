@@ -19,6 +19,7 @@
 package bitbucket
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -327,11 +328,24 @@ func jsonArgs(args []string) []string {
 	return append(args, "-o", "json", outputSummaryFlag, "none")
 }
 
-// runJSON runs a twg subcommand and returns its combined output. Every
-// JSON-parsed twg call goes through it so a new call cannot forget the
-// output flags; callers must not pass their own `-o` or `--output-summary`.
+// runJSON runs a twg subcommand and returns its stdout alone, so a notice twg
+// writes to stderr (update, deprecation or auth-refresh note) never becomes
+// part of the JSON a caller decodes. Every JSON-parsed twg call goes through
+// it so a new call cannot forget the output flags; callers must not pass
+// their own `-o` or `--output-summary`. On failure the returned bytes are the
+// error detail instead: the trimmed stderr, or stdout when stderr is empty.
 func (h *Host) runJSON(ctx context.Context, args []string) ([]byte, error) {
-	return h.cmd(ctx, "twg", jsonArgs(args)...).CombinedOutput()
+	out, err := h.cmd(ctx, "twg", jsonArgs(args)...).Output()
+	if err == nil {
+		return out, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		if stderr := bytes.TrimSpace(exitErr.Stderr); len(stderr) > 0 {
+			return stderr, err
+		}
+	}
+	return out, err
 }
 
 // runWithDescription runs a twg bb pull-requests command whose description is
@@ -708,17 +722,23 @@ func (h *Host) FetchFailedCheckTargetLogs(ctx context.Context, pr *scm.PR, _ str
 func (h *Host) fetchPipelineLog(ctx context.Context, buildNumber string) (string, error) {
 	args := []string{"bb", "pipeline", "get", "--pipeline", buildNumber, "--logs", "--failed-steps", "--lines", "0", outputSummaryFlag, "none"}
 	args = append(args, h.repoArgs()...)
-	// Stream into a bounded tail instead of CombinedOutput so a huge failed
-	// build log never allocates its whole text in the daemon. The tail is what
-	// matters: the failure is at the end of a log.
+	// Stream stdout into a bounded tail so a huge failed build log never
+	// allocates its whole text in the daemon. The tail is what matters: the
+	// failure is at the end of a log. stderr is kept apart, so a twg notice
+	// never lands in the log text; it only explains a failed run.
 	tail := &tailBuffer{max: maxPipelineLogBytes}
+	errTail := &tailBuffer{max: maxPipelineLogBytes}
 	cmd := h.cmd(ctx, "twg", args...)
 	cmd.Stdout = tail
-	cmd.Stderr = tail
+	cmd.Stderr = errTail
 	err := cmd.Run()
 	out := strings.TrimSpace(tail.String())
 	if err != nil {
-		return "", fmt.Errorf("twg bb pipeline get --logs: %s: %w", out, err)
+		detail := strings.TrimSpace(errTail.String())
+		if detail == "" {
+			detail = out
+		}
+		return "", fmt.Errorf("twg bb pipeline get --logs: %s: %w", detail, err)
 	}
 	return out, nil
 }
